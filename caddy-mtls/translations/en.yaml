@@ -1,0 +1,95 @@
+# Home Assistant Add-on: Caddy mTLS Proxy
+# English translations for configuration options
+
+configuration:
+  domain:
+    name: Domain
+    description: >-
+      The domain name for your Home Assistant instance (e.g., home.example.com).
+      This domain must point to your Home Assistant's public IP address.
+      Let's Encrypt will automatically obtain and renew SSL certificates for this domain.
+
+  email:
+    name: Email
+    description: >-
+      Email address for Let's Encrypt certificate registration.
+      You will receive expiration warnings at this address.
+
+  upstream_host:
+    name: Upstream Host
+    description: >-
+      The hostname or IP address of the backend service to proxy to.
+      Default is 'homeassistant' which resolves to Home Assistant Core.
+
+  upstream_port:
+    name: Upstream Port
+    description: >-
+      The port of the backend service.
+      Default is 8123 for Home Assistant.
+
+  mtls_enabled:
+    name: Enable mTLS
+    description: >-
+      Enable mutual TLS (mTLS) authentication.
+      When enabled, clients must present a valid certificate to access the service.
+      Client certificates can be downloaded from the add-on's web interface.
+
+  ca_country:
+    name: CA Country Code
+    description: >-
+      Two-letter country code for the CA certificate (e.g., US, DE, AT).
+
+  ca_state:
+    name: CA State/Province
+    description: >-
+      State or province name for the CA certificate.
+
+  ca_locality:
+    name: CA City/Locality
+    description: >-
+      City or locality name for the CA certificate.
+
+  ca_organization:
+    name: CA Organization
+    description: >-
+      Organization name for the CA certificate.
+
+  ca_common_name:
+    name: CA Common Name
+    description: >-
+      Common Name (CN) for the CA certificate.
+      This is a descriptive name for your certificate authority.
+
+  client_names:
+    name: Client Names
+    description: >-
+      List of client names for certificate generation.
+      Each name will get its own .p12 certificate file.
+      Use descriptive names like 'john-phone', 'mary-laptop', etc.
+      Add new entries to create additional client certificates.
+
+  client_cert_password:
+    name: Client Certificate Password
+    description: >-
+      Password to protect the .p12 certificate files.
+      Users will need this password when importing the certificate.
+      Choose a strong password and share it securely with your users.
+
+  acme_dns_provider:
+    name: ACME DNS Provider
+    description: >-
+      DNS provider for DNS-01 ACME challenge.
+      Use this when port 80 is not available for HTTP-01 challenge.
+      Supported providers: Cloudflare, Route53 (AWS), Hetzner.
+      Set to 'none' to use standard HTTP-01 challenge (requires port 80).
+
+  dns_api_token:
+    name: DNS API Token
+    description: >-
+      API token for the selected DNS provider.
+
+      For Cloudflare: Create an API token with Zone:Read and DNS:Edit permissions.
+      For Route53: Use AWS access key format 'ACCESS_KEY_ID:SECRET_ACCESS_KEY'.
+      For Hetzner: Create an API token in the Hetzner DNS Console.
+
+      Leave empty if using HTTP-01 challenge (acme_dns_provider = none).

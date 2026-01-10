@@ -1,0 +1,89 @@
+# Home Assistant Add-on: Caddy mTLS Proxy
+# https://developers.home-assistant.io/docs/add-ons/configuration/
+
+name: "Caddy mTLS Proxy"
+version: "1.0.0"
+slug: "caddy_mtls"
+description: "Caddy reverse proxy with mutual TLS (mTLS) authentication and automatic HTTPS via Let's Encrypt"
+url: "https://github.com/LinumIQ/caddy-mtls"
+
+# Supported architectures
+arch:
+  - aarch64
+  - amd64
+  - armv7
+  - i386
+
+# Startup configuration
+startup: services
+boot: auto
+init: false
+
+# Port configuration for Let's Encrypt ACME challenges
+ports:
+  "80/tcp": 80
+  "443/tcp": 443
+
+ports_description:
+  "80/tcp": "HTTP port for Let's Encrypt ACME challenges"
+  "443/tcp": "HTTPS port with mTLS authentication"
+
+# Ingress configuration for certificate download page
+ingress: true
+ingress_port: 8099
+ingress_entry: /
+panel_icon: mdi:certificate-outline
+panel_title: "Caddy mTLS"
+
+# File mappings
+map:
+  - ssl:rw
+  - addon_config:rw
+
+# Add-on options with defaults
+options:
+  domain: ""
+  email: ""
+  upstream_host: "homeassistant"
+  upstream_port: 8123
+  mtls_enabled: true
+
+  # CA certificate subject fields
+  ca_country: "US"
+  ca_state: "State"
+  ca_locality: "City"
+  ca_organization: "Home Assistant"
+  ca_common_name: "Home Assistant mTLS CA"
+
+  # Client certificates
+  client_names:
+    - "user"
+  client_cert_password: "changeme"
+
+  # ACME DNS challenge (optional, for when port 80 is unavailable)
+  acme_dns_provider: "none"
+  dns_api_token: ""
+
+# Schema for options validation
+schema:
+  domain: str
+  email: email
+  upstream_host: str
+  upstream_port: port
+  mtls_enabled: bool
+
+  ca_country: str
+  ca_state: str
+  ca_locality: str
+  ca_organization: str
+  ca_common_name: str
+
+  client_names:
+    - str
+  client_cert_password: password
+
+  acme_dns_provider: list(none|cloudflare|route53|hetzner)
+  dns_api_token: str?
+
+# Resource limits
+timeout: 300
