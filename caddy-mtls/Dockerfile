@@ -1,8 +1,23 @@
 # Home Assistant Add-on: Caddy mTLS Proxy
 # Dockerfile for building Caddy with DNS modules
+#
+# Build args:
+#   BUILD_FROM   - Home Assistant base image (provided by Supervisor for each arch).
+#                  We declare a sensible default so plain `docker build` also works.
+#   BUILD_ARCH   - Target arch label, set by Supervisor (informational).
+#   BUILD_VERSION- Add-on version, set by Supervisor (informational).
 
-ARG BUILD_FROM
-FROM golang:1.25.5-alpine AS builder
+ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base:3.23
+ARG BUILD_ARCH=amd64
+ARG BUILD_VERSION=dev
+
+# Build Caddy with DNS plugins on the build platform; cross-compile to TARGETOS/TARGETARCH.
+FROM --platform=$BUILDPLATFORM golang:1.26.2-alpine AS builder
+ARG TARGETOS
+ARG TARGETARCH
+ENV CGO_ENABLED=0 \
+    GOOS=${TARGETOS} \
+    GOARCH=${TARGETARCH}
 
 # Install xcaddy for building Caddy with plugins
 RUN go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest

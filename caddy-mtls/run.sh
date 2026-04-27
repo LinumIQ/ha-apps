@@ -87,10 +87,13 @@ if bashio::var.true "$MTLS_ENABLED"; then
         bashio::log.info "Server certificate already exists"
     fi
 
-    # Generate client certificates
+    # Generate client certificates.
+    # Use newline-delimited iteration so client names containing whitespace or
+    # globbing characters are handled safely.
     bashio::log.info "Processing client certificates..."
 
-    for client_name in $(bashio::config 'client_names'); do
+    while IFS= read -r client_name; do
+        [[ -z "$client_name" ]] && continue
         if [[ ! -f "$CERT_DIR/mTLS-client-${client_name}.p12" ]]; then
             bashio::log.info "Generating client certificate for: $client_name"
             generate_client_cert "$client_name"
@@ -98,9 +101,9 @@ if bashio::var.true "$MTLS_ENABLED"; then
             bashio::log.info "Client certificate already exists for: $client_name"
         fi
 
-        # Copy .p12 to www directory for download
+        # Copy .p12 to www directory for download via ingress.
         cp "$CERT_DIR/mTLS-client-${client_name}.p12" "$WWW_DIR/"
-    done
+    done <<< "$(bashio::config 'client_names')"
 
     # Copy CA certificate for download
     cp "$CERT_DIR/mTLS-CA.crt" "$WWW_DIR/"
@@ -112,13 +115,12 @@ fi
 
 bashio::log.info "Generating certificate download page..."
 
-# Get ingress entry and ensure exactly one trailing slash (double-slash protection)
-INGRESS_ENTRY="$(bashio::addon.ingress_entry)/"
-INGRESS_ENTRY="${INGRESS_ENTRY%//}/"
-
-# Get full ingress URL for QR codes (includes host)
-INGRESS_URL="http://homeassistant.local:8123/"
-INGRESS_URL="${INGRESS_URL%//}/"
+# Get ingress entry and ensure exactly one trailing slash.
+# bashio::addon.ingress_entry returns the path WITHOUT a trailing slash
+# (e.g. "/api/hassio_ingress/<token>"); we strip any trailing slash and
+# re-append exactly one to avoid the historical "//" double-slash bug.
+INGRESS_ENTRY="$(bashio::addon.ingress_entry)"
+INGRESS_ENTRY="${INGRESS_ENTRY%/}/"
 
 # Start HTML
 cat > "$WWW_DIR/index.html" << 'HTMLHEAD'
@@ -171,12 +173,6 @@ cat > "$WWW_DIR/index.html" << 'HTMLHEAD'
             font-weight: bold;
             color: var(--primary-color);
         }
-        .qr-code {
-            background: white;
-            padding: 10px;
-            border-radius: 8px;
-        }
-        .qr-code img { display: block; width: 150px; height: 150px; }
         .download-btn {
             display: inline-block;
             background: var(--primary-color);
@@ -225,30 +221,25 @@ if bashio::var.true "$MTLS_ENABLED"; then
         <p class="muted">Each user needs their own .p12 file installed on their device.</p>
 HTMLSTATUS
 
-    # Generate client certificate cards with QR codes
-    for client_name in $(bashio::config 'client_names'); do
-        # Use full URL for QR codes (scannable), relative path for HTML links
-        P12_URL_FULL="${INGRESS_URL}mTLS-client-${client_name}.p12"
+    # Generate client certificate cards.
+    # NOTE: We intentionally do NOT embed QR codes pointing at the ingress URL,
+    # because cert downloads require an authenticated Home Assistant session.
+    # A QR code scanned from another device would land on a session-less request
+    # and 401, which is misleading. Provide a clear download button instead.
+    while IFS= read -r client_name; do
+        [[ -z "$client_name" ]] && continue
         P12_URL="${INGRESS_ENTRY}mTLS-client-${client_name}.p12"
-
-        # Generate QR code as base64 PNG (using full URL for scanning)
-        QR_BASE64=$(echo -n "$P12_URL_FULL" | qrencode -t PNG -o - | base64 -w 0)
-        bashio::log.info "QR URL: $P12_URL_FULL"
 
         cat >> "$WWW_DIR/index.html" << HTMLCLIENT
         <div class="card client-card">
             <div class="client-info">
-                <div class="client-name">$client_name</div>
-                <p class="muted">PKCS#12 certificate bundle</p>
+                <div class="client-name">${client_name}</div>
+                <p class="muted">PKCS#12 certificate bundle (password protected)</p>
                 <a href="$P12_URL" class="download-btn" download>⬇️ Download .p12</a>
-            </div>
-            <div class="qr-code">
-                <img src="data:image/png;base64,$QR_BASE64" alt="QR Code for $client_name">
-                <p class="muted" style="text-align:center; margin: 5px 0 0 0; font-size: 0.8em;">Scan to download</p>
             </div>
         </div>
 HTMLCLIENT
-    done
+    done <<< "$(bashio::config 'client_names')"
 
     # Add import instructions
     cat >> "$WWW_DIR/index.html" << 'HTMLINSTRUCTIONS'
@@ -257,7 +248,7 @@ HTMLCLIENT
 
             <h4>iOS / iPadOS</h4>
             <ol>
-                <li>Download the .p12 file (or scan QR code)</li>
+                <li>Download the .p12 file</li>
                 <li>Go to Settings → Profile Downloaded</li>
                 <li>Install the profile and enter the certificate password</li>
                 <li>Go to Settings → General → About → Certificate Trust Settings</li>
@@ -324,22 +315,28 @@ bashio::log.info "Download page generated at $WWW_DIR/index.html"
 
 bashio::log.info "Generating Caddyfile..."
 
-# Determine TLS configuration
+# Determine TLS configuration.
+# We pass the DNS API token via an environment variable referenced through
+# Caddy's {env.X} placeholder so that:
+#   1. The secret is not persisted in /etc/caddy/Caddyfile.
+#   2. Tokens containing braces, dollar signs or whitespace cannot break the
+#      Caddyfile syntax.
 TLS_CONFIG=""
-if [[ "$ACME_DNS_PROVIDER" == "cloudflare" ]]; then
-    TLS_CONFIG="dns cloudflare $DNS_API_TOKEN"
-elif [[ "$ACME_DNS_PROVIDER" == "route53" ]]; then
-    TLS_CONFIG="dns route53 $DNS_API_TOKEN"
-elif [[ "$ACME_DNS_PROVIDER" == "hetzner" ]]; then
-    TLS_CONFIG="dns hetzner $DNS_API_TOKEN"
+if [[ "$ACME_DNS_PROVIDER" != "none" ]]; then
+    export DNS_API_TOKEN
+    TLS_CONFIG="dns ${ACME_DNS_PROVIDER} {env.DNS_API_TOKEN}"
 fi
 
-# Determine mTLS client auth configuration
+# Determine mTLS client auth configuration.
+# Use 'trust_pool file' (Caddy 2.10+); the legacy 'trusted_ca_cert_file' is
+# deprecated and emits a startup warning.
 MTLS_CONFIG=""
 if bashio::var.true "$MTLS_ENABLED"; then
     MTLS_CONFIG="client_auth {
             mode require_and_verify
-            trusted_ca_cert_file $CERT_DIR/mTLS-CA.crt
+            trust_pool file {
+                pem_file $CERT_DIR/mTLS-CA.crt
+            }
         }"
 fi
 
@@ -368,13 +365,12 @@ $DOMAIN {
         $MTLS_CONFIG
     }
 
-    # Reverse proxy to Home Assistant
+    # Reverse proxy to Home Assistant.
+    # NOTE: Caddy's reverse_proxy automatically forwards Host, X-Forwarded-For,
+    # X-Forwarded-Proto and X-Forwarded-Host. WebSockets are upgraded
+    # transparently. We only override X-Real-IP since some clients expect it.
     reverse_proxy $UPSTREAM_HOST:$UPSTREAM_PORT {
-        # WebSocket support
-        header_up Host {host}
         header_up X-Real-IP {remote_host}
-        header_up X-Forwarded-For {remote_host}
-        header_up X-Forwarded-Proto {scheme}
     }
 
     # Logging
@@ -414,15 +410,24 @@ bashio::log.info "Copying certificates to addon_config..."
 
 if [[ -d "/config" ]]; then
     mkdir -p /config/certs
+    chmod 700 /config/certs
 
     if bashio::var.true "$MTLS_ENABLED"; then
-        cp "$CERT_DIR/mTLS-CA.crt" /config/certs/ 2>/dev/null || true
+        if cp "$CERT_DIR/mTLS-CA.crt" /config/certs/ 2>/dev/null; then
+            chmod 644 /config/certs/mTLS-CA.crt
+        fi
 
-        for client_name in $(bashio::config 'client_names'); do
-            cp "$CERT_DIR/mTLS-client-${client_name}.p12" /config/certs/ 2>/dev/null || true
-        done
+        while IFS= read -r client_name; do
+            [[ -z "$client_name" ]] && continue
+            src="$CERT_DIR/mTLS-client-${client_name}.p12"
+            dst="/config/certs/mTLS-client-${client_name}.p12"
+            if cp "$src" "$dst" 2>/dev/null; then
+                # PKCS#12 contains the private key; restrict to owner only.
+                chmod 600 "$dst"
+            fi
+        done <<< "$(bashio::config 'client_names')"
 
-        bashio::log.info "Certificates copied to /config/certs/"
+        bashio::log.info "Certificates copied to /config/certs/ (mode 600 for .p12)"
         bashio::log.info "Access via: /addon_configs/local_caddy_mtls/certs/"
     fi
 fi

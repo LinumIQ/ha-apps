@@ -29,27 +29,26 @@
 $DOMAIN {
     tls {
         # For HTTP-01 challenge (default), no extra config needed
-        # For DNS-01 challenge, one of:
-        #   dns cloudflare {env.CF_API_TOKEN}
-        #   dns route53 {env.AWS_ACCESS_KEY_ID} {env.AWS_SECRET_ACCESS_KEY}
-        #   dns hetzner {env.HETZNER_API_TOKEN}
+        # For DNS-01 challenge:
+        #   dns cloudflare {env.DNS_API_TOKEN}
+        #   dns route53 {env.DNS_API_TOKEN}
+        #   dns hetzner {env.DNS_API_TOKEN}
         $TLS_CONFIG
 
-        # mTLS client authentication (when enabled)
+        # mTLS client authentication (Caddy 2.10+ uses trust_pool):
         # client_auth {
         #     mode require_and_verify
-        #     trusted_ca_cert_file /data/certs/mTLS-CA.crt
+        #     trust_pool file {
+        #         pem_file /data/certs/mTLS-CA.crt
+        #     }
         # }
         $MTLS_CONFIG
     }
 
-    # Reverse proxy to Home Assistant (or other upstream)
+    # Reverse proxy. Caddy auto-forwards Host, X-Forwarded-For,
+    # X-Forwarded-Proto and X-Forwarded-Host. WebSockets upgrade transparently.
     reverse_proxy $UPSTREAM_HOST:$UPSTREAM_PORT {
-        # Preserve original headers for WebSocket support
-        header_up Host {host}
         header_up X-Real-IP {remote_host}
-        header_up X-Forwarded-For {remote_host}
-        header_up X-Forwarded-Proto {scheme}
     }
 
     # Request logging
