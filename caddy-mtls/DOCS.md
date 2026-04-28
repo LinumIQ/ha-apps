@@ -243,4 +243,4 @@ View add-on logs in Home Assistant:
 ## Support
 
 For issues and feature requests, please visit:
-https://github.com/LinumIQ/home-assistant-addons/issues
+https://github.com/LinumIQ/ha-apps/issues

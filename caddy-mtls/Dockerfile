@@ -83,9 +83,9 @@ LABEL \
     org.opencontainers.image.vendor="LinumIQ" \
     org.opencontainers.image.authors="LinumIQ <opensource@linumiq.com>" \
     org.opencontainers.image.licenses="Apache-2.0" \
-    org.opencontainers.image.url="https://github.com/LinumIQ/home-assistant-addons" \
+    org.opencontainers.image.url="https://github.com/LinumIQ/ha-apps" \
     org.opencontainers.image.source="${BUILD_REPOSITORY}" \
-    org.opencontainers.image.documentation="https://github.com/LinumIQ/home-assistant-addons/blob/main/caddy-mtls/DOCS.md" \
+    org.opencontainers.image.documentation="https://github.com/LinumIQ/ha-apps/blob/main/caddy-mtls/DOCS.md" \
     org.opencontainers.image.created=${BUILD_DATE} \
     org.opencontainers.image.revision=${BUILD_REF} \
     org.opencontainers.image.version=${BUILD_VERSION}

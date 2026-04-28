@@ -19,7 +19,7 @@ certificate authentication and automatic certificate provisioning.
 
 Click the button below to add this repository to your Home Assistant instance:
 
-[![Open your Home Assistant instance and show the add add-on repository dialog with a specific repository URL pre-filled.](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2FLinumIQ%2Fhome-assistant-addons)
+[![Open your Home Assistant instance and show the add add-on repository dialog with a specific repository URL pre-filled.](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2FLinumIQ%2Fha-apps)
 
 Or add it manually:
 
@@ -27,7 +27,7 @@ Or add it manually:
 2. Click the three-dot menu (⋮) in the top right and select **Repositories**.
 3. Add the URL of this repository:
    ```
-   https://github.com/LinumIQ/home-assistant-addons
+   https://github.com/LinumIQ/ha-apps
    ```
 4. Click **Add**, then close the dialog.
 5. The LinumIQ add-ons should now appear in the add-on store.

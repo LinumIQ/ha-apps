@@ -8,8 +8,8 @@ slug: "caddy_mtls"
 description: >-
   Caddy reverse proxy with mutual TLS (mTLS) client certificate authentication
   and automatic HTTPS via Let's Encrypt.
-url: "https://github.com/LinumIQ/home-assistant-addons/tree/main/caddy-mtls"
-documentation: "https://github.com/LinumIQ/home-assistant-addons/blob/main/caddy-mtls/DOCS.md"
+url: "https://github.com/LinumIQ/ha-apps/tree/main/caddy-mtls"
+documentation: "https://github.com/LinumIQ/ha-apps/blob/main/caddy-mtls/DOCS.md"
 image: "ghcr.io/linumiq/{arch}-addon-caddy-mtls"
 
 # Supported architectures
