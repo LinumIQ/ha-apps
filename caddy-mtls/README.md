@@ -1,7 +1,7 @@
 # Caddy mTLS Proxy for Home Assistant
 
 [![Home Assistant Add-on](https://img.shields.io/badge/Home%20Assistant-Add--on-blue.svg)](https://www.home-assistant.io/addons/)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](../LICENSE)
 
 A Home Assistant add-on that provides a Caddy reverse proxy with mutual TLS (mTLS) authentication. Secure your Home Assistant with client certificates and automatic HTTPS via Let's Encrypt.
 
@@ -53,7 +53,7 @@ ca_organization: My Home
 ca_common_name: Home Assistant mTLS CA
 
 # DNS challenge (optional, for when port 80 is blocked)
-acme_dns_provider: none  # or: cloudflare, route53, hetzner
+acme_dns_provider: none # or: cloudflare, route53, hetzner
 dns_api_token: ""
 ```
 
@@ -72,12 +72,13 @@ Add names to the `client_names` list and restart the add-on:
 ```yaml
 client_names:
   - existing-user
-  - new-user  # Added
+  - new-user # Added
 ```
 
 ### Revoking Access
 
 To revoke all certificates:
+
 1. Stop the add-on
 2. Delete `/addon_configs/local_caddy_mtls/certs/`
 3. Remove revoked users from `client_names`
@@ -86,6 +87,7 @@ To revoke all certificates:
 ## Documentation
 
 See [DOCS.md](DOCS.md) for detailed documentation including:
+
 - DNS provider setup (Cloudflare, Route53, Hetzner)
 - Certificate installation guides for all platforms
 - Troubleshooting tips
@@ -100,7 +102,8 @@ Internet → Router:443 → Caddy (mTLS) → Home Assistant:8123
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+Apache License 2.0 - see [LICENSE](../LICENSE) and [NOTICE](../NOTICE) at the
+repository root for details.
 
 ## Contributing
 

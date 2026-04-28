@@ -1,0 +1,9 @@
+#!/command/with-contenv bashio
+# ==============================================================================
+# Home Assistant Add-on: Caddy mTLS Proxy
+# Long-running Caddy server. The Caddyfile is rendered by the init-caddy
+# oneshot before this service is started.
+# ==============================================================================
+
+bashio::log.info "Starting Caddy server..."
+exec /usr/bin/caddy run --config /etc/caddy/Caddyfile --adapter caddyfile

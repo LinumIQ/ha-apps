@@ -1,0 +1,76 @@
+#include <tunables/global>
+
+profile caddy_mtls flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+  #include <abstractions/nameservice>
+  #include <abstractions/ssl_certs>
+  #include <abstractions/openssl>
+
+  # Capabilities
+  capability setuid,
+  capability setgid,
+  capability dac_read_search,
+  capability dac_override,
+  capability net_bind_service,
+  capability sys_admin,
+  capability sys_chroot,
+  capability sys_ptrace,
+  capability kill,
+  capability audit_write,
+  capability chown,
+  capability fowner,
+  capability fsetid,
+
+  # S6-overlay
+  /init ix,
+  /bin/** ix,
+  /usr/bin/** ix,
+  /usr/sbin/** ix,
+  /usr/lib/bashio/** ix,
+  /run/{s6,s6-rc*,service}/** ix,
+  /package/** ix,
+  /command/** ix,
+  /etc/services.d/** rwix,
+  /etc/cont-init.d/** rwix,
+  /etc/cont-finish.d/** rwix,
+  /etc/s6-overlay/** rwix,
+  /etc/s6/** rwix,
+  /run/{,**} rwk,
+  /dev/tty rw,
+
+  # Caddy binary + config
+  /usr/bin/caddy ix,
+  /etc/caddy/** rw,
+
+  # Bashio + helpers
+  /usr/bin/bashio ix,
+  /usr/lib/** r,
+
+  # Add-on data
+  /data/** rwk,
+  /config/** rw,
+  /share/** rw,
+  /ssl/** rw,
+  /tmp/** rwk,
+
+  # Web assets / templates
+  /templates/** r,
+
+  # OpenSSL CA generation
+  /etc/ssl/** r,
+
+  # Network access
+  network inet stream,
+  network inet dgram,
+  network inet6 stream,
+  network inet6 dgram,
+  network netlink raw,
+  network unix stream,
+  network unix dgram,
+
+  # Process / proc
+  /proc/** r,
+  /proc/*/status r,
+  /proc/*/cmdline r,
+  /sys/** r,
+}

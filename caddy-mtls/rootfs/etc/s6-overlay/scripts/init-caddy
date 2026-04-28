@@ -1,0 +1,438 @@
+#!/command/with-contenv bashio
+# ==============================================================================
+# Home Assistant Add-on: Caddy mTLS Proxy
+# Init oneshot: validate config, render Caddyfile + download page, generate
+# certificates if mTLS is enabled.
+# ==============================================================================
+set -e
+
+# shellcheck source=rootfs/etc/s6-overlay/scripts/lib/cert-helpers.sh
+source /etc/s6-overlay/scripts/lib/cert-helpers.sh
+
+###############################################################################
+# Paths (also referenced by the Caddyfile)
+###############################################################################
+readonly CERT_DIR="/data/certs"
+readonly WWW_DIR="/data/www"
+readonly CADDY_DATA="/data/caddy"
+readonly CADDYFILE="/etc/caddy/Caddyfile"
+
+mkdir -p "${CERT_DIR}" "${WWW_DIR}" "${CADDY_DATA}"
+chmod 700 "${CERT_DIR}"
+
+###############################################################################
+# Read configuration
+###############################################################################
+bashio::log.info "Reading configuration..."
+
+DOMAIN="$(bashio::config 'domain')"
+EMAIL="$(bashio::config 'email')"
+UPSTREAM_HOST="$(bashio::config 'upstream_host')"
+UPSTREAM_PORT="$(bashio::config 'upstream_port')"
+MTLS_ENABLED="$(bashio::config 'mtls_enabled')"
+
+CA_COUNTRY="$(bashio::config 'ca_country')"
+CA_STATE="$(bashio::config 'ca_state')"
+CA_LOCALITY="$(bashio::config 'ca_locality')"
+CA_ORGANIZATION="$(bashio::config 'ca_organization')"
+CA_COMMON_NAME="$(bashio::config 'ca_common_name')"
+
+CLIENT_CERT_PASSWORD="$(bashio::config 'client_cert_password')"
+
+ACME_DNS_PROVIDER="$(bashio::config 'acme_dns_provider')"
+DNS_API_TOKEN="$(bashio::config 'dns_api_token')"
+LOG_LEVEL="$(bashio::config 'log_level' 'info')"
+
+# Required by the helper functions in cert-helpers.sh
+export CERT_DIR \
+       CA_COUNTRY CA_STATE CA_LOCALITY CA_ORGANIZATION CA_COMMON_NAME \
+       CLIENT_CERT_PASSWORD
+
+###############################################################################
+# Validation
+###############################################################################
+if bashio::var.is_empty "${DOMAIN}"; then
+    bashio::exit.nok "Option 'domain' is required (e.g. home.example.com)."
+fi
+
+if bashio::var.is_empty "${EMAIL}"; then
+    bashio::exit.nok "Option 'email' is required for Let's Encrypt registration."
+fi
+
+case "${ACME_DNS_PROVIDER}" in
+    none|cloudflare|route53|hetzner) ;;
+    *) bashio::exit.nok "Unknown acme_dns_provider '${ACME_DNS_PROVIDER}'." ;;
+esac
+
+if [[ "${ACME_DNS_PROVIDER}" != "none" ]] && bashio::var.is_empty "${DNS_API_TOKEN}"; then
+    bashio::exit.nok "DNS API token is required when acme_dns_provider is '${ACME_DNS_PROVIDER}'."
+fi
+
+if bashio::var.true "${MTLS_ENABLED}" && bashio::var.is_empty "${CLIENT_CERT_PASSWORD}"; then
+    bashio::exit.nok "client_cert_password must be set when mTLS is enabled."
+fi
+
+###############################################################################
+# Generate certificates if mTLS is enabled
+###############################################################################
+if bashio::var.true "${MTLS_ENABLED}"; then
+    bashio::log.info "mTLS is enabled, ensuring certificates are present..."
+
+    if [[ ! -f "${CERT_DIR}/mTLS-CA.crt" ]]; then
+        bashio::log.info "Generating CA certificate..."
+        generate_ca
+    else
+        bashio::log.info "Reusing existing CA certificate."
+    fi
+
+    if [[ ! -f "${CERT_DIR}/mTLS-server.crt" ]]; then
+        bashio::log.info "Generating server certificate for '${DOMAIN}'..."
+        generate_server_cert "${DOMAIN}"
+    else
+        bashio::log.info "Reusing existing server certificate."
+    fi
+
+    bashio::log.info "Processing client certificates..."
+    mapfile -t CLIENT_NAMES < <(bashio::jq "/data/options.json" '.client_names[]?')
+    for client_name in "${CLIENT_NAMES[@]}"; do
+        [[ -z "${client_name}" ]] && continue
+        if [[ ! -f "${CERT_DIR}/mTLS-client-${client_name}.p12" ]]; then
+            bashio::log.info "Generating client certificate for: ${client_name}"
+            generate_client_cert "${client_name}"
+        else
+            bashio::log.info "Reusing client certificate for: ${client_name}"
+        fi
+
+        if ! cp "${CERT_DIR}/mTLS-client-${client_name}.p12" "${WWW_DIR}/"; then
+            bashio::exit.nok "Failed to copy client cert '${client_name}' to www dir"
+        fi
+        chmod 644 "${WWW_DIR}/mTLS-client-${client_name}.p12"
+    done
+
+    if ! cp "${CERT_DIR}/mTLS-CA.crt" "${WWW_DIR}/"; then
+        bashio::exit.nok "Failed to copy CA cert to www dir"
+    fi
+    chmod 644 "${WWW_DIR}/mTLS-CA.crt"
+fi
+
+###############################################################################
+# Render certificate download page
+###############################################################################
+bashio::log.info "Rendering certificate download page..."
+
+# Strip any trailing slash from ingress entry, then re-append exactly one,
+# avoiding the historical "//" double-slash bug in generated links.
+INGRESS_ENTRY="$(bashio::addon.ingress_entry)"
+INGRESS_ENTRY="${INGRESS_ENTRY%/}/"
+
+write_download_page() {
+    local f="${WWW_DIR}/index.html"
+
+    cat > "${f}" <<'HTMLHEAD'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Caddy mTLS - Certificate Download</title>
+    <style>
+        :root {
+            --primary-color: #03a9f4;
+            --bg-color: #1c1c1c;
+            --card-bg: #2d2d2d;
+            --text-color: #ffffff;
+            --text-muted: #9e9e9e;
+        }
+        * { box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        .container { max-width: 800px; margin: 0 auto; }
+        h1 {
+            color: var(--primary-color);
+            border-bottom: 2px solid var(--primary-color);
+            padding-bottom: 10px;
+        }
+        h2 { color: var(--text-color); margin-top: 30px; }
+        .card {
+            background: var(--card-bg);
+            border-radius: 8px;
+            padding: 20px;
+            margin: 15px 0;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+        }
+        .client-card { display: flex; flex-wrap: wrap; align-items: center; gap: 20px; }
+        .client-info { flex: 1; min-width: 200px; }
+        .client-name { font-size: 1.2em; font-weight: bold; color: var(--primary-color); }
+        .download-btn {
+            display: inline-block;
+            background: var(--primary-color);
+            color: white;
+            padding: 10px 20px;
+            border-radius: 4px;
+            text-decoration: none;
+            margin-top: 10px;
+            transition: opacity 0.2s;
+        }
+        .download-btn:hover { opacity: 0.8; }
+        .instructions { background: #3d3d3d; padding: 15px; border-radius: 4px; margin-top: 15px; }
+        .instructions h3 { margin-top: 0; color: var(--primary-color); }
+        .instructions ol { padding-left: 20px; }
+        .muted { color: var(--text-muted); font-size: 0.9em; }
+        code {
+            background: #1c1c1c;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>&#128274; Caddy mTLS Certificates</h1>
+HTMLHEAD
+
+    if bashio::var.true "${MTLS_ENABLED}"; then
+        # HTML-escape the domain before embedding
+        local domain_html
+        domain_html="$(printf '%s' "${DOMAIN}" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+        {
+            printf '        <p>mTLS authentication is <strong style="color: #4caf50;">enabled</strong> for <code>%s</code></p>\n' "${domain_html}"
+            printf '        <h2>&#128220; CA Certificate</h2>\n'
+            printf '        <div class="card">\n'
+            printf '            <p>Install this CA certificate on devices that need to trust client certificates:</p>\n'
+            printf '            <a href="%smTLS-CA.crt" class="download-btn" download>Download CA Certificate</a>\n' "${INGRESS_ENTRY}"
+            printf '        </div>\n'
+            printf '        <h2>&#128100; Client Certificates</h2>\n'
+            printf '        <p class="muted">Each user needs their own .p12 file installed on their device.</p>\n'
+        } >> "${f}"
+
+        while IFS= read -r client_name; do
+            [[ -z "${client_name}" ]] && continue
+            local name_html
+            name_html="$(printf '%s' "${client_name}" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+            {
+                printf '        <div class="card client-card">\n'
+                printf '            <div class="client-info">\n'
+                printf '                <div class="client-name">%s</div>\n' "${name_html}"
+                printf '                <p class="muted">PKCS#12 certificate bundle (password protected)</p>\n'
+                printf '                <a href="%smTLS-client-%s.p12" class="download-btn" download>Download .p12</a>\n' "${INGRESS_ENTRY}" "${client_name}"
+                printf '            </div>\n'
+                printf '        </div>\n'
+            } >> "${f}"
+        done < <(bashio::jq "/data/options.json" '.client_names[]?')
+
+        cat >> "${f}" <<'HTMLINSTR'
+        <div class="instructions">
+            <h3>How to Import Certificates</h3>
+
+            <h4>iOS / iPadOS</h4>
+            <ol>
+                <li>Download the .p12 file</li>
+                <li>Go to Settings &rarr; Profile Downloaded</li>
+                <li>Install the profile and enter the certificate password</li>
+                <li>Go to Settings &rarr; General &rarr; About &rarr; Certificate Trust Settings</li>
+                <li>Enable full trust for the CA certificate</li>
+            </ol>
+
+            <h4>Android</h4>
+            <ol>
+                <li>Download the .p12 file</li>
+                <li>Go to Settings &rarr; Security &rarr; Encryption &amp; credentials</li>
+                <li>Tap "Install a certificate" &rarr; "VPN &amp; app user certificate"</li>
+                <li>Select the downloaded .p12 file and enter the password</li>
+            </ol>
+
+            <h4>Windows</h4>
+            <ol>
+                <li>Download the .p12 file</li>
+                <li>Double-click the file to open Certificate Import Wizard</li>
+                <li>Select "Current User" and click Next</li>
+                <li>Enter the certificate password</li>
+                <li>Let Windows automatically select the certificate store</li>
+            </ol>
+
+            <h4>macOS</h4>
+            <ol>
+                <li>Download the .p12 file</li>
+                <li>Double-click to open in Keychain Access</li>
+                <li>Enter the certificate password when prompted</li>
+                <li>The certificate will be added to your login keychain</li>
+            </ol>
+
+            <h4>Linux (Firefox)</h4>
+            <ol>
+                <li>Download the .p12 file</li>
+                <li>Go to Settings &rarr; Privacy &amp; Security &rarr; Certificates</li>
+                <li>Click "View Certificates" &rarr; "Your Certificates" tab</li>
+                <li>Click "Import" and select the .p12 file</li>
+                <li>Enter the certificate password</li>
+            </ol>
+        </div>
+HTMLINSTR
+    else
+        cat >> "${f}" <<'HTMLDISABLED'
+        <div class="card">
+            <p>mTLS authentication is <strong style="color: #ff9800;">disabled</strong>.</p>
+            <p>Enable mTLS in the add-on configuration to generate client certificates.</p>
+        </div>
+HTMLDISABLED
+    fi
+
+    cat >> "${f}" <<'HTMLFOOT'
+    </div>
+</body>
+</html>
+HTMLFOOT
+}
+
+if ! write_download_page; then
+    bashio::exit.nok "Failed to render download page"
+fi
+bashio::log.info "Download page rendered at ${WWW_DIR}/index.html"
+
+###############################################################################
+# Render Caddyfile
+###############################################################################
+bashio::log.info "Rendering Caddyfile..."
+
+# Map bashio log levels onto Caddy log levels.
+case "${LOG_LEVEL}" in
+    trace|debug)            CADDY_LOG_LEVEL="DEBUG" ;;
+    info|notice)            CADDY_LOG_LEVEL="INFO" ;;
+    warning)                CADDY_LOG_LEVEL="WARN" ;;
+    error|fatal)            CADDY_LOG_LEVEL="ERROR" ;;
+    *)                      CADDY_LOG_LEVEL="INFO" ;;
+esac
+
+TLS_DIRECTIVES=""
+if [[ "${ACME_DNS_PROVIDER}" != "none" ]]; then
+    # Pass the secret via environment variable referenced through Caddy's
+    # {env.X} placeholder so that the token never lands in the on-disk
+    # Caddyfile and cannot break the Caddyfile syntax.
+    export DNS_API_TOKEN
+    TLS_DIRECTIVES="${TLS_DIRECTIVES}        dns ${ACME_DNS_PROVIDER} {env.DNS_API_TOKEN}
+"
+fi
+
+if bashio::var.true "${MTLS_ENABLED}"; then
+    TLS_DIRECTIVES="${TLS_DIRECTIVES}        client_auth {
+            mode require_and_verify
+            trust_pool file {
+                pem_file ${CERT_DIR}/mTLS-CA.crt
+            }
+        }
+"
+fi
+
+# Caddy rejects an empty 'tls { }' block. Only emit it when we have
+# directives to put inside; otherwise omit it entirely so Caddy falls back
+# to fully automatic HTTPS (HTTP-01 / TLS-ALPN challenges).
+TLS_BLOCK=""
+if [[ -n "${TLS_DIRECTIVES}" ]]; then
+    TLS_BLOCK="tls {
+${TLS_DIRECTIVES}    }"
+fi
+
+cat > "${CADDYFILE}" <<CADDYFILE
+# Caddy mTLS Proxy - generated by init-caddy on every start. Do not edit.
+
+{
+    email ${EMAIL}
+
+    storage file_system {
+        root ${CADDY_DATA}
+    }
+
+    admin off
+
+    log default {
+        output stdout
+        format console
+        level ${CADDY_LOG_LEVEL}
+    }
+}
+
+# Public mTLS-protected reverse proxy
+${DOMAIN} {
+    ${TLS_BLOCK}
+
+    reverse_proxy ${UPSTREAM_HOST}:${UPSTREAM_PORT} {
+        header_up X-Real-IP {remote_host}
+    }
+
+    log {
+        output stdout
+        format console
+        level ${CADDY_LOG_LEVEL}
+    }
+}
+
+# Ingress server for the certificate download page (only Supervisor proxy).
+:8099 {
+    @blocked not remote_ip 172.30.32.2
+    abort @blocked
+
+    # Plain-text health endpoint used for diagnostics.
+    handle /_health {
+        respond "ok" 200
+    }
+
+    handle {
+        root * ${WWW_DIR}
+        file_server
+    }
+
+    log {
+        output stdout
+        format console
+        level ${CADDY_LOG_LEVEL}
+    }
+}
+CADDYFILE
+
+bashio::log.info "Validating generated Caddyfile..."
+if ! /usr/bin/caddy validate --config "${CADDYFILE}" --adapter caddyfile; then
+    bashio::exit.nok "Generated Caddyfile failed validation"
+fi
+
+###############################################################################
+# Mirror certs to /config for user access via the Samba/SSH/file editor add-ons.
+###############################################################################
+if bashio::var.true "${MTLS_ENABLED}" && [[ -d "/config" ]]; then
+    bashio::log.info "Mirroring certificates to /config/certs..."
+    mkdir -p /config/certs
+    chmod 700 /config/certs
+
+    if ! cp "${CERT_DIR}/mTLS-CA.crt" /config/certs/; then
+        bashio::log.warning "Could not copy CA cert to /config/certs"
+    else
+        chmod 644 /config/certs/mTLS-CA.crt
+    fi
+
+    while IFS= read -r client_name; do
+        [[ -z "${client_name}" ]] && continue
+        src="${CERT_DIR}/mTLS-client-${client_name}.p12"
+        dst="/config/certs/mTLS-client-${client_name}.p12"
+        if cp "${src}" "${dst}"; then
+            chmod 600 "${dst}"
+        else
+            bashio::log.warning "Could not copy '${src}' to /config/certs"
+        fi
+    done < <(bashio::jq "/data/options.json" '.client_names[]?')
+fi
+
+###############################################################################
+# Done
+###############################################################################
+bashio::log.info "Init complete:"
+bashio::log.info "  Domain:      ${DOMAIN}"
+bashio::log.info "  Upstream:    ${UPSTREAM_HOST}:${UPSTREAM_PORT}"
+bashio::log.info "  mTLS:        ${MTLS_ENABLED}"
+bashio::log.info "  ACME DNS:    ${ACME_DNS_PROVIDER}"
+bashio::log.info "  Log level:   ${LOG_LEVEL} (caddy=${CADDY_LOG_LEVEL})"

@@ -93,3 +93,9 @@ configuration:
       For Hetzner: Create an API token in the Hetzner DNS Console.
 
       Leave empty if using HTTP-01 challenge (acme_dns_provider = none).
+
+  log_level:
+    name: Log Level
+    description: >-
+      Verbosity for both the add-on init script and the Caddy server.
+      One of: trace, debug, info, notice, warning, error, fatal. Default: info.

@@ -1,0 +1,5 @@
+#!/command/execlineb -S0
+# When the long-running Caddy service exits for any reason, bring the whole
+# add-on container down so the Home Assistant Supervisor can restart it
+# (which re-runs the init oneshot from a clean state).
+s6-svscanctl -t /run/service

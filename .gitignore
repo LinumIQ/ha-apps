@@ -1,0 +1,12 @@
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Backups & local notes that should not ship
+*.bak
+PRD.md.bak
+
+# Local state
+.vscode/*.log

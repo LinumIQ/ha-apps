@@ -6,7 +6,7 @@ This add-on provides a Caddy reverse proxy with mutual TLS (mTLS) authentication
 
 - 🔒 **Automatic HTTPS** via Let's Encrypt
 - 🔐 **mTLS Authentication** - require client certificates for access
-- 📱 **Easy Certificate Distribution** - download page with QR codes
+- 📱 **Easy Certificate Distribution** - dedicated download page (admin-only ingress panel)
 - 🌐 **DNS-01 Challenge Support** - for when port 80 is unavailable
 - 👥 **Multiple Client Certificates** - generate certificates for each user/device
 
@@ -21,6 +21,7 @@ This add-on provides a Caddy reverse proxy with mutual TLS (mTLS) authentication
 ### Port 80 Availability
 
 Let's Encrypt requires port 80 for the HTTP-01 challenge. If port 80 is not available:
+
 - Use the DNS-01 challenge by configuring a DNS provider (Cloudflare, Route53, or Hetzner)
 - Ensure no other service is using port 80
 
@@ -35,39 +36,40 @@ Let's Encrypt requires port 80 for the HTTP-01 challenge. If port 80 is not avai
 
 ### Required Options
 
-| Option | Description | Example |
-|--------|-------------|---------|
-| `domain` | Your domain name | `home.example.com` |
-| `email` | Email for Let's Encrypt | `admin@example.com` |
+| Option   | Description             | Example             |
+| -------- | ----------------------- | ------------------- |
+| `domain` | Your domain name        | `home.example.com`  |
+| `email`  | Email for Let's Encrypt | `admin@example.com` |
 
 ### Optional Options
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `upstream_host` | `homeassistant` | Backend service hostname |
-| `upstream_port` | `8123` | Backend service port |
-| `mtls_enabled` | `true` | Enable client certificate authentication |
-| `client_names` | `["user"]` | List of client certificate names |
-| `client_cert_password` | `changeme` | Password for .p12 files |
+| Option                 | Default         | Description                                                                                    |
+| ---------------------- | --------------- | ---------------------------------------------------------------------------------------------- |
+| `upstream_host`        | `homeassistant` | Backend service hostname                                                                       |
+| `upstream_port`        | `8123`          | Backend service port                                                                           |
+| `mtls_enabled`         | `true`          | Enable client certificate authentication                                                       |
+| `client_names`         | `["user"]`      | List of client certificate names                                                               |
+| `client_cert_password` | `changeme`      | Password for .p12 files                                                                        |
+| `log_level`            | `info`          | Add-on / Caddy log verbosity (`trace`, `debug`, `info`, `notice`, `warning`, `error`, `fatal`) |
 
 ### CA Certificate Options
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `ca_country` | `US` | Two-letter country code |
-| `ca_state` | `State` | State or province |
-| `ca_locality` | `City` | City name |
-| `ca_organization` | `Home Assistant` | Organization name |
-| `ca_common_name` | `Home Assistant mTLS CA` | CA certificate name |
+| Option            | Default                  | Description             |
+| ----------------- | ------------------------ | ----------------------- |
+| `ca_country`      | `US`                     | Two-letter country code |
+| `ca_state`        | `State`                  | State or province       |
+| `ca_locality`     | `City`                   | City name               |
+| `ca_organization` | `Home Assistant`         | Organization name       |
+| `ca_common_name`  | `Home Assistant mTLS CA` | CA certificate name     |
 
 ### DNS Challenge Options (Optional)
 
 Use these options when port 80 is not available:
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `acme_dns_provider` | `none` | DNS provider: `none`, `cloudflare`, `route53`, `hetzner` |
-| `dns_api_token` | (empty) | API token for the DNS provider |
+| Option              | Default | Description                                              |
+| ------------------- | ------- | -------------------------------------------------------- |
+| `acme_dns_provider` | `none`  | DNS provider: `none`, `cloudflare`, `route53`, `hetzner` |
+| `dns_api_token`     | (empty) | API token for the DNS provider                           |
 
 #### Cloudflare Setup
 
@@ -80,6 +82,7 @@ Use these options when port 80 is not available:
 #### AWS Route53 Setup
 
 1. Create an IAM user with the following policy:
+
 ```json
 {
   "Version": "2012-10-17",
@@ -98,15 +101,13 @@ Use these options when port 80 is not available:
     },
     {
       "Effect": "Allow",
-      "Action": [
-        "route53:ListHostedZonesByName",
-        "route53:ListHostedZones"
-      ],
+      "Action": ["route53:ListHostedZonesByName", "route53:ListHostedZones"],
       "Resource": "*"
     }
   ]
 }
 ```
+
 2. Set `dns_api_token` to `ACCESS_KEY_ID:SECRET_ACCESS_KEY`
 
 #### Hetzner DNS Setup
@@ -119,20 +120,25 @@ Use these options when port 80 is not available:
 
 ### Method 1: Web Interface (Recommended)
 
-1. Open the add-on's web UI from the Home Assistant sidebar
+1. Open the add-on's web UI from the Home Assistant sidebar (admin only)
 2. Click the download button for each client certificate
-3. Scan the QR code on mobile devices for easy download
+
+> The download links are served through Home Assistant Ingress and require an
+> authenticated admin session. There are intentionally no QR codes: a QR
+> scanned from another device would land on a session-less request and be
+> rejected.
 
 ### Method 2: File Access
 
 Certificates are also available at:
+
 - `/addon_configs/local_caddy_mtls/certs/` (via Samba or SSH add-ons)
 
 ## Installing Client Certificates
 
 ### iOS / iPadOS
 
-1. Download the .p12 file (tap download link or scan QR code)
+1. Download the .p12 file (tap download link)
 2. Go to **Settings → Profile Downloaded**
 3. Tap **Install** and enter your device passcode
 4. Enter the certificate password when prompted
@@ -230,10 +236,11 @@ A new CA will be generated, invalidating all previous client certificates. Distr
 ## Logs
 
 View add-on logs in Home Assistant:
+
 1. Go to **Settings → Add-ons → Caddy mTLS Proxy**
 2. Click the **Log** tab
 
 ## Support
 
 For issues and feature requests, please visit:
-https://github.com/LinumIQ/caddy-mtls/issues
+https://github.com/LinumIQ/home-assistant-addons/issues
