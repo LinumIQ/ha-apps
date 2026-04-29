@@ -19,13 +19,15 @@ ENV CGO_ENABLED=0
 # hadolint ignore=DL3018
 RUN apk add --no-cache git ca-certificates
 
-RUN go install "github.com/caddyserver/xcaddy/cmd/xcaddy@${XCADDY_VERSION}"
-
-RUN xcaddy build "${CADDY_VERSION}" \
-    --with github.com/caddy-dns/cloudflare \
-    --with github.com/caddy-dns/route53 \
-    --with github.com/caddy-dns/hetzner \
-    --output /caddy
+# Install xcaddy and immediately use it to build a custom Caddy binary
+# (kept in a single RUN layer to satisfy hadolint DL3059 and because the
+# intermediate xcaddy binary is not needed in the final builder image).
+RUN go install "github.com/caddyserver/xcaddy/cmd/xcaddy@${XCADDY_VERSION}" \
+ && xcaddy build "${CADDY_VERSION}" \
+        --with github.com/caddy-dns/cloudflare \
+        --with github.com/caddy-dns/route53 \
+        --with github.com/caddy-dns/hetzner \
+        --output /caddy
 
 # ---- Stage 2: Final image based on community add-ons base (s6-overlay v3) ----
 # hadolint ignore=DL3006
@@ -66,9 +68,14 @@ RUN chmod a+x \
         /etc/s6-overlay/s6-rc.d/caddy/run \
         /etc/s6-overlay/s6-rc.d/caddy/finish
 
-# Health monitoring is handled by the Home Assistant Supervisor watchdog
-# (see config.yaml `watchdog:`); a Docker HEALTHCHECK would be ignored by
-# Supervisor and only complicate plain `docker run` workflows.
+# Health monitoring: probe the local HTTPS port. curl returns 0 for any
+# HTTP response (including 401 when no mTLS client cert is presented),
+# so a successful TLS handshake is sufficient to consider the add-on
+# healthy. Home Assistant Supervisor reads this HEALTHCHECK directive
+# and restarts the add-on after repeated failures.
+HEALTHCHECK --start-period=2m --interval=30s --timeout=10s --retries=3 \
+    CMD curl --silent --show-error --insecure --output /dev/null \
+        --max-time 5 https://127.0.0.1/ || exit 1
 
 # OCI image labels
 LABEL \
