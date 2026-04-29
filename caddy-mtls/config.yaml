@@ -13,11 +13,11 @@ documentation: "https://github.com/LinumIQ/ha-apps/blob/main/caddy-mtls/DOCS.md"
 image: "ghcr.io/linumiq/{arch}-addon-caddy-mtls"
 
 # Supported architectures
+# Note: i386 and armv7 were dropped as they are no longer supported by
+# Home Assistant OS / Supervisor.
 arch:
   - aarch64
   - amd64
-  - armv7
-  - i386
 
 # Use S6-overlay v3 from the community add-ons base image
 init: false
