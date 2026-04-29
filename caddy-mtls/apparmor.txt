@@ -22,14 +22,14 @@ profile caddy_mtls flags=(attach_disconnected,mediate_deleted) {
   capability fsetid,
 
   # S6-overlay
-  /init ix,
-  /bin/** ix,
-  /usr/bin/** ix,
-  /usr/sbin/** ix,
-  /usr/lib/bashio/** ix,
-  /run/{s6,s6-rc*,service}/** ix,
-  /package/** ix,
-  /command/** ix,
+  /init rix,
+  /bin/** rix,
+  /usr/bin/** rix,
+  /usr/sbin/** rix,
+  /usr/lib/bashio/** rix,
+  /run/{s6,s6-rc*,service}/** rix,
+  /package/** rix,
+  /command/** rix,
   /etc/services.d/** rwix,
   /etc/cont-init.d/** rwix,
   /etc/cont-finish.d/** rwix,
@@ -39,11 +39,11 @@ profile caddy_mtls flags=(attach_disconnected,mediate_deleted) {
   /dev/tty rw,
 
   # Caddy binary + config
-  /usr/bin/caddy ix,
+  /usr/bin/caddy rix,
   /etc/caddy/** rw,
 
   # Bashio + helpers
-  /usr/bin/bashio ix,
+  /usr/bin/bashio rix,
   /usr/lib/** r,
 
   # Add-on data
