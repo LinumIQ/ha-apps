@@ -43,10 +43,20 @@ ARG BUILD_REPOSITORY
 ARG BUILD_VERSION
 
 # Install runtime dependencies. The hassio-addons base already provides bash,
-# jq, curl, tzdata, ca-certificates, s6-overlay and bashio. We only need the
-# OpenSSL CLI for cert generation and libcap (for setcap on the Caddy binary).
+# jq, curl, tzdata, ca-certificates, s6-overlay and bashio. We need:
+#   - openssl: cert generation / CRL management
+#   - libcap:  setcap on the Caddy binary
+#   - python3 + py3-pip: cert manager FastAPI app and expiry monitor
+#   - py3-fastapi, py3-uvicorn, py3-jinja2: avoid pip-compiling at build time
 # hadolint ignore=DL3018
-RUN apk add --no-cache openssl libcap
+RUN apk add --no-cache \
+        openssl \
+        libcap \
+        python3 \
+        py3-fastapi \
+        py3-jinja2 \
+        py3-python-multipart \
+        uvicorn
 
 # Install the custom Caddy build from the builder stage and grant it the
 # capability to bind to privileged ports (80/443) without running as root.
@@ -64,18 +74,25 @@ COPY rootfs /
 RUN chmod a+x \
         /etc/s6-overlay/scripts/init-caddy \
         /etc/s6-overlay/scripts/lib/cert-helpers.sh \
+        /etc/s6-overlay/scripts/lib/state.sh \
         /etc/s6-overlay/s6-rc.d/init-caddy/up \
         /etc/s6-overlay/s6-rc.d/caddy/run \
-        /etc/s6-overlay/s6-rc.d/caddy/finish
+        /etc/s6-overlay/s6-rc.d/caddy/finish \
+        /etc/s6-overlay/s6-rc.d/cert-mgr/run \
+        /etc/s6-overlay/s6-rc.d/cert-mgr/finish \
+        /etc/s6-overlay/s6-rc.d/cert-monitor/run \
+        /etc/s6-overlay/s6-rc.d/cert-monitor/finish
 
-# Health monitoring: probe the local HTTPS port. curl returns 0 for any
-# HTTP response (including 401 when no mTLS client cert is presented),
-# so a successful TLS handshake is sufficient to consider the add-on
-# healthy. Home Assistant Supervisor reads this HEALTHCHECK directive
-# and restarts the add-on after repeated failures.
+# Health monitoring: probe Caddy's local admin API and the cert-mgr
+# ingress port. We deliberately avoid hitting the public HTTPS port
+# because that would require a valid (ACME-issued) TLS certificate to
+# be present, which isn't true during the brief startup window or when
+# ACME challenges are temporarily failing - both of which are normal,
+# recoverable conditions that should not flap the add-on.
 HEALTHCHECK --start-period=2m --interval=30s --timeout=10s --retries=3 \
-    CMD curl --silent --show-error --insecure --output /dev/null \
-        --max-time 5 https://127.0.0.1/ || exit 1
+    CMD curl --silent --fail --max-time 5 http://127.0.0.1:2019/config/ > /dev/null \
+        && curl --silent --fail --max-time 5 http://127.0.0.1:8099/_health > /dev/null \
+        || exit 1
 
 # OCI image labels
 LABEL \

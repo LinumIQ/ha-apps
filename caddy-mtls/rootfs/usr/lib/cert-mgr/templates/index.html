@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Caddy mTLS - Certificate Manager</title>
+<link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+<header>
+  <h1>Caddy mTLS - Certificate Manager</h1>
+  <p class="sub">Manage the certificate authority and client certificates for this add-on.</p>
+</header>
+
+<section class="card">
+  <h2>Certificate Authority</h2>
+  {% if state.ca %}
+    <table class="meta">
+      <tr><th>Subject CN</th><td>{{ state.ca.subject_cn }}</td></tr>
+      <tr><th>Serial</th><td><code>{{ state.ca.serial }}</code></td></tr>
+      <tr><th>Fingerprint (SHA-256)</th><td><code>{{ state.ca.fingerprint_sha256 }}</code></td></tr>
+      <tr><th>Not before</th><td>{{ state.ca.not_before }}</td></tr>
+      <tr><th>Not after</th><td>{{ state.ca.not_after }}</td></tr>
+    </table>
+  {% else %}
+    <p class="warn">No CA metadata in state file.</p>
+  {% endif %}
+  <p>
+    {% if ca_crt_exists %}<a class="btn" href="download/ca">Download CA cert</a>{% endif %}
+    {% if crl_exists %}<a class="btn" href="download/crl">Download CRL</a>{% endif %}
+  </p>
+  <details>
+    <summary class="danger">Regenerate CA (irreversible)</summary>
+    <p class="warn">
+      This wipes ALL existing certificates and issues a brand-new CA, server cert
+      and client certs (using the current client list). All previously installed
+      client bundles will stop working immediately and must be redistributed.
+    </p>
+    <form method="post" action="api/ca/regenerate">
+      <label>
+        Type <code>REGENERATE-CA</code> to confirm:
+        <input type="text" name="confirm" required pattern="REGENERATE-CA" autocomplete="off">
+      </label>
+      <button type="submit" class="btn-danger">Regenerate CA</button>
+    </form>
+  </details>
+</section>
+
+<section class="card">
+  <h2>Client certificates</h2>
+  <table class="clients">
+    <thead>
+      <tr>
+        <th>Name</th><th>Status</th><th>Serial</th><th>Not after</th><th>Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for c in state.clients %}
+      <tr>
+        <td>{{ c.name }}</td>
+        <td><span class="status status-{{ c.status }}">{{ c.status }}</span></td>
+        <td><code>{{ c.serial | default('-') }}</code></td>
+        <td>{{ c.not_after | default('-') }}</td>
+        <td class="actions">
+          {% if c.status == 'active' %}
+            <a class="btn" href="download/client/{{ c.name }}">.p12</a>
+            <form method="post" action="api/clients/{{ c.name }}/regenerate" style="display:inline">
+              <button class="btn">Regenerate</button>
+            </form>
+            <form method="post" action="api/clients/{{ c.name }}/revoke" style="display:inline">
+              <input type="hidden" name="reason" value="superseded">
+              <button class="btn-danger" onclick="return confirm('Revoke client {{ c.name }}?')">Revoke</button>
+            </form>
+          {% else %}
+            <em>{{ c.status }}{% if c.revocation_reason %} ({{ c.revocation_reason }}){% endif %}</em>
+          {% endif %}
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="5"><em>No clients yet.</em></td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h3>Add new client</h3>
+  <form method="post" action="api/clients">
+    <label>
+      Name:
+      <input type="text" name="name" required pattern="[A-Za-z0-9._\-]{1,64}" autocomplete="off">
+    </label>
+    <button class="btn" type="submit">Create</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>CRL</h2>
+  {% if state.crl_number %}
+    <p>CRL number: <code>{{ state.crl_number }}</code> &mdash; generated {{ state.crl_generated_at }}</p>
+  {% else %}
+    <p class="warn">CRL not yet generated.</p>
+  {% endif %}
+</section>
+
+<footer>
+  <p>state version {{ state.version }}</p>
+</footer>
+</body>
+</html>

@@ -9,6 +9,9 @@ This add-on provides a Caddy reverse proxy with mutual TLS (mTLS) authentication
 - 📱 **Easy Certificate Distribution** - dedicated download page (admin-only ingress panel)
 - 🌐 **DNS-01 Challenge Support** - for when port 80 is unavailable
 - 👥 **Multiple Client Certificates** - generate certificates for each user/device
+- 🛠️ **Web Certificate Manager** - add, revoke and regenerate certificates from the ingress UI
+- ♻️ **Certificate Revocation List (CRL)** - revoked clients are rejected on the next handshake without restarts
+- 📅 **Expiration Notifications** - per-cert sensors and persistent notifications as expiry approaches
 
 ## Requirements
 
@@ -51,6 +54,8 @@ Let's Encrypt requires port 80 for the HTTP-01 challenge. If port 80 is not avai
 | `client_names`         | `["user"]`      | List of client certificate names                                                               |
 | `client_cert_password` | `changeme`      | Password for .p12 files                                                                        |
 | `log_level`            | `info`          | Add-on / Caddy log verbosity (`trace`, `debug`, `info`, `notice`, `warning`, `error`, `fatal`) |
+| `cert_expiry_warn_days`     | `[30, 14, 7, 1]` | List of days-before-expiry thresholds at which to fire a notification (one notification per crossed threshold per cert)        |
+| `cert_check_interval_hours` | `6`              | How often the `cert-monitor` service polls certificate metadata and publishes sensor states (`1`-`168`)                          |
 
 ### CA Certificate Options
 
@@ -187,7 +192,30 @@ Certificates are also available at:
 3. Click **Import** and select the .p12 file
 4. Enter the certificate password
 
+## Web Certificate Manager
+
+The ingress panel exposes a dashboard with the following capabilities (all
+require an authenticated Home Assistant admin session and are restricted to
+the Supervisor ingress IP):
+
+- **Add a client** - issues a new client certificate, adds it to the
+  active allowlist and reloads Caddy in-place. Names must match
+  `[A-Za-z0-9._-]+`. Duplicate names are rejected with HTTP 409.
+- **Revoke a client** - revokes the cert in the CA database, regenerates
+  the CRL, removes the client from the active allowlist and reloads
+  Caddy. Subsequent handshakes from that client are rejected.
+- **Regenerate a client** - revokes the old serial (it remains in the
+  CRL) and issues a fresh certificate under the same name.
+- **Regenerate the CA** - destructive: invalidates every existing
+  client certificate. Requires you to type `REGENERATE-CA` in the
+  confirmation field; any other value returns HTTP 400.
+- **Downloads** - CA certificate, CRL and per-client `.p12` bundles.
+
 ## Adding New Users
+
+The recommended path is the Web Certificate Manager (above). The legacy
+`client_names` option is still honoured: any name listed there is
+ensured at start-up. To add a user permanently via configuration:
 
 1. Go to the add-on configuration
 2. Add new names to the `client_names` list
@@ -196,16 +224,38 @@ Certificates are also available at:
 
 ## Certificate Revocation
 
-To revoke all client certificates (e.g., if a device is lost):
+### Revoking a single client (recommended)
 
-1. Stop the add-on
-2. Delete the certificate files:
-   - Via SSH: `rm -rf /addon_configs/local_caddy_mtls/certs/`
-   - Or delete `/data/certs/` inside the add-on container
-3. Optionally remove specific client names from `client_names`
-4. Restart the add-on
+Use the **Revoke** button in the Web Certificate Manager. The client's
+serial is added to the CRL served at
+`http://<your-domain>/mTLS-CA.crl` and Caddy is reloaded immediately.
 
-A new CA will be generated, invalidating all previous client certificates. Distribute new certificates to authorized users.
+### Revoking all client certificates
+
+If you have lost control of the CA itself (e.g. compromised key), use
+**Regenerate CA** in the Web Certificate Manager (typed confirmation
+required). This rotates the CA, invalidates every existing client
+  certificate, and re-issues fresh certs for
+client bundles.
+
+## Expiration Notifications
+
+When the add-on starts, a `cert-monitor` long-run service publishes a
+sensor entity per certificate to Home Assistant via the Supervisor
+proxy:
+
+- `sensor.caddy_mtls_ca_expiry`
+- `sensor.caddy_mtls_client_<name>_expiry`
+
+The sensor value is the number of days remaining until the certificate
+expires (`unit_of_measurement: d`), with the exact `not_after` timestamp
+in the attributes. Use these in automations / Lovelace cards.
+
+Whenever a certificate's days-remaining first drops to or below one of
+the `cert_expiry_warn_days` thresholds, a persistent notification is
+raised in Home Assistant. Each (certificate, threshold) pair fires at
+most once - rotating the certificate (which changes its serial) resets
+the state.
 
 ## Troubleshooting
 

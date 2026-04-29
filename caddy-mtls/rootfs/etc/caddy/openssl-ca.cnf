@@ -1,0 +1,54 @@
+# OpenSSL CA configuration used by `openssl ca` for issuing and revoking
+# server / client certificates. Paths and runtime values are pulled from
+# environment variables so this file can be shipped as static content.
+#
+# Required env vars at call time:
+#   CERT_DIR        - base certificate directory (e.g. /data/certs)
+#   SAN_DNS         - subjectAltName value for server issuance
+#                     (e.g. "DNS:foo.example.com,DNS:*.foo.example.com")
+#   CRL_DOMAIN      - FQDN that hosts the public CRL over HTTP
+#
+# index.txt.attr is created with `unique_subject = no` so we can re-issue a
+# certificate with the same CN (e.g. after revocation).
+
+[ ca ]
+default_ca = mtls_ca
+
+[ mtls_ca ]
+dir              = ${ENV::CERT_DIR}
+database         = $dir/ca-db/index.txt
+new_certs_dir    = $dir/ca-db/newcerts
+serial           = $dir/ca-db/serial
+crlnumber        = $dir/ca-db/crlnumber
+certificate      = $dir/mTLS-CA.crt
+private_key      = $dir/mTLS-CA.key
+default_md       = sha256
+default_days     = 365
+default_crl_days = 30
+policy           = mtls_policy
+unique_subject   = no
+copy_extensions  = none
+email_in_dn      = no
+rand_serial      = no
+preserve         = no
+name_opt         = ca_default
+cert_opt         = ca_default
+
+[ mtls_policy ]
+countryName            = optional
+stateOrProvinceName    = optional
+localityName           = optional
+organizationName       = optional
+organizationalUnitName = optional
+commonName             = supplied
+emailAddress           = optional
+
+[ client_ext ]
+authorityKeyIdentifier = keyid,issuer
+basicConstraints       = CA:FALSE
+keyUsage               = digitalSignature,keyEncipherment,dataEncipherment
+extendedKeyUsage       = clientAuth
+crlDistributionPoints  = URI:http://${ENV::CRL_DOMAIN}/mTLS-CA.crl
+
+[ crl_ext ]
+authorityKeyIdentifier = keyid:always

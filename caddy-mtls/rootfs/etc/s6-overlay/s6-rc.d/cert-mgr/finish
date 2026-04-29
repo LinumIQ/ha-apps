@@ -1,0 +1,4 @@
+#!/command/execlineb -S0
+# When cert-mgr exits, just let s6 restart it (don't kill the whole add-on).
+foreground { s6-sleep 2 }
+exit 0

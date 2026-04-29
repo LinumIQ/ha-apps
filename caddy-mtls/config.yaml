@@ -3,7 +3,7 @@
 # https://developers.home-assistant.io/docs/add-ons/configuration/
 
 name: "Caddy mTLS Proxy"
-version: "1.1.1"
+version: "1.2.0"
 slug: "caddy_mtls"
 description: >-
   Caddy reverse proxy with mutual TLS (mTLS) client certificate authentication
@@ -31,11 +31,18 @@ ports_description:
   "80/tcp": "HTTP port for Let's Encrypt HTTP-01 ACME challenge"
   "443/tcp": "HTTPS port with mTLS authentication"
 
-# Ingress configuration for the certificate download page
+# Ingress configuration for the certificate management web UI (FastAPI app
+# served by the cert-mgr s6 service on port 8099 inside the container).
 ingress: true
+ingress_port: 8099
 ingress_entry: /
 panel_icon: mdi:certificate-outline
 panel_title: "Caddy mTLS"
+
+# Allow the cert-monitor service to publish sensor entities and persistent
+# notifications to Home Assistant via the Supervisor proxy.
+hassio_api: true
+homeassistant_api: true
 
 # File mappings
 map:
@@ -60,6 +67,12 @@ options:
   acme_dns_provider: "none"
   dns_api_token: ""
   log_level: "info"
+  cert_expiry_warn_days:
+    - 30
+    - 14
+    - 7
+    - 1
+  cert_check_interval_hours: 6
 
 # Schema for options validation
 schema:
@@ -79,6 +92,9 @@ schema:
   acme_dns_provider: list(none|cloudflare|route53|hetzner)
   dns_api_token: password?
   log_level: list(trace|debug|info|notice|warning|error|fatal)?
+  cert_expiry_warn_days:
+    - int(1,365)
+  cert_check_interval_hours: int(1,168)
 
 # Resource configuration
 timeout: 300

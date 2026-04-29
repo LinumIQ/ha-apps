@@ -1,0 +1,45 @@
+#!/command/with-contenv bashio
+# ==============================================================================
+# Home Assistant Add-on: Caddy mTLS Proxy
+# Long-running cert-mgr FastAPI app served on the ingress port.
+#
+# This service must inherit the same shell-helper environment as the
+# init-caddy oneshot so it can shell out to the cert-helpers / state.sh
+# library functions and produce identical artefacts.
+# ==============================================================================
+
+bashio::log.info "Starting cert-mgr (FastAPI) service..."
+
+# Reuse the same options the init oneshot read.
+DOMAIN="$(bashio::config 'domain')"
+CA_COUNTRY="$(bashio::config 'ca_country')"
+CA_STATE="$(bashio::config 'ca_state')"
+CA_LOCALITY="$(bashio::config 'ca_locality')"
+CA_ORGANIZATION="$(bashio::config 'ca_organization')"
+CA_COMMON_NAME="$(bashio::config 'ca_common_name')"
+CLIENT_CERT_PASSWORD="$(bashio::config 'client_cert_password')"
+LOG_LEVEL="$(bashio::config 'log_level' 'info')"
+
+case "${LOG_LEVEL}" in
+    trace|debug)            UVICORN_LOG_LEVEL="debug"; export CERT_MGR_LOG_LEVEL="DEBUG" ;;
+    info|notice)            UVICORN_LOG_LEVEL="info";  export CERT_MGR_LOG_LEVEL="INFO" ;;
+    warning)                UVICORN_LOG_LEVEL="warning"; export CERT_MGR_LOG_LEVEL="WARNING" ;;
+    error|fatal)            UVICORN_LOG_LEVEL="error"; export CERT_MGR_LOG_LEVEL="ERROR" ;;
+    *)                      UVICORN_LOG_LEVEL="info";  export CERT_MGR_LOG_LEVEL="INFO" ;;
+esac
+
+export CERT_DIR="/data/certs"
+export STATE_FILE="/data/state.json"
+export STATE_LOCK="/data/state.json.lock"
+export CADDYFILE="/etc/caddy/Caddyfile"
+export CADDY_ADMIN="localhost:2019"
+export OPENSSL_CA_CNF="/etc/caddy/openssl-ca.cnf"
+export DOMAIN \
+       CA_COUNTRY CA_STATE CA_LOCALITY CA_ORGANIZATION CA_COMMON_NAME \
+       CLIENT_CERT_PASSWORD
+
+cd /usr/lib/cert-mgr || exit 1
+exec uvicorn app:app \
+    --host 0.0.0.0 \
+    --port 8099 \
+    --log-level "${UVICORN_LOG_LEVEL}"

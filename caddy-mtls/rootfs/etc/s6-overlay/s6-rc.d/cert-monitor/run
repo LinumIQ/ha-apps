@@ -1,0 +1,31 @@
+#!/command/with-contenv bashio
+# ==============================================================================
+# Home Assistant Add-on: Caddy mTLS Proxy
+# Long-running cert expiry monitor: publishes per-cert sensor entities and
+# raises persistent notifications as warning thresholds are crossed.
+# ==============================================================================
+
+bashio::log.info "Starting cert-monitor service..."
+
+LOG_LEVEL="$(bashio::config 'log_level' 'info')"
+case "${LOG_LEVEL}" in
+    trace|debug) export CERT_MGR_LOG_LEVEL="DEBUG" ;;
+    info|notice) export CERT_MGR_LOG_LEVEL="INFO" ;;
+    warning)     export CERT_MGR_LOG_LEVEL="WARNING" ;;
+    error|fatal) export CERT_MGR_LOG_LEVEL="ERROR" ;;
+    *)           export CERT_MGR_LOG_LEVEL="INFO" ;;
+esac
+
+# Convert hours -> seconds.
+HOURS="$(bashio::config 'cert_check_interval_hours' '6')"
+export CERT_CHECK_INTERVAL_SECONDS="$(( HOURS * 3600 ))"
+
+# Comma-separated list of warning thresholds in days.
+THRESHOLDS="$(bashio::jq '/data/options.json' '.cert_expiry_warn_days // [30,14,7,1] | join(",")')"
+export CERT_EXPIRY_WARN_DAYS="${THRESHOLDS}"
+
+export STATE_FILE="/data/state.json"
+export SUPERVISOR_URL="http://supervisor"
+
+cd /usr/lib/cert-mgr || exit 1
+exec python3 monitor.py

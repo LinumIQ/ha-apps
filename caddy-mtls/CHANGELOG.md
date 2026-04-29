@@ -5,6 +5,81 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-04-29
+
+### Added
+
+- **Certificate Revocation List (CRL) support.** Each issued client
+  certificate now carries a `crlDistributionPoints` extension pointing at
+  `http://<domain>/mTLS-CA.crl`, and the add-on serves the CRL over plain
+  HTTP from a dedicated site block. Revocations are recorded via
+  `openssl ca` against an on-disk index database under
+  `/data/certs/ca-db/`. The CRL is regenerated on every revocation and on
+  every container restart, and Caddy is reloaded in-place via its admin
+  API (now bound to `localhost:2019`) so changes take effect without
+  dropping connections.
+- **Certificate expiration notifications.** A new `cert-monitor` long-run
+  service publishes per-certificate sensor entities to Home Assistant
+  (`sensor.caddy_mtls_<slug>_expiry`, value = days remaining) via the
+  Supervisor REST proxy and raises a persistent notification as the
+  certificate crosses one of the configured warning thresholds (default
+  30 / 14 / 7 / 1 days). Each (cert, threshold) pair fires at most once
+  per cert lifetime; rotating the cert resets the state.
+- **Web UI for certificate management.** A new FastAPI app
+  (`cert-mgr` long-run, served on the ingress port) exposes a dashboard
+  to add new clients, revoke existing ones, regenerate individual
+  client certificates, download CA / CRL / `.p12` bundles and (with
+  a typed `REGENERATE-CA` confirmation string) perform a full CA
+  regeneration. All mutations call into the same shell helper library
+  used by the init oneshot, then trigger `caddy reload` so the active
+  client allowlist is updated atomically.
+- New options: `cert_expiry_warn_days` (list of int, default
+  `[30, 14, 7, 1]`) and `cert_check_interval_hours` (1-168, default 6).
+- New Supervisor capabilities: `hassio_api: true` and
+  `homeassistant_api: true` so the monitor can publish sensor states and
+  notifications.
+
+### Changed
+
+- Client certificates are now issued through `openssl ca` with a proper
+  serial database and `unique_subject = no`, allowing the same CN to be
+  re-issued after revocation.
+- The active client allowlist directory (`/data/certs/active/`) now
+  contains `.pem` files (Caddy's `verifier leaf folder` loader requires
+  this extension; previously `.crt` files were silently ignored).
+- `/data/state.json` is the single source of truth for cert metadata,
+  notification state and revocation history. It is updated atomically
+  under a flock-protected jq pipeline.
+- The container `HEALTHCHECK` now probes Caddy's local admin API and the
+  cert-mgr ingress port instead of the public HTTPS port, so a
+  transient ACME failure (or the brief startup window before the first
+  certificate is issued) no longer marks the add-on unhealthy.
+
+### Removed
+
+- The legacy self-signed `mTLS-server.crt` / `/api/server/regenerate`
+  code path. Caddy issues its own publicly-trusted TLS certificate via
+  ACME, so the additional self-signed server certificate was unused. On
+  upgrade, any pre-existing `.server` block is automatically pruned from
+  `/data/state.json`.
+
+### Fixed
+
+- Cert metadata in `/data/state.json` now stores `not_before` /
+  `not_after` as ISO-8601 UTC timestamps (parsed via
+  `openssl x509 -dateopt iso_8601`). The previous busybox `date -d`
+  call could not parse OpenSSL's `MMM DD HH:MM:SS YYYY GMT` format and
+  emitted "Could not parse" warnings from `cert-monitor`.
+- Web UI template referenced legacy field names
+  (`state.ca.subject`, `state.server.subject`); now uses the actual
+  `subject_cn` keys, so the dashboard renders correctly.
+- HA's ingress proxy can forward the iframe root as `GET //` (doubled
+  slash), which previously hit FastAPI's 404 handler. The
+  `IngressOnlyMiddleware` now collapses runs of leading slashes so the
+  dashboard renders on first load.
+- Several edge cases in the CRL reason normalisation (`key_compromise`
+  vs `keyCompromise`, etc).
+
 ## [1.1.1] - 2026-04-29
 
 ### Fixed
