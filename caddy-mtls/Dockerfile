@@ -3,18 +3,18 @@
 ARG BUILD_FROM=ghcr.io/hassio-addons/base:20.1.0
 
 # ---- Stage 1: Build a custom Caddy with DNS provider modules via xcaddy ----
-# Cross-compile from the build platform to the target arch so users on slow
-# Pi-class hardware are not forced to compile Go locally.
-FROM --platform=$BUILDPLATFORM golang:1.25.1-alpine AS caddy-builder
+# The Home Assistant builder runs this under QEMU for non-native target
+# architectures, so we build natively for the target platform. We deliberately
+# avoid the BUILDPLATFORM/TARGETPLATFORM cross-compile pattern because it
+# forces buildx into the docker-container driver, which does not load the
+# resulting image into the local Docker daemon and thus breaks the HA
+# builder's subsequent `docker tag` step.
+FROM golang:1.25.1-alpine AS caddy-builder
 
-ARG TARGETOS
-ARG TARGETARCH
 ARG CADDY_VERSION=v2.10.2
 ARG XCADDY_VERSION=v0.4.4
 
-ENV CGO_ENABLED=0 \
-    GOOS=${TARGETOS} \
-    GOARCH=${TARGETARCH}
+ENV CGO_ENABLED=0
 
 # hadolint ignore=DL3018
 RUN apk add --no-cache git ca-certificates
