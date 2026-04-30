@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] - 2026-04-30
+
+### Fixed
+
+- **Cert-manager UI no longer breaks out of the Home Assistant ingress
+  iframe** after creating, revoking, regenerating or rotating a client
+  certificate (or regenerating the CA). The `303 See Other` response
+  used a bare absolute `Location: /`, which the browser resolved at the
+  HA root and replaced the iframe with the main HA dashboard. The
+  redirect now respects the `X-Ingress-Path` header injected by
+  Supervisor and points back at the dashboard inside the ingress
+  prefix.
+
 ## [1.2.1] - 2026-04-30
 
 ### Fixed

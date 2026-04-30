@@ -264,12 +264,24 @@ async def download_client(name: str):
 # Routes - mutations
 # ---------------------------------------------------------------------------
 
-def _redirect_home() -> RedirectResponse:
-    return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
+def _redirect_home(request: Request) -> RedirectResponse:
+    """Redirect back to the dashboard, staying inside the ingress iframe.
+
+    Home Assistant's Supervisor proxies ingress traffic and adds the
+    ``X-Ingress-Path`` header (e.g. ``/api/hassio_ingress/<token>``).
+    A bare ``Location: /`` would resolve at the parent origin and break
+    the iframe out to the HA root, so we prepend the ingress prefix when
+    present.
+    """
+    ingress_prefix = request.headers.get("X-Ingress-Path", "").rstrip("/")
+    return RedirectResponse(
+        url=f"{ingress_prefix}/",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
 
 
 @app.post("/api/clients")
-async def add_client(name: str = Form(...)):
+async def add_client(request: Request, name: str = Form(...)):
     name = _validate_client_name(name)
     if (CERT_DIR / f"mTLS-client-{name}.p12").exists():
         raise HTTPException(status.HTTP_409_CONFLICT, f"client '{name}' already exists")
@@ -287,11 +299,11 @@ async def add_client(name: str = Form(...)):
     ok, msg = _caddy_reload()
     if not ok:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"caddy reload failed: {msg}")
-    return _redirect_home()
+    return _redirect_home(request)
 
 
 @app.post("/api/clients/{name}/revoke")
-async def revoke_client(name: str, reason: str = Form("unspecified")):
+async def revoke_client(request: Request, name: str, reason: str = Form("unspecified")):
     name = _validate_client_name(name)
     if not (CERT_DIR / f"mTLS-client-{name}.crt").exists():
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"client '{name}' not found")
@@ -308,11 +320,11 @@ async def revoke_client(name: str, reason: str = Form("unspecified")):
     ok, msg = _caddy_reload()
     if not ok:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"caddy reload failed: {msg}")
-    return _redirect_home()
+    return _redirect_home(request)
 
 
 @app.post("/api/clients/{name}/regenerate")
-async def regenerate_client(name: str):
+async def regenerate_client(request: Request, name: str):
     """Revoke the existing cert (if active) and issue a new one under the same name."""
     name = _validate_client_name(name)
     crt = CERT_DIR / f"mTLS-client-{name}.crt"
@@ -339,11 +351,11 @@ async def regenerate_client(name: str):
     ok, msg = _caddy_reload()
     if not ok:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"caddy reload failed: {msg}")
-    return _redirect_home()
+    return _redirect_home(request)
 
 
 @app.post("/api/ca/regenerate")
-async def regenerate_ca(confirm: str = Form(...)):
+async def regenerate_ca(request: Request, confirm: str = Form(...)):
     """Wipe everything and regenerate CA + the previously known clients.
 
     Guarded by the user typing the literal string `REGENERATE-CA`.
@@ -381,4 +393,4 @@ async def regenerate_ca(confirm: str = Form(...)):
     ok, msg = _caddy_reload()
     if not ok:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"caddy reload failed: {msg}")
-    return _redirect_home()
+    return _redirect_home(request)
