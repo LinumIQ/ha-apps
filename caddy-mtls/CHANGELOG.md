@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.4] - 2026-04-30
+
+### Changed
+
+- **Certificate manager UI now shows friendly error and success banners**
+  instead of returning a raw JSON `{"detail": "..."}` payload when an
+  operation fails or succeeds. All mutation handlers (add / revoke /
+  regenerate client, regenerate CA) now redirect back to the dashboard
+  with the message rendered as a styled banner inside the ingress iframe.
+- **Clearer message when adding a client whose name collides with a
+  revoked certificate**: the form now reports
+  *"A client named 'X' already exists and is revoked. Choose a different
+  name to create a new client."* instead of the previous opaque
+  `client 'X' already exists` JSON error.
+- Improved validation messages for empty / too-long / invalid client
+  names, missing clients on revoke, regenerating a non-active client,
+  and an unconfirmed CA regeneration.
+
 ## [1.2.3] - 2026-04-30
 
 ### Changed

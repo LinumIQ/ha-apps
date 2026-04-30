@@ -46,16 +46,16 @@ Let's Encrypt requires port 80 for the HTTP-01 challenge. If port 80 is not avai
 
 ### Optional Options
 
-| Option                 | Default         | Description                                                                                    |
-| ---------------------- | --------------- | ---------------------------------------------------------------------------------------------- |
-| `upstream_host`        | `homeassistant` | Backend service hostname                                                                       |
-| `upstream_port`        | `8123`          | Backend service port                                                                           |
-| `mtls_enabled`         | `true`          | Enable client certificate authentication                                                       |
-| `client_names`         | `["user"]`      | List of client certificate names                                                               |
-| `client_cert_password` | `LinumIQ`       | Password for .p12 files                                                                        |
-| `log_level`            | `info`          | Add-on / Caddy log verbosity (`trace`, `debug`, `info`, `notice`, `warning`, `error`, `fatal`) |
-| `cert_expiry_warn_days`     | `[30, 14, 7, 1]` | List of days-before-expiry thresholds at which to fire a notification (one notification per crossed threshold per cert)        |
-| `cert_check_interval_hours` | `6`              | How often the `cert-monitor` service polls certificate metadata and publishes sensor states (`1`-`168`)                          |
+| Option                      | Default          | Description                                                                                                             |
+| --------------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `upstream_host`             | `homeassistant`  | Backend service hostname                                                                                                |
+| `upstream_port`             | `8123`           | Backend service port                                                                                                    |
+| `mtls_enabled`              | `true`           | Enable client certificate authentication                                                                                |
+| `client_names`              | `["user"]`       | List of client certificate names                                                                                        |
+| `client_cert_password`      | `LinumIQ`        | Password for .p12 files                                                                                                 |
+| `log_level`                 | `info`           | Add-on / Caddy log verbosity (`trace`, `debug`, `info`, `notice`, `warning`, `error`, `fatal`)                          |
+| `cert_expiry_warn_days`     | `[30, 14, 7, 1]` | List of days-before-expiry thresholds at which to fire a notification (one notification per crossed threshold per cert) |
+| `cert_check_interval_hours` | `6`              | How often the `cert-monitor` service polls certificate metadata and publishes sensor states (`1`-`168`)                 |
 
 ### CA Certificate Options
 
@@ -235,7 +235,7 @@ serial is added to the CRL served at
 If you have lost control of the CA itself (e.g. compromised key), use
 **Regenerate CA** in the Web Certificate Manager (typed confirmation
 required). This rotates the CA, invalidates every existing client
-  certificate, and re-issues fresh certs for
+certificate, and re-issues fresh certs for
 client bundles.
 
 ## Expiration Notifications

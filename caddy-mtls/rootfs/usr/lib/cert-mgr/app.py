@@ -26,6 +26,7 @@ import shlex
 import subprocess
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 from fastapi import FastAPI, Form, HTTPException, Request, status
 from fastapi.responses import (
@@ -145,18 +146,40 @@ def _validate_client_name(name: str) -> str:
 
     Allowed characters keep the cert filename safe and predictable.
     """
+    err = _client_name_error(name)
+    if err:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, err)
+    return (name or "").strip()
+
+
+def _client_name_error(name: str) -> str | None:
+    """Return a human-readable error if the name is invalid, else None."""
     name = (name or "").strip()
     if not name:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "client name is required")
+        return "Client name is required."
     if len(name) > 64:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "client name too long")
+        return "Client name is too long (max 64 characters)."
     allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
     if not set(name).issubset(allowed):
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "client name may only contain letters, digits, dash, underscore and dot",
+        return (
+            "Client name may only contain letters, digits, dash, underscore "
+            "and dot."
         )
-    return name
+    return None
+
+
+class FlashError(Exception):
+    """User-facing error that should be shown as a banner on the dashboard.
+
+    Mutation handlers raise this instead of HTTPException so the user sees
+    a styled message in the iframe rather than a raw JSON payload. The
+    matching exception handler converts it to a 303 redirect back to ``/``
+    with the message in the query string.
+    """
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +187,13 @@ def _validate_client_name(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="Caddy mTLS - Cert Manager", docs_url=None, redoc_url=None)
+
+
+@app.exception_handler(FlashError)
+async def _flash_error_handler(request: Request, exc: FlashError) -> RedirectResponse:
+    """Convert a FlashError into a 303 redirect to the dashboard with a banner."""
+    return _redirect_home(request, error=exc.message)
+
 
 
 class IngressOnlyMiddleware(BaseHTTPMiddleware):
@@ -215,6 +245,8 @@ async def index(request: Request) -> Any:
     state = _read_state()
     ca_crt_exists = (CERT_DIR / "mTLS-CA.crt").exists()
     crl_exists = (CERT_DIR / "mTLS-CA.crl").exists()
+    flash_error = request.query_params.get("error") or None
+    flash_ok = request.query_params.get("ok") or None
     return templates.TemplateResponse(
         request,
         "index.html",
@@ -222,6 +254,8 @@ async def index(request: Request) -> Any:
             "state": state,
             "ca_crt_exists": ca_crt_exists,
             "crl_exists": crl_exists,
+            "flash_error": flash_error,
+            "flash_ok": flash_ok,
         },
     )
 
@@ -264,7 +298,12 @@ async def download_client(name: str):
 # Routes - mutations
 # ---------------------------------------------------------------------------
 
-def _redirect_home(request: Request) -> RedirectResponse:
+def _redirect_home(
+    request: Request,
+    *,
+    error: str | None = None,
+    ok: str | None = None,
+) -> RedirectResponse:
     """Redirect back to the dashboard, staying inside the ingress iframe.
 
     Home Assistant's Supervisor proxies ingress traffic and adds the
@@ -272,21 +311,55 @@ def _redirect_home(request: Request) -> RedirectResponse:
     A bare ``Location: /`` would resolve at the parent origin and break
     the iframe out to the HA root, so we prepend the ingress prefix when
     present.
+
+    An ``error`` or ``ok`` flash message is forwarded as a query string
+    parameter and rendered as a banner on the dashboard.
     """
     ingress_prefix = request.headers.get("X-Ingress-Path", "").rstrip("/")
+    qs = ""
+    params: dict[str, str] = {}
+    if error:
+        params["error"] = error
+    if ok:
+        params["ok"] = ok
+    if params:
+        qs = "?" + urlencode(params)
     return RedirectResponse(
-        url=f"{ingress_prefix}/",
+        url=f"{ingress_prefix}/{qs}",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
 
 @app.post("/api/clients")
 async def add_client(request: Request, name: str = Form(...)):
-    name = _validate_client_name(name)
-    if (CERT_DIR / f"mTLS-client-{name}.p12").exists():
-        raise HTTPException(status.HTTP_409_CONFLICT, f"client '{name}' already exists")
+    err = _client_name_error(name)
+    if err:
+        raise FlashError(err)
+    name = name.strip()
 
-    rc, _, err = _bash_invoke(
+    state = _read_state()
+    existing = next(
+        (c for c in state.get("clients", []) if c.get("name") == name),
+        None,
+    )
+    if existing is not None:
+        if existing.get("status") == "revoked":
+            raise FlashError(
+                f"A client named '{name}' already exists and is revoked. "
+                "Choose a different name to create a new client."
+            )
+        raise FlashError(
+            f"A client named '{name}' already exists. "
+            "Use Regenerate to rotate it, or choose a different name."
+        )
+    if (CERT_DIR / f"mTLS-client-{name}.p12").exists():
+        # Defensive: state and disk are out of sync.
+        raise FlashError(
+            f"A certificate file for '{name}' already exists on disk. "
+            "Choose a different name."
+        )
+
+    rc, _, err_out = _bash_invoke(
         f"generate_client_cert {shlex.quote(name)}\n"
         f"state_refresh_client {shlex.quote(name)}\n"
         f"populate_active_dir $(state_active_clients | tr '\\n' ' ')\n"
@@ -294,41 +367,71 @@ async def add_client(request: Request, name: str = Form(...)):
         f"state_refresh_crl\n"
     )
     if rc != 0:
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"add_client failed: {err}")
+        LOG.error("add_client('%s') failed: %s", name, err_out.strip())
+        raise FlashError(
+            f"Failed to create client '{name}'. See add-on logs for details."
+        )
 
-    ok, msg = _caddy_reload()
-    if not ok:
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"caddy reload failed: {msg}")
-    return _redirect_home(request)
+    ok_reload, msg = _caddy_reload()
+    if not ok_reload:
+        LOG.error("caddy reload after add_client failed: %s", msg)
+        raise FlashError(
+            f"Client '{name}' was created, but reloading Caddy failed. "
+            "Check the add-on logs."
+        )
+    return _redirect_home(request, ok=f"Client '{name}' created.")
 
 
 @app.post("/api/clients/{name}/revoke")
 async def revoke_client(request: Request, name: str, reason: str = Form("unspecified")):
-    name = _validate_client_name(name)
+    err = _client_name_error(name)
+    if err:
+        raise FlashError(err)
+    name = name.strip()
     if not (CERT_DIR / f"mTLS-client-{name}.crt").exists():
-        raise HTTPException(status.HTTP_404_NOT_FOUND, f"client '{name}' not found")
+        raise FlashError(f"Client '{name}' was not found.")
 
-    rc, _, err = _bash_invoke(
+    rc, _, err_out = _bash_invoke(
         f"revoke_client_by_name {shlex.quote(name)} {shlex.quote(reason)}\n"
         f"state_mark_revoked {shlex.quote(name)} {shlex.quote(reason)}\n"
         f"generate_crl\n"
         f"state_refresh_crl\n"
     )
     if rc != 0:
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"revoke failed: {err}")
+        LOG.error("revoke_client('%s') failed: %s", name, err_out.strip())
+        raise FlashError(
+            f"Failed to revoke client '{name}'. See add-on logs for details."
+        )
 
-    ok, msg = _caddy_reload()
-    if not ok:
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"caddy reload failed: {msg}")
-    return _redirect_home(request)
+    ok_reload, msg = _caddy_reload()
+    if not ok_reload:
+        LOG.error("caddy reload after revoke_client failed: %s", msg)
+        raise FlashError(
+            f"Client '{name}' was revoked, but reloading Caddy failed. "
+            "Check the add-on logs."
+        )
+    return _redirect_home(request, ok=f"Client '{name}' revoked.")
 
 
 @app.post("/api/clients/{name}/regenerate")
 async def regenerate_client(request: Request, name: str):
     """Revoke the existing cert (if active) and issue a new one under the same name."""
-    name = _validate_client_name(name)
+    err = _client_name_error(name)
+    if err:
+        raise FlashError(err)
+    name = name.strip()
     crt = CERT_DIR / f"mTLS-client-{name}.crt"
     p12 = CERT_DIR / f"mTLS-client-{name}.p12"
+
+    state = _read_state()
+    existing = next(
+        (c for c in state.get("clients", []) if c.get("name") == name),
+        None,
+    )
+    if existing is None or existing.get("status") != "active":
+        raise FlashError(
+            f"Cannot regenerate '{name}': no active client with this name."
+        )
 
     snippet = ""
     if crt.exists():
@@ -344,14 +447,21 @@ async def regenerate_client(request: Request, name: str):
         f"generate_crl\n"
         f"state_refresh_crl\n"
     )
-    rc, _, err = _bash_invoke(snippet)
+    rc, _, err_out = _bash_invoke(snippet)
     if rc != 0:
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"regenerate failed: {err}")
+        LOG.error("regenerate_client('%s') failed: %s", name, err_out.strip())
+        raise FlashError(
+            f"Failed to regenerate client '{name}'. See add-on logs for details."
+        )
 
-    ok, msg = _caddy_reload()
-    if not ok:
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"caddy reload failed: {msg}")
-    return _redirect_home(request)
+    ok_reload, msg = _caddy_reload()
+    if not ok_reload:
+        LOG.error("caddy reload after regenerate_client failed: %s", msg)
+        raise FlashError(
+            f"Client '{name}' was regenerated, but reloading Caddy failed. "
+            "Check the add-on logs."
+        )
+    return _redirect_home(request, ok=f"Client '{name}' regenerated.")
 
 
 @app.post("/api/ca/regenerate")
@@ -361,13 +471,15 @@ async def regenerate_ca(request: Request, confirm: str = Form(...)):
     Guarded by the user typing the literal string `REGENERATE-CA`.
     """
     if confirm != "REGENERATE-CA":
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "confirmation string must be exactly 'REGENERATE-CA'",
+        raise FlashError(
+            "CA regeneration was not confirmed. Type REGENERATE-CA exactly to proceed."
         )
     domain = os.environ.get("DOMAIN", "")
     if not domain:
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "DOMAIN env var not set")
+        LOG.error("regenerate_ca: DOMAIN env var not set")
+        raise FlashError(
+            "Cannot regenerate CA: the DOMAIN configuration option is not set."
+        )
 
     state = _read_state()
     client_names = [c["name"] for c in state.get("clients", []) if c.get("name")]
@@ -378,19 +490,26 @@ async def regenerate_ca(request: Request, confirm: str = Form(...)):
         "generate_ca\n"
         "state_refresh_ca\n"
     )
-    for name in client_names:
-        snippet += f"generate_client_cert {shlex.quote(name)}\n"
-        snippet += f"state_refresh_client {shlex.quote(name)}\n"
+    for cname in client_names:
+        snippet += f"generate_client_cert {shlex.quote(cname)}\n"
+        snippet += f"state_refresh_client {shlex.quote(cname)}\n"
     snippet += (
         "populate_active_dir $(state_active_clients | tr '\\n' ' ')\n"
         "generate_crl\n"
         "state_refresh_crl\n"
     )
-    rc, _, err = _bash_invoke(snippet)
+    rc, _, err_out = _bash_invoke(snippet)
     if rc != 0:
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"CA regen failed: {err}")
+        LOG.error("regenerate_ca failed: %s", err_out.strip())
+        raise FlashError(
+            "Failed to regenerate the CA. See add-on logs for details."
+        )
 
-    ok, msg = _caddy_reload()
-    if not ok:
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"caddy reload failed: {msg}")
-    return _redirect_home(request)
+    ok_reload, msg = _caddy_reload()
+    if not ok_reload:
+        LOG.error("caddy reload after regenerate_ca failed: %s", msg)
+        raise FlashError(
+            "CA was regenerated, but reloading Caddy failed. Check the add-on logs."
+        )
+    return _redirect_home(request, ok="CA regenerated.")
+

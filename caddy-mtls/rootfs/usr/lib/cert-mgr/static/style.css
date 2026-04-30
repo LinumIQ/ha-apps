@@ -48,5 +48,22 @@ form label { display: block; margin: 0.5rem 0; }
 input[type=text] { padding: 0.4rem 0.6rem; border: 1px solid #d1d5db; border-radius: 6px; min-width: 16rem; }
 .warn { color: #b91c1c; }
 .danger { color: #b91c1c; cursor: pointer; }
+.flash {
+  border-radius: 8px;
+  padding: 0.85rem 1.1rem;
+  margin-bottom: 1.25rem;
+  font-size: 0.95rem;
+  border: 1px solid transparent;
+}
+.flash-error {
+  background: #fef2f2;
+  border-color: #fecaca;
+  color: #991b1b;
+}
+.flash-ok {
+  background: #ecfdf5;
+  border-color: #a7f3d0;
+  color: #065f46;
+}
 details { margin-top: 1rem; }
 footer { color: #9ca3af; font-size: 0.85rem; text-align: center; margin: 2rem 0 1rem; }
