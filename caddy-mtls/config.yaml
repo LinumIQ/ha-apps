@@ -3,7 +3,7 @@
 # https://developers.home-assistant.io/docs/add-ons/configuration/
 
 name: "Caddy mTLS Proxy"
-version: "1.2.0"
+version: "1.2.1"
 slug: "caddy_mtls"
 description: >-
   Caddy reverse proxy with mutual TLS (mTLS) client certificate authentication
@@ -33,8 +33,9 @@ ports_description:
 
 # Ingress configuration for the certificate management web UI (FastAPI app
 # served by the cert-mgr s6 service on port 8099 inside the container).
+# 8099 is the Supervisor default for ingress_port, so we don't set it
+# explicitly (the linter rejects redundant defaults).
 ingress: true
-ingress_port: 8099
 ingress_entry: /
 panel_icon: mdi:certificate-outline
 panel_title: "Caddy mTLS"

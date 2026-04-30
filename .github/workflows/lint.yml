@@ -32,7 +32,11 @@ jobs:
       - name: Run Shellcheck
         uses: ludeeus/action-shellcheck@2.0.0
         env:
-          SHELLCHECK_OPTS: -e SC1008 -s bash
+          # SC1008: bashio shebang is not recognised by shellcheck
+          # SC1083: s6 'finish' scripts are execlineb, not shell
+          # SC1091: sourced files use absolute /etc/... paths
+          # SC2016: jq programs intentionally use single quotes
+          SHELLCHECK_OPTS: -e SC1008,SC1083,SC1091,SC2016 -s bash
         with:
           ignore_paths: ".git"
 

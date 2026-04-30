@@ -10,3 +10,9 @@ PRD.md.bak
 
 # Local state
 .vscode/*.log
+
+
+# Coredumps and Python caches that should never ship
+core.*
+__pycache__/
+*.pyc

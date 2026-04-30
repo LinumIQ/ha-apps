@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-04-30
+
+### Fixed
+
+- **AppArmor profile no longer fails to load on Home Assistant OS.**
+  The 1.2.0 profile required AppArmor 4.x (used `abi <abi/4.0>`,
+  `io_uring`, bare `capability`, `mount`, `ptrace` and `dbus`), which
+  caused Supervisor to reject the profile on stock HA OS with
+  `can't load profile ...: exit status 1`. The profile was rewritten
+  against the AppArmor 3.x feature set used by mainstream community
+  add-ons (explicit capability list, s6-overlay paths, ssl/share/config
+  mappings).
+- **Add-on linter** rejected the explicit `ingress_port: 8099` in
+  `config.yaml` because 8099 is the Supervisor default for that key.
+  Removed the redundant declaration.
+- **Shellcheck CI job** now also excludes `SC1083` (s6 `finish` scripts
+  are execlineb, not shell), `SC1091` (sourced files use absolute
+  `/etc/...` paths) and `SC2016` (jq programs intentionally use single
+  quotes), all of which are unavoidable in this codebase.
+
+### Removed
+
+- A 2.3 MB `core.5100` core dump was accidentally committed in 1.2.0.
+  Removed from the repository and added a `.gitignore` rule for
+  `core.*`, `__pycache__/` and `*.pyc`.
+
 ## [1.2.0] - 2026-04-29
 
 ### Added

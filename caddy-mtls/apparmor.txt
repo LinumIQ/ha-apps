@@ -1,5 +1,3 @@
-abi <abi/4.0>,
-
 #include <tunables/global>
 
 profile caddy_mtls flags=(attach_disconnected,mediate_deleted) {
@@ -8,17 +6,56 @@ profile caddy_mtls flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/openssl>
   #include <abstractions/ssl_certs>
 
-  capability,
-  network,
-  unix,
+  # Capabilities
+  file,
+  umount,
   signal,
-  ptrace,
-  mount,
-  dbus,
-  io_uring,
+  network,
 
-  / r,
-  /** mrixwlk,
+  capability chown,
+  capability dac_override,
+  capability dac_read_search,
+  capability fowner,
+  capability fsetid,
+  capability kill,
+  capability net_bind_service,
+  capability net_raw,
+  capability setgid,
+  capability setuid,
+  capability sys_admin,
+  capability sys_ptrace,
 
+  # S6-Overlay
+  /init ix,
+  /bin/** ix,
+  /usr/bin/** ix,
+  /usr/sbin/** ix,
+  /run/{s6,s6-rc*,service}/** ix,
+  /package/** ix,
+  /command/** ix,
+  /etc/s6-overlay/** rix,
+  /etc/services.d/** rwix,
+  /etc/cont-init.d/** rwix,
+  /etc/cont-finish.d/** rwix,
+  /run/{,**} rwk,
+  /dev/tty rw,
+
+  # Bashio
+  /usr/lib/bashio/** ix,
+  /tmp/** rwk,
+
+  # Caddy & cert-mgr add-on assets
+  /usr/bin/caddy mrix,
+  /usr/lib/cert-mgr/** r,
+  /usr/lib/python3*/** mr,
+  /etc/caddy/** r,
+
+  # Persistent add-on data and config
+  /data/** rwk,
+  /ssl/** rwk,
+  /share/** rwk,
+  /config/** rwk,
+
+  # Deny dangerous operations
   deny /sys/kernel/security/** wl,
 }
