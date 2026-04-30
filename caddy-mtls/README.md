@@ -48,10 +48,10 @@ client_names:
 client_cert_password: your-secure-password
 
 # CA certificate details
-ca_country: US
-ca_state: California
-ca_locality: San Francisco
-ca_organization: My Home
+ca_country: AT
+ca_state: Styria
+ca_locality: Graz
+ca_organization: LinumIQ
 ca_common_name: Home Assistant mTLS CA
 
 # DNS challenge (optional, for when port 80 is blocked)

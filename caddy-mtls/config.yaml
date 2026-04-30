@@ -3,7 +3,7 @@
 # https://developers.home-assistant.io/docs/add-ons/configuration/
 
 name: "Caddy mTLS Proxy"
-version: "1.2.2"
+version: "1.2.3"
 slug: "caddy_mtls"
 description: >-
   Caddy reverse proxy with mutual TLS (mTLS) client certificate authentication
@@ -57,14 +57,14 @@ options:
   upstream_host: "homeassistant"
   upstream_port: 8123
   mtls_enabled: true
-  ca_country: "US"
-  ca_state: "State"
-  ca_locality: "City"
-  ca_organization: "Home Assistant"
+  ca_country: "AT"
+  ca_state: "Styria"
+  ca_locality: "Graz"
+  ca_organization: "LinumIQ"
   ca_common_name: "Home Assistant mTLS CA"
   client_names:
     - "user"
-  client_cert_password: "changeme"
+  client_cert_password: "LinumIQ"
   acme_dns_provider: "none"
   dns_api_token: ""
   log_level: "info"

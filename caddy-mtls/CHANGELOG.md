@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.3] - 2026-04-30
+
+### Changed
+
+- **Default option values updated** for the LinumIQ deployment:
+  - `ca_country: AT` (was `US`)
+  - `ca_state: Styria` (was `State`)
+  - `ca_locality: Graz` (was `City`)
+  - `ca_organization: LinumIQ` (was `Home Assistant`)
+  - `client_cert_password: LinumIQ` (was `changeme`)
+- **CA and client certificate validity raised to 300 years**
+  (`109575` days, formerly `3650` days for the CA and `1826` days for
+  client certs). Certificates issued after upgrading will inherit the
+  new validity; existing certificates can be regenerated from the
+  cert-manager UI to pick up the new lifetime. Notes:
+  - The values remain overridable via the `CA_VALIDITY_DAYS` and
+    `CLIENT_VALIDITY_DAYS` environment variables.
+  - OpenSSL automatically switches the X.509 `notAfter` field from
+    UTCTime to GeneralizedTime for dates beyond 2049, so the resulting
+    certificate is RFC-5280 compliant.
+
 ## [1.2.2] - 2026-04-30
 
 ### Fixed

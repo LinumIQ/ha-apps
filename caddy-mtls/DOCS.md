@@ -52,7 +52,7 @@ Let's Encrypt requires port 80 for the HTTP-01 challenge. If port 80 is not avai
 | `upstream_port`        | `8123`          | Backend service port                                                                           |
 | `mtls_enabled`         | `true`          | Enable client certificate authentication                                                       |
 | `client_names`         | `["user"]`      | List of client certificate names                                                               |
-| `client_cert_password` | `changeme`      | Password for .p12 files                                                                        |
+| `client_cert_password` | `LinumIQ`       | Password for .p12 files                                                                        |
 | `log_level`            | `info`          | Add-on / Caddy log verbosity (`trace`, `debug`, `info`, `notice`, `warning`, `error`, `fatal`) |
 | `cert_expiry_warn_days`     | `[30, 14, 7, 1]` | List of days-before-expiry thresholds at which to fire a notification (one notification per crossed threshold per cert)        |
 | `cert_check_interval_hours` | `6`              | How often the `cert-monitor` service polls certificate metadata and publishes sensor states (`1`-`168`)                          |
@@ -61,10 +61,10 @@ Let's Encrypt requires port 80 for the HTTP-01 challenge. If port 80 is not avai
 
 | Option            | Default                  | Description             |
 | ----------------- | ------------------------ | ----------------------- |
-| `ca_country`      | `US`                     | Two-letter country code |
-| `ca_state`        | `State`                  | State or province       |
-| `ca_locality`     | `City`                   | City name               |
-| `ca_organization` | `Home Assistant`         | Organization name       |
+| `ca_country`      | `AT`                     | Two-letter country code |
+| `ca_state`        | `Styria`                 | State or province       |
+| `ca_locality`     | `Graz`                   | City name               |
+| `ca_organization` | `LinumIQ`                | Organization name       |
 | `ca_common_name`  | `Home Assistant mTLS CA` | CA certificate name     |
 
 ### DNS Challenge Options (Optional)

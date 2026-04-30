@@ -14,12 +14,12 @@
 #   DOMAIN          (used as CRL_DOMAIN at issuance time)
 #
 # Validity (days), overridable via env:
-#   CA       : 10 years   (3650 days)
-#   Client   : 5  years   (1826 days)
+#   CA       : 300 years  (109575 days)
+#   Client   : 300 years  (109575 days)
 # ==============================================================================
 
-readonly CA_VALIDITY_DAYS="${CA_VALIDITY_DAYS:-3650}"
-readonly CLIENT_VALIDITY_DAYS="${CLIENT_VALIDITY_DAYS:-1826}"
+readonly CA_VALIDITY_DAYS="${CA_VALIDITY_DAYS:-109575}"
+readonly CLIENT_VALIDITY_DAYS="${CLIENT_VALIDITY_DAYS:-109575}"
 readonly CRL_VALIDITY_DAYS="${CRL_VALIDITY_DAYS:-30}"
 readonly OPENSSL_CA_CNF="${OPENSSL_CA_CNF:-/etc/caddy/openssl-ca.cnf}"
 
