@@ -16,8 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the message rendered as a styled banner inside the ingress iframe.
 - **Clearer message when adding a client whose name collides with a
   revoked certificate**: the form now reports
-  *"A client named 'X' already exists and is revoked. Choose a different
-  name to create a new client."* instead of the previous opaque
+  _"A client named 'X' already exists and is revoked. Choose a different
+  name to create a new client."_ instead of the previous opaque
   `client 'X' already exists` JSON error.
 - Improved validation messages for empty / too-long / invalid client
   names, missing clients on revoke, regenerating a non-active client,
