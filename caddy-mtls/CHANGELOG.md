@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.7] - 2026-05-02
+
+### Changed
+
+- **Responsive, mobile-first web UI for the certificate manager**. The
+  ingress panel has been fully redesigned with a clean card-based layout
+  that works well on phones, tablets, and desktops. Client certificates
+  are now shown as individual cards that stack vertically on small screens
+  and expand to a three-column row on wider screens, replacing the
+  previous horizontally-scrolling table. Other improvements include CSS
+  custom-property design tokens, automatic dark-mode via
+  `prefers-color-scheme`, touch-friendly controls (min 2.4 rem tap
+  targets), a styled danger-zone disclosure for CA regeneration, improved
+  accessible markup (`<dl>` for metadata, `aria-labelledby` on sections),
+  and proper word-wrap for long fingerprints / serial numbers.
+
 ## [1.2.6] - 2026-05-02
 
 ### Added
