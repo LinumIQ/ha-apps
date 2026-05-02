@@ -33,7 +33,38 @@ Let's Encrypt requires port 80 for the HTTP-01 challenge. If port 80 is not avai
 1. Add this repository to your Home Assistant add-on store
 2. Install the "Caddy mTLS Proxy" add-on
 3. Configure the required options (see Configuration section)
-4. Start the add-on
+4. **Add the add-on to Home Assistant Core's trusted reverse proxies**
+   (see [Home Assistant Core Configuration](#home-assistant-core-configuration)
+   below) - without this, requests proxied through this add-on will be
+   rejected with `400 Bad Request` by Home Assistant Core.
+5. Start the add-on
+
+## Home Assistant Core Configuration
+
+Because this add-on terminates TLS and forwards requests to Home Assistant
+Core, you must tell Home Assistant Core to trust the add-on as a reverse
+proxy. Otherwise Home Assistant rejects the forwarded requests with
+`400 Bad Request` (and silently logs `Received X-Forwarded-For header from
+untrusted proxy`).
+
+Add the following to `/config/configuration.yaml` (the file is editable
+via the **File editor**, **Studio Code Server**, or **Samba** add-ons) and
+restart Home Assistant Core:
+
+```yaml
+http:
+  use_x_forwarded_for: true
+  trusted_proxies:
+    # Supervisor's internal Docker network. Covers this add-on regardless
+    # of which IP the Supervisor assigns to it on each restart.
+    - 172.30.32.0/23
+```
+
+If you already have an `http:` section, merge the two keys into it
+instead of duplicating the section. The exact container IP of this
+add-on is also printed in the add-on log on every start, in case you
+prefer to whitelist a specific address instead of the whole Supervisor
+network.
 
 ## Configuration
 

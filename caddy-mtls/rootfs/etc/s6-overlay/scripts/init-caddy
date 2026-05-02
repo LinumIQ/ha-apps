@@ -291,3 +291,30 @@ bashio::log.info "  Upstream:    ${UPSTREAM_HOST}:${UPSTREAM_PORT}"
 bashio::log.info "  mTLS:        ${MTLS_ENABLED}"
 bashio::log.info "  ACME DNS:    ${ACME_DNS_PROVIDER}"
 bashio::log.info "  Log level:   ${LOG_LEVEL} (caddy=${CADDY_LOG_LEVEL})"
+
+###############################################################################
+# Reverse-proxy reminder for Home Assistant Core.
+# HA Core rejects requests from unknown reverse proxies with 400 Bad Request.
+# We can't edit the user's configuration.yaml safely, so emit a prominent,
+# copy-pasteable reminder on every start. Detect our own container IP so the
+# user can also whitelist a single address if they prefer it over the whole
+# Supervisor docker subnet.
+###############################################################################
+ADDON_IP="$(hostname -i 2>/dev/null | awk '{print $1}')"
+[[ -z "${ADDON_IP}" ]] && ADDON_IP="<this add-on's container IP>"
+
+bashio::log.notice "------------------------------------------------------------"
+bashio::log.notice "Home Assistant Core must trust this add-on as a reverse"
+bashio::log.notice "proxy, otherwise it returns 400 Bad Request for every"
+bashio::log.notice "request forwarded through ${DOMAIN}."
+bashio::log.notice ""
+bashio::log.notice "Add this to /config/configuration.yaml and restart HA Core:"
+bashio::log.notice ""
+bashio::log.notice "  http:"
+bashio::log.notice "    use_x_forwarded_for: true"
+bashio::log.notice "    trusted_proxies:"
+bashio::log.notice "      - 172.30.32.0/23   # Supervisor docker network"
+bashio::log.notice "      # or just this add-on's current IP: ${ADDON_IP}"
+bashio::log.notice ""
+bashio::log.notice "See the add-on documentation for details."
+bashio::log.notice "------------------------------------------------------------"
