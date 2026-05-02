@@ -193,8 +193,11 @@ http://${DOMAIN} {
         root * ${CERT_DIR}
         file_server
     }
+    # Anything other than the public CRL endpoint is redirected to HTTPS.
+    # ACME HTTP-01 challenges are still handled automatically by Caddy
+    # before user routes, so this redirect does not break cert renewal.
     handle {
-        respond 404
+        redir https://{host}{uri} permanent
     }
 
     log {

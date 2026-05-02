@@ -104,7 +104,7 @@ def _supervisor_request(method: str, path: str, payload: dict[str, Any] | None =
         return False
 
 
-def _publish_sensor(slug: str, friendly: str, days_left: int, not_after: str) -> None:
+def _publish_sensor(slug: str, friendly: str, days_left: int, not_after: str) -> bool:
     """Push a sensor state to Home Assistant via the Supervisor proxy."""
     entity_id = f"sensor.caddy_mtls_{slug}_expiry"
     payload = {
@@ -116,7 +116,7 @@ def _publish_sensor(slug: str, friendly: str, days_left: int, not_after: str) ->
             "not_after": not_after,
         },
     }
-    _supervisor_request("POST", f"/core/api/states/{entity_id}", payload)
+    return _supervisor_request("POST", f"/core/api/states/{entity_id}", payload)
 
 
 def _send_notification(title: str, message: str, notification_id: str) -> None:
@@ -165,11 +165,18 @@ def _crossed_threshold(days_left: int, last_notified: int | None) -> int | None:
     return None
 
 
-def _process_once() -> None:
+def _process_once() -> bool:
+    """Run a single monitor iteration.
+
+    Returns True iff at least one sensor was successfully published to
+    Home Assistant during this iteration. Used by the startup loop to
+    decide when HA Core is finally reachable.
+    """
     state = _read_state()
     if not state:
-        return
+        return False
     notified = _read_notified()
+    any_published = False
 
     items: list[tuple[str, str, dict[str, Any]]] = []
     if state.get("ca"):
@@ -183,7 +190,8 @@ def _process_once() -> None:
         days_left = _days_until(meta.get("not_after"))
         if days_left is None:
             continue
-        _publish_sensor(slug, friendly, days_left, meta.get("not_after", ""))
+        if _publish_sensor(slug, friendly, days_left, meta.get("not_after", "")):
+            any_published = True
 
         # Identify cert by serial so rotation resets the notification state.
         identity = f"{slug}:{meta.get('serial','')}"
@@ -207,6 +215,7 @@ def _process_once() -> None:
     new_notified = {k: v for k, v in new_notified.items() if k in current_ids}
     if new_notified != notified:
         _write_notified(new_notified)
+    return any_published
 
 
 def main() -> None:
@@ -216,12 +225,34 @@ def main() -> None:
         THRESHOLDS,
         STATE_FILE,
     )
+    # On startup, Home Assistant Core may not yet be ready (Supervisor
+    # returns 502 Bad Gateway while HA boots). Retry quickly with
+    # exponential backoff until the first publication succeeds, instead
+    # of waiting a full INTERVAL_SECONDS (6h by default).
+    backoff = 5
+    max_backoff = 300
     while True:
+        try:
+            published = _process_once()
+            if published:
+                LOG.info("Initial publication to Home Assistant succeeded.")
+                break
+            LOG.info(
+                "Initial publication did not reach Home Assistant yet "
+                "(retrying in %ds)...",
+                backoff,
+            )
+        except Exception as exc:  # noqa: BLE001 - never crash the loop
+            LOG.exception("cert-monitor startup iteration failed: %s", exc)
+        time.sleep(backoff)
+        backoff = min(backoff * 2, max_backoff)
+
+    while True:
+        time.sleep(INTERVAL_SECONDS)
         try:
             _process_once()
         except Exception as exc:  # noqa: BLE001 - never crash the loop
             LOG.exception("cert-monitor iteration failed: %s", exc)
-        time.sleep(INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":

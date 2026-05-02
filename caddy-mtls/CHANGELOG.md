@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.5] - 2026-05-02
+
+### Fixed
+
+- **Plain HTTP requests to the public domain now redirect to HTTPS**
+  (308 Permanent Redirect) instead of returning `404 Not Found`. The
+  explicit `http://${domain}` site that serves the CRL was previously
+  responding 404 to every other path, including `/`, which made the
+  add-on look broken when accessed via `http://`. ACME HTTP-01
+  challenges are still handled by Caddy automatically and continue to
+  work.
+- **`cert-monitor` now publishes sensors as soon as Home Assistant
+  Core is reachable**, instead of giving up for 6 hours after the
+  first attempt. On startup, when the Supervisor proxy returns
+  `502 Bad Gateway` (HA Core still booting), the monitor now retries
+  with exponential backoff (5s → 10s → … → 5min cap) until the
+  first publication succeeds, and only then switches to the
+  configured `cert_check_interval_hours` cadence.
+
 ## [1.2.4] - 2026-04-30
 
 ### Changed
