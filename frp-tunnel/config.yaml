@@ -1,0 +1,49 @@
+---
+# Home Assistant Add-on: FRP Tunnel
+# https://developers.home-assistant.io/docs/add-ons/configuration/
+
+name: "FRP Tunnel"
+version: "1.0.0"
+slug: "frp_tunnel"
+description: >-
+  frp client (frpc) that exposes Home Assistant over a persistent reverse
+  tunnel to a remote frps server (e.g. the LinumIQ tunneling service).
+url: "https://github.com/LinumIQ/ha-apps/tree/main/frp-tunnel"
+
+# Supported architectures
+arch:
+  - aarch64
+  - amd64
+
+# Use S6-overlay v3 from the community add-ons base image
+init: false
+startup: services
+
+# Outbound-only client; no port mappings or ingress needed.
+
+# File mappings
+map:
+  - addon_config:rw
+
+# Add-on options with defaults
+options:
+  server_addr: "linumiq.net"
+  server_port: 7000
+  token: ""
+  subdomain: ""
+  local_host: "homeassistant"
+  local_port: 8123
+  log_level: "info"
+
+# Schema for options validation
+schema:
+  server_addr: str
+  server_port: port
+  token: password
+  subdomain: "match(^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$)"
+  local_host: str
+  local_port: port
+  log_level: list(trace|debug|info|warn|error)
+
+# Resource configuration
+timeout: 60
