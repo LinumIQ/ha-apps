@@ -7,6 +7,7 @@ Thumbs.db
 # Backups & local notes that should not ship
 *.bak
 PRD.md.bak
+.nocommit
 
 # Local state
 .vscode/*.log
