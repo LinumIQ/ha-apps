@@ -1,7 +1,7 @@
 # Agent Instructions for mTLS Caddy Add-On
 
 ## Project Overview
-- This is a Home Assistant Add-on built using Docker.
+- This is a repository for Home Assistant Add-ons/Apps built using Docker.
 - Key components: `config.yaml` (metadata), `Dockerfile` (build), `run.sh` (entrypoint).
 
 ## Home Assistant Add-on Rules
