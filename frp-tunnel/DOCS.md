@@ -36,9 +36,11 @@ The add-on regenerates `/data/frpc.toml` from the options on every start
 ```toml
 serverAddr = "linumiq.net"
 serverPort = 7000
+loginFailExit = false
 
-[auth]
-method = "token"
+# The frps auth HTTP plugin reads the per-user token from metadatas.token.
+# Do NOT use [auth] method = "token" — that field is not seen by the plugin.
+[metadatas]
 token = "<your token>"
 
 [log]
