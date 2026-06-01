@@ -83,8 +83,9 @@ unset — the defaults point at the live LinumIQ service.
 | ------------- | ------ | ----------------------------------- | -------------------------------- |
 | `app_base`    | URL    | `https://app.linumiq.net`           | Web app for browser pairing.     |
 | `api_base`    | URL    | `https://api.linumiq.net`           | Backend API for device flow.     |
-| `server_addr` | string | `linumiq.net`                       | frps server hostname.            |
+| `server_addr` | string | `linumiq.net`                       | frps control hostname.           |
 | `server_port` | port   | `7000`                              | frps control port.               |
+| `domain_base` | string | `linumiq.net`                       | Public domain suffix for the tunnel host (`<subdomain>.<domain_base>`). Defaults to `server_addr`; only differs when the public vhost and frps control endpoint live on separate hosts/ports (e.g. dev). |
 | `local_host`  | string | `homeassistant`                     | Local service hostname.          |
 | `local_port`  | port   | `8123`                              | Local service port.              |
 
