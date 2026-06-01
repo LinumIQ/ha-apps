@@ -45,6 +45,11 @@ profile frp_tunnel flags=(attach_disconnected,mediate_deleted) {
   # frpc binary
   /usr/bin/frpc mrix,
 
+  # frp-mgr FastAPI panel (Python + uvicorn)
+  /usr/bin/python3 mrix,
+  /usr/lib/python3*/** mr,
+  /usr/lib/frp-mgr/** r,
+
   # Persistent add-on data
   /data/** rwk,
 

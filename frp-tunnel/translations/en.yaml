@@ -2,47 +2,45 @@
 # English translations for configuration options
 
 configuration:
-  server_addr:
-    name: Server Address
-    description: >-
-      Hostname or IP of the frps (frp server) instance that this client
-      registers with. For the LinumIQ tunneling service this is
-      'linumiq.net'.
-
-  server_port:
-    name: Server Port
-    description: >-
-      TCP port of the frps control channel. Default is 7000.
-
-  token:
-    name: Tunnel Token
-    description: >-
-      Per-tunnel authentication token. Generate this in the LinumIQ
-      dashboard after claiming your subdomain. Treat it like a password -
-      anyone who has it can impersonate your tunnel.
-
-  subdomain:
-    name: Subdomain
-    description: >-
-      The subdomain you claimed in the dashboard (e.g. 'smith' for
-      smith.linumiq.net). Must be 3-32 characters: lowercase a-z, 0-9
-      and '-', and must not start or end with '-'. The frps auth plugin
-      also rejects mismatches between this value and the one bound to
-      your token.
-
-  local_host:
-    name: Local Host
-    description: >-
-      Hostname or IP of the local service to expose through the tunnel.
-      Default is 'homeassistant' which resolves to Home Assistant Core
-      on the Supervisor network.
-
-  local_port:
-    name: Local Port
-    description: >-
-      TCP port of the local service. Default is 8123 for Home Assistant.
-
   log_level:
     name: Log Level
     description: >-
       Verbosity of frpc's own log output (trace, debug, info, warn, error).
+
+  # -------------------------------------------------------------------
+  # Advanced / development overrides (hidden in production)
+  # -------------------------------------------------------------------
+  app_base:
+    name: App Base URL (advanced)
+    description: >-
+      Base URL of the LinumIQ web app used for browser-based device pairing.
+      Default is https://app.linumiq.net. Only change this for development
+      or testing against a staging environment.
+
+  api_base:
+    name: API Base URL (advanced)
+    description: >-
+      Base URL of the LinumIQ backend API. Default is https://api.linumiq.net.
+      Only change this for development or testing.
+
+  server_addr:
+    name: FRP Server Address (advanced)
+    description: >-
+      Hostname or IP of the frps server. Default is linumiq.net.
+      Only change this for development or testing.
+
+  server_port:
+    name: FRP Server Port (advanced)
+    description: >-
+      TCP control port of the frps server. Default is 7000.
+
+  local_host:
+    name: Local Host (advanced)
+    description: >-
+      Hostname or IP of the local service to expose. Default is
+      'homeassistant' which resolves to Home Assistant Core.
+
+  local_port:
+    name: Local Port (advanced)
+    description: >-
+      TCP port of the local service. Default is 8123 for Home Assistant.

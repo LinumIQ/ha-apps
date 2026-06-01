@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>FRP Tunnel - Pairing Panel</title>
+    <link rel="stylesheet" href="static/style.css" />
+  </head>
+  <body>
+    <div class="container">
+      <header class="app-header">
+        <div class="app-header__icon" aria-hidden="true">🔗</div>
+        <div class="app-header__text">
+          <h1>FRP Tunnel</h1>
+          <p>
+            Pair your Home Assistant instance with your LinumIQ account
+            to make it reachable on the public internet.
+          </p>
+        </div>
+      </header>
+
+      {% if flash_error %}
+      <div class="flash flash-error" role="alert">
+        <strong>Error:</strong>&nbsp;{{ flash_error }}
+      </div>
+      {% endif %} {% if flash_ok %}
+      <div class="flash flash-ok" role="status">{{ flash_ok }}</div>
+      {% endif %}
+
+      {# --- STATE: Unpaired (pairing not started) --- #}
+      {% if not paired and not pairing_active %}
+      <section class="card" aria-labelledby="pair-heading">
+        <h2 class="card__title" id="pair-heading">Get Started</h2>
+        <p>
+          This add-on uses a secure browser-based pairing flow. No manual
+          tokens or configuration files are needed.
+        </p>
+        <ol class="steps">
+          <li>Click <strong>Start Pairing</strong> below.</li>
+          <li>
+            Open the link shown on screen in your browser (or scan the QR
+            code if available).
+          </li>
+          <li>
+            Sign in or create an account at
+            <code>app.linumiq.net</code>.
+          </li>
+          <li>Approve the device when prompted.</li>
+          <li>Come back here — your tunnel will be live!</li>
+        </ol>
+        <form method="post" action="./pair/start">
+          <button class="btn" type="submit">Start Pairing</button>
+        </form>
+      </section>
+      {% endif %}
+
+      {# --- STATE: Pairing in progress --- #}
+      {% if not paired and pairing_active %}
+      <section class="card card--pairing" aria-labelledby="pairing-heading">
+        <h2 class="card__title" id="pairing-heading">Pairing in Progress</h2>
+
+        <div class="pairing-code">
+          <span class="pairing-code__label">Your pairing code</span>
+          <span class="pairing-code__value">{{ user_code }}</span>
+        </div>
+
+        {% if verification_uri_complete %}
+        <p class="pairing-link">
+          <a
+            href="{{ verification_uri_complete }}"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="btn"
+          >
+            Open pairing page &nearr;
+          </a>
+        </p>
+        <p class="pairing-hint">
+          This link opens in a new tab. Sign in, approve the device, then
+          return here.
+        </p>
+        {% endif %}
+
+        <div class="pairing-status" id="pairing-status">
+          <span class="spinner" aria-hidden="true"></span>
+          Waiting for approval&hellip;
+        </div>
+
+        <form method="post" action="./pair/start" class="pairing-reset">
+          <button class="btn-secondary" type="submit">Restart Pairing</button>
+        </form>
+      </section>
+
+      <script>
+        (function () {
+          var polling = true;
+          var interval = {{ interval | default(5, true) }} * 1000;
+          var base = ".";
+
+          function poll() {
+            if (!polling) return;
+            fetch(base + "/pair/poll", { method: "POST" })
+              .then(function (r) {
+                return r.json();
+              })
+              .then(function (data) {
+                var el = document.getElementById("pairing-status");
+                if (!el) return;
+                if (data.status === "pending") {
+                  el.innerHTML =
+                    '<span class="spinner" aria-hidden="true"></span> Waiting for approval&hellip;';
+                  setTimeout(poll, interval);
+                } else if (data.status === "slow_down") {
+                  el.innerHTML =
+                    '<span class="spinner" aria-hidden="true"></span> Server asked to slow down, retrying&hellip;';
+                  setTimeout(poll, interval + 2000);
+                } else if (data.status === "paired") {
+                  el.innerHTML =
+                    '<span class="status-ok">&#10003;</span> Paired! Reloading&hellip;';
+                  polling = false;
+                  setTimeout(function () {
+                    window.location.href = base + "/";
+                  }, 800);
+                } else if (data.status === "no_tunnel") {
+                  el.innerHTML =
+                    '<span class="status-warn">&#9888;</span> Device approved — set a subdomain.';
+                  polling = false;
+                  setTimeout(function () {
+                    window.location.href = base + "/";
+                  }, 1200);
+                } else if (data.status === "expired") {
+                  el.innerHTML =
+                    '<span class="status-error">&#10007;</span> Session expired. Please restart pairing.';
+                  polling = false;
+                } else {
+                  // error
+                  el.innerHTML =
+                    '<span class="status-error">&#10007;</span> ' +
+                    (data.error || "Unknown error") +
+                    '. <a href="' +
+                    base +
+                    '/">Reload</a>';
+                  polling = false;
+                }
+              })
+              .catch(function () {
+                var el = document.getElementById("pairing-status");
+                if (el) {
+                  el.innerHTML =
+                    '<span class="spinner" aria-hidden="true"></span> Retrying&hellip;';
+                }
+                setTimeout(poll, 3000);
+              });
+          }
+
+          setTimeout(poll, interval);
+        })();
+      </script>
+      {% endif %}
+
+      {# --- STATE: Paired --- #}
+      {% if paired %}
+      <section class="card" aria-labelledby="status-heading">
+        <div class="card__header">
+          <h2 class="card__title" id="status-heading">
+            <span class="status-badge status-badge--live" aria-hidden="true"></span>
+            Connected
+          </h2>
+        </div>
+
+        <dl class="meta-list">
+          <div class="meta-list__row">
+            <dt class="meta-list__label">Public URL</dt>
+            <dd class="meta-list__value">
+              <a href="{{ public_url }}" target="_blank" rel="noopener noreferrer">
+                {{ public_url }}
+              </a>
+            </dd>
+          </div>
+          <div class="meta-list__row">
+            <dt class="meta-list__label">Subdomain</dt>
+            <dd class="meta-list__value"><code>{{ subdomain }}</code></dd>
+          </div>
+          <div class="meta-list__row">
+            <dt class="meta-list__label">frpc status</dt>
+            <dd class="meta-list__value">{{ frpc_status }}</dd>
+          </div>
+          <div class="meta-list__row">
+            <dt class="meta-list__label">Forwarding</dt>
+            <dd class="meta-list__value">
+              {{ local_host or "homeassistant" }}:{{ local_port or "8123" }}
+            </dd>
+          </div>
+        </dl>
+
+        <div class="btn-row">
+          <button
+            class="btn-secondary"
+            type="button"
+            onclick="
+              document.getElementById('change-dialog').style.display =
+                document.getElementById('change-dialog').style.display === 'none'
+                  ? 'block' : 'none';
+            "
+          >
+            Change Subdomain
+          </button>
+          <form
+            method="post"
+            action="./unpair"
+            onsubmit="return confirm('Unpair this device? The tunnel will stop immediately.')"
+          >
+            <button class="btn-danger" type="submit">Unpair</button>
+          </form>
+        </div>
+
+        <div
+          id="change-dialog"
+          class="change-dialog"
+          style="display: none"
+        >
+          <h3>Change Subdomain</h3>
+          <p>
+            Enter a new subdomain (3-32 lowercase letters, digits, hyphens).
+            Your public URL will be
+            <code>https://&lt;subdomain&gt;.linumiq.net</code>.
+          </p>
+          <form method="post" action="./subdomain/change" class="form-inline">
+            <div class="field">
+              <label for="subdomain">New subdomain</label>
+              <input
+                id="subdomain"
+                type="text"
+                name="subdomain"
+                required
+                pattern="^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="my-home"
+              />
+            </div>
+            <button class="btn" type="submit">Change</button>
+          </form>
+        </div>
+      </section>
+      {% endif %}
+    </div>
+  </body>
+</html>

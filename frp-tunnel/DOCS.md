@@ -1,47 +1,54 @@
 # FRP Tunnel - Documentation
 
-This add-on runs the upstream `frpc` client (pinned to v0.65.0) inside a
-Home Assistant add-on container. It opens a single outbound TCP control
-connection to a remote `frps` server, registers one HTTP proxy bound to
-`<subdomain>.<server_addr>`, and forwards public requests back to your
-local Home Assistant instance.
+This add-on exposes your local Home Assistant instance to the public
+internet via a persistent reverse tunnel (`frpc`) connected to the
+LinumIQ tunneling service at `linumiq.net`.
 
-It is designed to be paired with the LinumIQ tunneling service
-(`linumiq.net`), where the frps auth plugin validates the per-tunnel
-token against the central database and rejects any attempt to claim a
-subdomain you do not own. It will also work against any standard frps
-server that accepts the same token format.
+**No manual tokens or configuration files are needed.** The add-on
+includes an ingress management panel that walks you through a secure
+browser-based device-pairing flow (OAuth2 Device Authorization Grant).
+Once paired, your Home Assistant is reachable at
+`https://<subdomain>.linumiq.net`.
 
-## Configuration
+## Quick Start
 
-| Option        | Type             | Default         | Description                                                                                       |
-| ------------- | ---------------- | --------------- | ------------------------------------------------------------------------------------------------- |
-| `server_addr` | string           | `linumiq.net`   | Hostname or IP of the frps server.                                                                |
-| `server_port` | port (1-65535)   | `7000`          | TCP control port of frps.                                                                         |
-| `token`       | password         | _required_      | Per-tunnel token. Get this from the LinumIQ dashboard after claiming a subdomain.                 |
-| `subdomain`   | string           | _required_      | The subdomain you claimed. 3-32 chars, lowercase a-z, 0-9, '-' (not starting/ending with '-').    |
-| `local_host`  | string           | `homeassistant` | Hostname/IP of the service to expose.                                                             |
-| `local_port`  | port (1-65535)   | `8123`          | Port of the service to expose.                                                                    |
-| `log_level`   | enum             | `info`          | frpc log verbosity: `trace`, `debug`, `info`, `warn`, `error`.                                    |
+1. Install the **FRP Tunnel** add-on from the add-on store.
+2. Open the add-on's **Web UI** (the "FRP Tunnel" entry in the sidebar).
+3. Click **Start Pairing**.
+4. A pairing code (e.g. `XXXX-XXXX`) and a link appear. Open the link in
+   any browser.
+5. Sign in to your LinumIQ account (or create one via the signup page).
+6. Approve the device when prompted.
+7. Return to the add-on panel — your tunnel is live!
 
-The schema rejects malformed subdomains via a regex `match()` constraint,
-and the service script re-validates the same regex at startup so a bad
-value can never reach `frpc` even if the schema is bypassed.
+You can change the subdomain or unpair the device from the same panel
+at any time.
+
+## How It Works
+
+- The ingress panel calls `POST /api/device/code` on the LinumIQ web app
+  to obtain a per-session device code and user-facing verification code.
+- You approve the device in your browser at the verification URL.
+- The panel polls `POST /api/device/token` with the device code until
+  the backend returns a long-lived `device_token`.
+- The panel then fetches the tunnel configuration (`GET /api/device/tunnel`
+  with the device token) — subdomain, frp tunnel token, server details.
+- The panel writes a complete `/data/frpc.toml` and triggers `frpc` to
+  start.
+- `frpc` connects to the remote `frps` server, authenticates with the
+  per-tunnel token, and registers the HTTP proxy under your subdomain.
 
 ## Generated `frpc.toml`
 
-The add-on regenerates `/data/frpc.toml` from the options on every start
-(any manual edits are lost). The rendered file looks like this:
+The panel generates `/data/frpc.toml` automatically. Example:
 
 ```toml
 serverAddr = "linumiq.net"
 serverPort = 7000
 loginFailExit = false
 
-# The frps auth HTTP plugin reads the per-user token from metadatas.token.
-# Do NOT use [auth] method = "token" — that field is not seen by the plugin.
 [metadatas]
-token = "<your token>"
+token = "<per-tunnel token>"
 
 [log]
 to = "console"
@@ -55,17 +62,45 @@ localIP = "homeassistant"
 localPort = 8123
 ```
 
-The `proxy_name` must equal the claimed subdomain - the frps auth plugin
-enforces this on the `NewProxy` op.
+The file is owned by the add-on and chmod 600. Do not edit it by hand;
+use the panel to change the subdomain or unpair.
+
+## Configuration Options
+
+### User-facing
+
+| Option      | Type | Default  | Description                                       |
+| ----------- | ---- | -------- | ------------------------------------------------- |
+| `log_level` | enum | `info`   | frpc log verbosity: `trace`, `debug`, `info`, `warn`, `error`. |
+
+### Advanced (development / E2E testing)
+
+These are optional overrides that let you point the add-on at a
+development or staging backend. In production you should leave them
+unset — the defaults point at the live LinumIQ service.
+
+| Option        | Type   | Production Default                  | Description                      |
+| ------------- | ------ | ----------------------------------- | -------------------------------- |
+| `app_base`    | URL    | `https://app.linumiq.net`           | Web app for browser pairing.     |
+| `api_base`    | URL    | `https://api.linumiq.net`           | Backend API for device flow.     |
+| `server_addr` | string | `linumiq.net`                       | frps server hostname.            |
+| `server_port` | port   | `7000`                              | frps control port.               |
+| `local_host`  | string | `homeassistant`                     | Local service hostname.          |
+| `local_port`  | port   | `8123`                              | Local service port.              |
 
 ## Troubleshooting
 
-- **`auth webhook denied`** in the add-on log: the token is wrong,
-  inactive, or does not match the subdomain. Re-copy the token from the
-  dashboard.
-- **`start proxy success`** but the public URL returns 502: Home
-  Assistant is not reachable on `local_host:local_port` from inside the
-  add-on. Check that `local_host` resolves (`homeassistant` only works
-  on the Supervisor network).
-- **Frequent reconnects**: increase `log_level` to `debug` and check
-  network connectivity to `server_addr:server_port`.
+- **Pairing link doesn't open**: The link opens `app.linumiq.net`. Make
+  sure your browser has internet access. If you're on a restricted
+  network, type the verification URL manually.
+- **"authorization_pending" for a long time**: The pairing code expires
+  after a few minutes. Click **Restart Pairing** to get a fresh code.
+- **"no tunnel found" after approving**: This is unusual — the backend
+  should auto-create a tunnel on first pairing. Try clicking **Change
+  Subdomain** to pick one manually.
+- **Public URL returns 502**: Home Assistant Core is not reachable at
+  the configured `local_host:local_port` from inside the container.
+  Verify `local_host` resolves (`homeassistant` works on the Supervisor
+  network; if you are using a different setup, set the advanced override).
+- **Frequent frpc reconnects**: Check network connectivity to
+  `server_addr:server_port`.

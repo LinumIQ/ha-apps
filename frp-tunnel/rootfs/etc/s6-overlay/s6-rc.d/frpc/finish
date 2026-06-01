@@ -1,4 +1,5 @@
 #!/command/execlineb -S0
-# When the long-running frpc service exits for any reason, bring the whole
-# add-on container down so the Home Assistant Supervisor can restart it.
-s6-svscanctl -t /run/service
+# When frpc exits (e.g. config changed, or connection lost), let s6
+# restart it after a short delay. Do NOT bring the whole add-on down.
+foreground { s6-sleep 2 }
+exit 0

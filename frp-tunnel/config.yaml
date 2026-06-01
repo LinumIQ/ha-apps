@@ -3,11 +3,13 @@
 # https://developers.home-assistant.io/docs/add-ons/configuration/
 
 name: "FRP Tunnel"
-version: "1.0.0"
+version: "2.0.0"
 slug: "frp_tunnel"
 description: >-
-  frp client (frpc) that exposes Home Assistant over a persistent reverse
-  tunnel to a remote frps server (e.g. the LinumIQ tunneling service).
+  Exposes Home Assistant over a persistent reverse tunnel to a remote
+  frps server. Pair the add-on with your LinumIQ account using a simple
+  browser-based device-authorization flow — no manual tokens or config
+  files required. Manage subdomains directly from the ingress panel.
 url: "https://github.com/LinumIQ/ha-apps/tree/main/frp-tunnel"
 
 # Supported architectures
@@ -19,31 +21,36 @@ arch:
 init: false
 startup: services
 
-# Outbound-only client; no port mappings or ingress needed.
+# Outbound-only client; no port mappings needed.
 
 # File mappings
 map:
   - addon_config:rw
 
-# Add-on options with defaults
+# Ingress panel for device pairing and tunnel management
+ingress: true
+ingress_entry: /
+panel_icon: mdi:lan-connect
+panel_title: "FRP Tunnel"
+
+# Add-on options with defaults.
+# The only user-facing option is log_level — all tunnel details are
+# obtained automatically via the device-authorization flow.
 options:
-  server_addr: "linumiq.net"
-  server_port: 7000
-  token: ""
-  subdomain: ""
-  local_host: "homeassistant"
-  local_port: 8123
   log_level: "info"
 
-# Schema for options validation
+# Advanced / hidden overrides for development and E2E testing.
+# In production these are never touched by the user; the FastAPI panel
+# drives everything through the browser pairing flow.
 schema:
-  server_addr: str
-  server_port: port
-  token: password
-  subdomain: "match(^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$)"
-  local_host: str
-  local_port: port
-  log_level: list(trace|debug|info|warn|error)
+  log_level: list(trace|debug|info|warn|error)?
+  # Advanced overrides (optional, production defaults)
+  app_base: url?
+  api_base: url?
+  server_addr: str?
+  server_port: port?
+  local_host: str?
+  local_port: port?
 
 # Resource configuration
 timeout: 60

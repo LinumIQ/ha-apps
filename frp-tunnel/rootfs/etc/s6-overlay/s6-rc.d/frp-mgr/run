@@ -1,0 +1,35 @@
+#!/command/with-contenv bashio
+# ==============================================================================
+# Home Assistant Add-on: FRP Tunnel
+# Long-running frp-mgr FastAPI app served on the ingress port (8099).
+# ==============================================================================
+
+bashio::log.info "Starting frp-mgr (FastAPI) pairing panel..."
+
+# --- User-facing option ---
+LOG_LEVEL="$(bashio::config 'log_level' 'info')"
+
+# --- Advanced overrides (production defaults, only changed for dev/E2E) ---
+APP_BASE="$(bashio::config 'app_base' 'https://app.linumiq.net')"
+API_BASE="$(bashio::config 'api_base' 'https://api.linumiq.net')"
+SERVER_ADDR="$(bashio::config 'server_addr' 'linumiq.net')"
+SERVER_PORT="$(bashio::config 'server_port' '7000')"
+LOCAL_HOST="$(bashio::config 'local_host' 'homeassistant')"
+LOCAL_PORT="$(bashio::config 'local_port' '8123')"
+
+# --- Map log_level to uvicorn level ---
+case "${LOG_LEVEL}" in
+    trace|debug) UVICORN_LOG_LEVEL="debug" ;;
+    info)        UVICORN_LOG_LEVEL="info" ;;
+    warn)        UVICORN_LOG_LEVEL="warning" ;;
+    error)       UVICORN_LOG_LEVEL="error" ;;
+    *)           UVICORN_LOG_LEVEL="info" ;;
+esac
+
+export APP_BASE API_BASE SERVER_ADDR SERVER_PORT LOCAL_HOST LOCAL_PORT LOG_LEVEL
+
+cd /usr/lib/frp-mgr || exit 1
+exec uvicorn app:app \
+    --host 0.0.0.0 \
+    --port 8099 \
+    --log-level "${UVICORN_LOG_LEVEL}"

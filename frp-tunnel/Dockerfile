@@ -18,9 +18,9 @@ ARG BUILD_VERSION
 ARG FRP_VERSION=0.65.0
 
 # Install runtime dependencies. The hassio-addons base already provides bash,
-# jq, curl, tzdata, ca-certificates, s6-overlay and bashio. We only need the
-# frpc binary itself, fetched from the upstream GitHub release matching the
-# target architecture.
+# jq, curl, tzdata, ca-certificates, s6-overlay and bashio. We need:
+#   - frpc binary (from upstream GitHub release)
+#   - python3 + FastAPI ecosystem: device-pairing ingress panel
 # hadolint ignore=DL3018,DL3003
 RUN set -eux; \
     case "${BUILD_ARCH}" in \
@@ -36,6 +36,16 @@ RUN set -eux; \
     rm -rf frp.tar.gz "frp_${FRP_VERSION}_${FRP_ARCH}"; \
     /usr/bin/frpc --version
 
+# Install Python + FastAPI stack for the ingress pairing panel.
+# Uses Alpine community packages (no pip, no build step).
+# hadolint ignore=DL3018
+RUN apk add --no-cache \
+        python3 \
+        py3-fastapi \
+        py3-jinja2 \
+        py3-python-multipart \
+        uvicorn
+
 # Pre-create directories used at runtime
 RUN mkdir -p /data
 
@@ -45,7 +55,9 @@ COPY rootfs /
 # Make every shell asset executable in one place
 RUN chmod a+x \
         /etc/s6-overlay/s6-rc.d/frpc/run \
-        /etc/s6-overlay/s6-rc.d/frpc/finish
+        /etc/s6-overlay/s6-rc.d/frpc/finish \
+        /etc/s6-overlay/s6-rc.d/frp-mgr/run \
+        /etc/s6-overlay/s6-rc.d/frp-mgr/finish
 
 # OCI image labels
 LABEL \
