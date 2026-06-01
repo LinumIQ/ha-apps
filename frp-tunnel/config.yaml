@@ -3,7 +3,7 @@
 # https://developers.home-assistant.io/docs/add-ons/configuration/
 
 name: "FRP Tunnel"
-version: "2.0.0"
+version: "2.0.1"
 slug: "frp_tunnel"
 description: >-
   Exposes Home Assistant over a persistent reverse tunnel to a remote
@@ -49,6 +49,7 @@ schema:
   api_base: url?
   server_addr: str?
   server_port: port?
+  domain_base: str?
   local_host: str?
   local_port: port?
 

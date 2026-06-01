@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.1] - 2026-06-01
+
+### Added
+
+- `domain_base` advanced override: the public tunnel hostname suffix
+  (`subdomain.<domain_base>`) can now be set independently of the frps
+  control address (`server_addr`). Defaults to `server_addr`, so production
+  behaviour is unchanged; useful for dev stacks where the public domain
+  (e.g. `dev.linumiq.net`) differs from the frps control host.
+
 ## [2.0.0] - 2026-06-01
 
 ### Added

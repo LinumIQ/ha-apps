@@ -51,6 +51,11 @@ APP_BASE = os.environ.get("APP_BASE", "https://app.linumiq.net").rstrip("/")
 API_BASE = os.environ.get("API_BASE", "https://api.linumiq.net").rstrip("/")
 SERVER_ADDR = os.environ.get("SERVER_ADDR", "linumiq.net")
 SERVER_PORT = int(os.environ.get("SERVER_PORT", "7000"))
+# Public domain suffix for the tunnel vhost (customDomains / public URL).
+# Usually identical to SERVER_ADDR in production, but kept separate so a dev
+# stack can connect frpc to a control server on one host while the public
+# hostname lives under a different domain (e.g. *.dev.linumiq.net).
+DOMAIN_BASE = os.environ.get("DOMAIN_BASE", "").strip() or SERVER_ADDR
 LOCAL_HOST = os.environ.get("LOCAL_HOST", "homeassistant")
 LOCAL_PORT = int(os.environ.get("LOCAL_PORT", "8123"))
 
@@ -188,7 +193,7 @@ def _write_frpc_toml(subdomain: str, token: str) -> None:
         f"[[proxies]]\n"
         f"name = \"{subdomain}\"\n"
         f"type = \"http\"\n"
-        f"customDomains = [\"{subdomain}.{SERVER_ADDR}\"]\n"
+        f"customDomains = [\"{subdomain}.{DOMAIN_BASE}\"]\n"
         f"localIP = \"{LOCAL_HOST}\"\n"
         f"localPort = {LOCAL_PORT}\n"
     )
@@ -366,7 +371,7 @@ async def index(request: Request) -> Any:
     frpc_stat = _frpc_status() if paired else "stopped"
 
     subdomain = state.get("subdomain", "")
-    public_url = f"https://{subdomain}.{SERVER_ADDR}" if subdomain else ""
+    public_url = f"https://{subdomain}.{DOMAIN_BASE}" if subdomain else ""
 
     flash_error = request.query_params.get("error") or None
     flash_ok = request.query_params.get("ok") or None
@@ -596,7 +601,7 @@ async def subdomain_change(
         LOG.info("Subdomain changed to %s", new_subdomain)
         return _redirect_home(
             request,
-            ok=f"Subdomain changed to {new_subdomain}.{SERVER_ADDR}",
+            ok=f"Subdomain changed to {new_subdomain}.{DOMAIN_BASE}",
         )
 
     elif status_code == 409:

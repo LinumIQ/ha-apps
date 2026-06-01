@@ -34,6 +34,14 @@ configuration:
     description: >-
       TCP control port of the frps server. Default is 7000.
 
+  domain_base:
+    name: Public Domain Base (advanced)
+    description: >-
+      Domain suffix for the public tunnel hostname (subdomain.<domain_base>).
+      Defaults to the FRP server address. Set this separately only when the
+      public domain differs from the frps control host, e.g. 'dev.linumiq.net'
+      for a development stack.
+
   local_host:
     name: Local Host (advanced)
     description: >-

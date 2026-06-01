@@ -14,6 +14,7 @@ APP_BASE="$(bashio::config 'app_base' 'https://app.linumiq.net')"
 API_BASE="$(bashio::config 'api_base' 'https://api.linumiq.net')"
 SERVER_ADDR="$(bashio::config 'server_addr' 'linumiq.net')"
 SERVER_PORT="$(bashio::config 'server_port' '7000')"
+DOMAIN_BASE="$(bashio::config 'domain_base' 'linumiq.net')"
 LOCAL_HOST="$(bashio::config 'local_host' 'homeassistant')"
 LOCAL_PORT="$(bashio::config 'local_port' '8123')"
 
@@ -26,7 +27,7 @@ case "${LOG_LEVEL}" in
     *)           UVICORN_LOG_LEVEL="info" ;;
 esac
 
-export APP_BASE API_BASE SERVER_ADDR SERVER_PORT LOCAL_HOST LOCAL_PORT LOG_LEVEL
+export APP_BASE API_BASE SERVER_ADDR SERVER_PORT DOMAIN_BASE LOCAL_HOST LOCAL_PORT LOG_LEVEL
 
 cd /usr/lib/frp-mgr || exit 1
 exec uvicorn app:app \
