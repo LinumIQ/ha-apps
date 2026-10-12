@@ -14,26 +14,32 @@ ARG BUILD_REF
 ARG BUILD_REPOSITORY
 ARG BUILD_VERSION
 
-# Pinned upstream frp release (v0.65.x line).
+# Pinned upstream frp release (v0.65.x line) and the SHA-256 of each release
+# tarball, as published in the release's frp_sha256_checksums.txt. Bumping
+# FRP_VERSION requires updating both checksums; the build fails on a mismatch.
 ARG FRP_VERSION=0.65.0
+ARG FRP_SHA256_AMD64=52ced8c5fdf772f48a9909da4c10c7568c061861946ac9af7a86eeaf14b7e6d5
+ARG FRP_SHA256_ARM64=d3e2be696d70b8e8dc475a81b8b5e4089f3a2acde5e42e47d6fc020fe3ddb180
 
 # Install runtime dependencies. The hassio-addons base already provides bash,
 # jq, curl, tzdata, ca-certificates, s6-overlay and bashio. We need:
-#   - frpc binary (from upstream GitHub release)
+#   - frpc binary (from upstream GitHub release, checksum-verified)
 #   - python3 + FastAPI ecosystem: device-pairing ingress panel
 # hadolint ignore=DL3018,DL3003
 RUN set -eux; \
     case "${BUILD_ARCH}" in \
-        amd64)   FRP_ARCH=linux_amd64 ;; \
-        aarch64) FRP_ARCH=linux_arm64 ;; \
+        amd64)   FRP_ARCH=linux_amd64; FRP_SHA256="${FRP_SHA256_AMD64}" ;; \
+        aarch64) FRP_ARCH=linux_arm64; FRP_SHA256="${FRP_SHA256_ARM64}" ;; \
         *) echo "Unsupported BUILD_ARCH: ${BUILD_ARCH}" >&2; exit 1 ;; \
     esac; \
     cd /tmp; \
     curl -fsSLo frp.tar.gz \
         "https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/frp_${FRP_VERSION}_${FRP_ARCH}.tar.gz"; \
+    printf '%s  frp.tar.gz\n' "${FRP_SHA256}" > frp.tar.gz.sha256; \
+    sha256sum -c frp.tar.gz.sha256; \
     tar -xzf frp.tar.gz; \
     install -m 0755 "frp_${FRP_VERSION}_${FRP_ARCH}/frpc" /usr/bin/frpc; \
-    rm -rf frp.tar.gz "frp_${FRP_VERSION}_${FRP_ARCH}"; \
+    rm -rf frp.tar.gz frp.tar.gz.sha256 "frp_${FRP_VERSION}_${FRP_ARCH}"; \
     /usr/bin/frpc --version
 
 # Install Python + FastAPI stack for the ingress pairing panel.
@@ -46,18 +52,17 @@ RUN apk add --no-cache \
         py3-python-multipart \
         uvicorn
 
-# Pre-create directories used at runtime
-RUN mkdir -p /data
-
-# Copy the s6-overlay services
+# Copy the s6-overlay services and the frp-mgr panel / renderer
 COPY rootfs /
 
-# Make every shell asset executable in one place
+# Make every executable asset executable in one place and pre-create the
+# runtime data directory (bind-mounted by Supervisor; used as-is outside it).
 RUN chmod a+x \
         /etc/s6-overlay/s6-rc.d/frpc/run \
         /etc/s6-overlay/s6-rc.d/frpc/finish \
         /etc/s6-overlay/s6-rc.d/frp-mgr/run \
-        /etc/s6-overlay/s6-rc.d/frp-mgr/finish
+        /etc/s6-overlay/s6-rc.d/frp-mgr/finish \
+    && mkdir -p /data
 
 # OCI image labels
 LABEL \

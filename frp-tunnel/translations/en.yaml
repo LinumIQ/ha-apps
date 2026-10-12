@@ -5,42 +5,47 @@ configuration:
   log_level:
     name: Log Level
     description: >-
-      Verbosity of frpc's own log output (trace, debug, info, warn, error).
+      Verbosity of the add-on's log, including frpc's own output
+      (trace, debug, info, notice, warning, error, fatal).
 
   # -------------------------------------------------------------------
-  # Advanced / development overrides (hidden in production)
+  # Advanced / development overrides. Leave empty in production: an
+  # override only applies when it is explicitly set.
   # -------------------------------------------------------------------
   app_base:
     name: App Base URL (advanced)
     description: >-
-      Base URL of the LinumIQ web app used for browser-based device pairing.
-      Default is https://app.linumiq.net. Only change this for development
-      or testing against a staging environment.
+      Base URL of the LinumIQ web app used for browser-based device pairing
+      and the device API. Default is https://app.linumiq.net. Only change
+      this for development, e.g. https://app-dev.linumiq.net.
 
   api_base:
     name: API Base URL (advanced)
     description: >-
       Base URL of the LinumIQ backend API. Default is https://api.linumiq.net.
-      Only change this for development or testing.
+      Only change this for development, e.g. https://api-dev.linumiq.net.
 
   server_addr:
     name: FRP Server Address (advanced)
     description: >-
-      Hostname or IP of the frps server. Default is linumiq.net.
-      Only change this for development or testing.
+      Hostname or IP of the frps server. Normally provided by the LinumIQ
+      server during pairing (default linumiq.net). When set, this value
+      overrides the server-provided one.
 
   server_port:
     name: FRP Server Port (advanced)
     description: >-
-      TCP control port of the frps server. Default is 7000.
+      TCP control port of the frps server. Normally provided by the LinumIQ
+      server during pairing (default 7000; the development stack uses 7001).
+      When set, this value overrides the server-provided one.
 
   domain_base:
     name: Public Domain Base (advanced)
     description: >-
-      Domain suffix for the public tunnel hostname (subdomain.<domain_base>).
-      Defaults to the FRP server address. Set this separately only when the
-      public domain differs from the frps control host, e.g. 'dev.linumiq.net'
-      for a development stack.
+      Domain suffix of the public tunnel hostname (subdomain.<domain_base>).
+      Normally provided by the LinumIQ server during pairing; falls back to
+      the FRP server address. When set, this value overrides the
+      server-provided one, e.g. 'dev.linumiq.net' for the development stack.
 
   local_host:
     name: Local Host (advanced)

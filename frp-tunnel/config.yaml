@@ -3,7 +3,7 @@
 # https://developers.home-assistant.io/docs/add-ons/configuration/
 
 name: "FRP Tunnel"
-version: "2.0.1"
+version: "2.1.0"
 slug: "frp_tunnel"
 description: >-
   Exposes Home Assistant over a persistent reverse tunnel to a remote
@@ -41,16 +41,19 @@ options:
 
 # Advanced / hidden overrides for development and E2E testing.
 # In production these are never touched by the user; the FastAPI panel
-# drives everything through the browser pairing flow.
+# drives everything through the browser pairing flow. server_addr,
+# server_port and domain_base are normally provided by the LinumIQ server
+# during pairing; an override applies only when it is explicitly set.
+# The add-on validates every value again before writing frpc.toml.
 schema:
-  log_level: list(trace|debug|info|warn|error)?
+  log_level: list(trace|debug|info|notice|warning|error|fatal)?
   # Advanced overrides (optional, production defaults)
   app_base: url?
   api_base: url?
-  server_addr: str?
+  server_addr: 'match(^[A-Za-z0-9.:-]+$)?'
   server_port: port?
-  domain_base: str?
-  local_host: str?
+  domain_base: 'match(^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$)?'
+  local_host: 'match(^[A-Za-z0-9.:-]+$)?'
   local_port: port?
 
 # Resource configuration

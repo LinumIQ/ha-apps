@@ -11,8 +11,12 @@ on:
 
 jobs:
   hadolint:
-    name: Hadolint
+    name: Hadolint (${{ matrix.addon }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        addon: ["caddy-mtls", "frp-tunnel"]
     steps:
       - name: Checkout the repository
         uses: actions/checkout@v5
@@ -20,7 +24,7 @@ jobs:
       - name: Run Hadolint
         uses: hadolint/hadolint-action@v3.1.0
         with:
-          dockerfile: caddy-mtls/Dockerfile
+          dockerfile: ${{ matrix.addon }}/Dockerfile
 
   shellcheck:
     name: Shellcheck
@@ -29,16 +33,23 @@ jobs:
       - name: Checkout the repository
         uses: actions/checkout@v5
 
+      # Scans every shell script of both add-ons: *.sh (helper libraries,
+      # frp-tunnel/tests/e2e/run.sh) and - via additional_files - the s6
+      # `run`/`finish` scripts. Those have no extension, are mode 644 in git
+      # and use the `with-contenv bashio` / `execlineb` shebangs, so the
+      # action's own shebang detection skips them.
       - name: Run Shellcheck
         uses: ludeeus/action-shellcheck@2.0.0
         env:
-          # SC1008: bashio shebang is not recognised by shellcheck
-          # SC1083: s6 'finish' scripts are execlineb, not shell
+          # SC1008: bashio / execlineb shebangs are not recognised (-s bash
+          #         parses every file as bash)
+          # SC1083: s6 'finish' scripts are execlineb ('foreground { ... }')
           # SC1091: sourced files use absolute /etc/... paths
           # SC2016: jq programs intentionally use single quotes
           SHELLCHECK_OPTS: -e SC1008,SC1083,SC1091,SC2016 -s bash
         with:
           ignore_paths: ".git"
+          additional_files: "run finish"
 
   yamllint:
     name: YAMLLint
@@ -51,8 +62,12 @@ jobs:
         uses: frenck/action-yamllint@v1.5.0
 
   addon-config:
-    name: Add-on configuration
+    name: Add-on configuration (${{ matrix.addon }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        addon: ["caddy-mtls", "frp-tunnel"]
     steps:
       - name: Checkout the repository
         uses: actions/checkout@v5
@@ -60,4 +75,63 @@ jobs:
       - name: Run Home Assistant Add-on Lint
         uses: frenck/action-addon-linter@v2
         with:
-          path: "./caddy-mtls"
+          path: "./${{ matrix.addon }}"
+
+  frp-tunnel-python:
+    name: FRP Tunnel Python (compile + unit tests)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The FastAPI flow tests (test_app.py) are skipped here because the
+      # panel's dependencies come from Alpine packages inside the image (the
+      # frp-tunnel-image job runs them there); the pure configuration logic,
+      # validators, precedence rules and the E2E harness's TOTP
+      # implementation are covered.
+      - name: Compile
+        run: >-
+          python -m py_compile
+          frp-tunnel/rootfs/usr/lib/frp-mgr/app.py
+          frp-tunnel/rootfs/usr/lib/frp-mgr/config.py
+          frp-tunnel/tests/e2e/approve.py
+
+      - name: Unit tests
+        run: python -m unittest discover -s frp-tunnel/tests/unit -v
+
+  frp-tunnel-image:
+    name: FRP Tunnel image (amd64 build + all unit tests inside)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v5
+
+      # Same build as Supervisor / the E2E harness; also verifies the pinned
+      # frp tarball checksum.
+      - name: Build the amd64 image
+        run: >-
+          docker build
+          --build-arg BUILD_FROM=ghcr.io/hassio-addons/base:20.1.0
+          --build-arg BUILD_ARCH=amd64
+          -t frp-tunnel-test
+          frp-tunnel
+
+      # Runs every unit test (incl. the FastAPI panel flows in test_app.py)
+      # with the image's Python packages against the INSTALLED panel code
+      # (FRP_MGR_DIR); FRP_TESTS_REQUIRE_FASTAPI=1 makes a missing FastAPI a
+      # failure instead of a skip.
+      - name: Unit tests inside the image
+        run: >-
+          docker run --rm
+          -v "${GITHUB_WORKSPACE}/frp-tunnel/tests:/tests:ro"
+          -e FRP_MGR_DIR=/usr/lib/frp-mgr
+          -e FRP_TESTS_REQUIRE_FASTAPI=1
+          -e PYTHONDONTWRITEBYTECODE=1
+          --entrypoint python3
+          frp-tunnel-test
+          -m unittest discover -s /tests/unit -v

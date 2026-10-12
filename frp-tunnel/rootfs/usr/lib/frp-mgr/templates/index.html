@@ -20,6 +20,22 @@
         </div>
       </header>
 
+      {#- Every value below is HTML-escaped (autoescape; nothing is marked safe). Values
+          embedded in JavaScript use |tojson. Pairing values (user code,
+          link, interval) were validated by config.parse_pairing_response. #}
+      {% if option_errors %}
+      <div class="flash flash-error" role="alert">
+        <strong>Invalid add-on configuration.</strong>
+        Fix it in the add-on's <em>Configuration</em> tab and restart the
+        add-on:
+        <ul>
+          {% for message in option_errors %}
+          <li>{{ message }}</li>
+          {% endfor %}
+        </ul>
+      </div>
+      {% endif %}
+
       {% if flash_error %}
       <div class="flash flash-error" role="alert">
         <strong>Error:</strong>&nbsp;{{ flash_error }}
@@ -28,8 +44,15 @@
       <div class="flash flash-ok" role="status">{{ flash_ok }}</div>
       {% endif %}
 
+      {% if not paired and frpc_status == "running" %}
+      <div class="flash flash-error" role="alert">
+        <strong>frpc is running although this device is not paired.</strong>
+        Restart the add-on to stop it.
+      </div>
+      {% endif %}
+
       {# --- STATE: Unpaired (pairing not started) --- #}
-      {% if not paired and not pairing_active %}
+      {% if not paired and not pairing_active and not approved_no_tunnel %}
       <section class="card" aria-labelledby="pair-heading">
         <h2 class="card__title" id="pair-heading">Get Started</h2>
         <p>
@@ -44,7 +67,7 @@
           </li>
           <li>
             Sign in or create an account at
-            <code>app.linumiq.net</code>.
+            <code>{{ app_host }}</code>.
           </li>
           <li>Approve the device when prompted.</li>
           <li>Come back here — your tunnel will be live!</li>
@@ -56,7 +79,7 @@
       {% endif %}
 
       {# --- STATE: Pairing in progress --- #}
-      {% if not paired and pairing_active %}
+      {% if not paired and pairing_active and not approved_no_tunnel %}
       <section class="card card--pairing" aria-labelledby="pairing-heading">
         <h2 class="card__title" id="pairing-heading">Pairing in Progress</h2>
 
@@ -95,7 +118,7 @@
       <script>
         (function () {
           var polling = true;
-          var interval = {{ interval | default(5, true) }} * 1000;
+          var interval = {{ interval | int(5) | tojson }} * 1000;
           var base = ".";
 
           function poll() {
@@ -111,6 +134,10 @@
                   el.innerHTML =
                     '<span class="spinner" aria-hidden="true"></span> Waiting for approval&hellip;';
                   setTimeout(poll, interval);
+                } else if (data.status === "retry") {
+                  el.innerHTML =
+                    '<span class="spinner" aria-hidden="true"></span> Backend not reachable, retrying&hellip;';
+                  setTimeout(poll, interval + 5000);
                 } else if (data.status === "slow_down") {
                   el.innerHTML =
                     '<span class="spinner" aria-hidden="true"></span> Server asked to slow down, retrying&hellip;';
@@ -134,13 +161,12 @@
                     '<span class="status-error">&#10007;</span> Session expired. Please restart pairing.';
                   polling = false;
                 } else {
-                  // error
+                  // error (server text is inserted as text, never as HTML)
                   el.innerHTML =
-                    '<span class="status-error">&#10007;</span> ' +
-                    (data.error || "Unknown error") +
-                    '. <a href="' +
+                    '<span class="status-error">&#10007;</span> <span class="msg"></span>. <a href="' +
                     base +
                     '/">Reload</a>';
+                  el.querySelector(".msg").textContent = data.error || "Unknown error";
                   polling = false;
                 }
               })
@@ -159,13 +185,58 @@
       </script>
       {% endif %}
 
+      {# --- STATE: Approved, but the account has no tunnel yet --- #}
+      {% if approved_no_tunnel %}
+      <section class="card" aria-labelledby="choose-heading">
+        <h2 class="card__title" id="choose-heading">Choose a Subdomain</h2>
+        <p>
+          This device is approved, but your account has no tunnel yet. Pick a
+          subdomain - your public URL will be
+          <code>https://&lt;subdomain&gt;.{{ domain_base }}</code>.
+        </p>
+        <form method="post" action="./subdomain/change" class="form-inline">
+          <div class="field">
+            <label for="first-subdomain">Subdomain</label>
+            <input
+              id="first-subdomain"
+              type="text"
+              name="subdomain"
+              required
+              pattern="^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="my-home"
+            />
+          </div>
+          <button class="btn" type="submit">Create tunnel</button>
+        </form>
+        <div class="btn-row">
+          <form method="post" action="./tunnel/refresh">
+            <button class="btn-secondary" type="submit">Refresh</button>
+          </form>
+          <form
+            method="post"
+            action="./unpair"
+            onsubmit="return confirm('Unpair this device?')"
+          >
+            <button class="btn-danger" type="submit">Unpair</button>
+          </form>
+        </div>
+      </section>
+      {% endif %}
+
       {# --- STATE: Paired --- #}
       {% if paired %}
       <section class="card" aria-labelledby="status-heading">
         <div class="card__header">
           <h2 class="card__title" id="status-heading">
+            {% if frpc_status == "running" %}
             <span class="status-badge status-badge--live" aria-hidden="true"></span>
             Connected
+            {% else %}
+            <span class="status-badge status-badge--idle" aria-hidden="true"></span>
+            Paired
+            {% endif %}
           </h2>
         </div>
 
@@ -187,6 +258,12 @@
             <dd class="meta-list__value">{{ frpc_status }}</dd>
           </div>
           <div class="meta-list__row">
+            <dt class="meta-list__label">Tunnel server</dt>
+            <dd class="meta-list__value">
+              <code>{{ server_addr }}:{{ server_port }}</code> (TLS)
+            </dd>
+          </div>
+          <div class="meta-list__row">
             <dt class="meta-list__label">Forwarding</dt>
             <dd class="meta-list__value">
               {{ local_host or "homeassistant" }}:{{ local_port or "8123" }}
@@ -206,6 +283,15 @@
           >
             Change Subdomain
           </button>
+          <form method="post" action="./tunnel/refresh">
+            <button
+              class="btn-secondary"
+              type="submit"
+              title="Re-fetch subdomain, token and server settings from your LinumIQ account"
+            >
+              Refresh tunnel config
+            </button>
+          </form>
           <form
             method="post"
             action="./unpair"
@@ -224,7 +310,7 @@
           <p>
             Enter a new subdomain (3-32 lowercase letters, digits, hyphens).
             Your public URL will be
-            <code>https://&lt;subdomain&gt;.linumiq.net</code>.
+            <code>https://&lt;subdomain&gt;.{{ domain_base }}</code>.
           </p>
           <form method="post" action="./subdomain/change" class="form-inline">
             <div class="field">

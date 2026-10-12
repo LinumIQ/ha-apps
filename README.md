@@ -13,6 +13,17 @@ Caddy reverse proxy with mutual TLS (mTLS) client certificate authentication and
 automatic HTTPS via Let's Encrypt. Secure your Home Assistant with strong client
 certificate authentication and automatic certificate provisioning.
 
+### [FRP Tunnel](./frp-tunnel)
+
+![Supports aarch64 Architecture][aarch64-shield]
+![Supports amd64 Architecture][amd64-shield]
+
+Exposes Home Assistant at `https://<subdomain>.linumiq.net` through an
+outbound-only, TLS-encrypted [frp](https://github.com/fatedier/frp) reverse
+tunnel to the LinumIQ tunneling service - no port forwarding required. Pair the
+add-on with your LinumIQ account from its ingress panel with a browser-based
+device-authorization flow; no tokens or configuration files to copy.
+
 ## Installation
 
 Click the button below to add this repository to your Home Assistant instance:

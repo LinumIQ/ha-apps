@@ -1,20 +1,76 @@
 #!/command/with-contenv bashio
+# shellcheck shell=bash
 # ==============================================================================
 # Home Assistant Add-on: FRP Tunnel
-# Wait-loop: frpc is started only after the pairing panel writes
-# /data/frpc.toml. While there is no toml, log and sleep.
+# Runs frpc once the add-on is paired.
+#
+# On every (re)start of this service /data/frpc.toml is re-rendered from the
+# persisted pairing state (/data/frp-state.json) and the add-on options by
+# /usr/lib/frp-mgr/config.py, so changed server-provided values (after
+# "Refresh tunnel config" or re-pairing) or changed option overrides are
+# always picked up. The pairing panel restarts this service (s6-svc -r)
+# whenever the state changes; until then it waits.
+#
+# frpc is started ONLY when the renderer exits 0, i.e. it has just read a
+# valid pairing from the state file (under the state lock it shares with
+# the panel). A frpc.toml on its own is never trusted:
+#   exit 3 (not paired: state file missing, corrupt or incomplete) - the
+#          renderer has deleted any leftover frpc.toml (old token); we delete
+#          it too and keep waiting. Without a state file the renderer is not
+#          even started (cheap wait loop); the panel restarts this service
+#          after every pairing, so nothing is missed.
+#   other  (render error, lock timeout) - frpc is not started from the
+#          previous file; retried every 10 seconds.
 # ==============================================================================
-set -e
-
 readonly CONFIG_FILE="/data/frpc.toml"
+readonly STATE_FILE="/data/frp-state.json"
+readonly RENDERER="/usr/lib/frp-mgr/config.py"
+readonly OPTIONS_FILE="/data/options.json"
 
-bashio::log.info "frpc service waiting for device pairing..."
+# Same log-level mapping as the panel (affects the renderer's own messages;
+# frpc's level is written into frpc.toml).
+FRP_MGR_LOG_LEVEL="INFO"
+if [[ -r "${OPTIONS_FILE}" ]]; then
+    case "$(jq -r '.log_level // "info"' "${OPTIONS_FILE}" 2>/dev/null || true)" in
+        trace|debug)  FRP_MGR_LOG_LEVEL="DEBUG" ;;
+        warning|warn) FRP_MGR_LOG_LEVEL="WARNING" ;;
+        error|fatal)  FRP_MGR_LOG_LEVEL="ERROR" ;;
+    esac
+fi
+export FRP_MGR_LOG_LEVEL
 
+waiting_logged=false
+last_rc=""
 while true; do
-    if [ -f "${CONFIG_FILE}" ] && [ -s "${CONFIG_FILE}" ]; then
-        bashio::log.info "frpc config found. Starting frpc..."
-        exec /usr/bin/frpc -c "${CONFIG_FILE}"
+    rc=0
+    if [[ -s "${STATE_FILE}" ]]; then
+        python3 "${RENDERER}" render || rc=$?
+    else
+        rc=3
     fi
-    bashio::log.info "No pairing yet — waiting for /data/frpc.toml..."
-    sleep 5
+    case "${rc}" in
+        0)
+            # Rendered (or already up to date) from a valid pairing.
+            if [[ -s "${CONFIG_FILE}" ]]; then
+                bashio::log.info "Starting frpc..."
+                exec /usr/bin/frpc -c "${CONFIG_FILE}"
+            fi
+            bashio::log.error "Renderer succeeded but ${CONFIG_FILE} is missing."
+            ;;
+        3)
+            # Not paired (yet, or any more): never run a leftover config.
+            rm -f "${CONFIG_FILE}"
+            if [[ "${waiting_logged}" == false ]]; then
+                bashio::log.info "Not paired yet - open the FRP Tunnel panel to pair this device."
+                waiting_logged=true
+            fi
+            ;;
+        *)
+            if [[ "${last_rc}" != "${rc}" ]]; then
+                bashio::log.error "Rendering frpc.toml failed (exit ${rc}); frpc is not started. Retrying every 10 s."
+            fi
+            ;;
+    esac
+    last_rc="${rc}"
+    sleep 10
 done

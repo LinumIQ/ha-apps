@@ -10,12 +10,14 @@ on:
       - main
     paths:
       - "caddy-mtls/**"
+      - "frp-tunnel/**"
       - ".github/workflows/builder.yml"
   pull_request:
     branches:
       - main
     paths:
       - "caddy-mtls/**"
+      - "frp-tunnel/**"
       - ".github/workflows/builder.yml"
   release:
     types:
@@ -44,8 +46,9 @@ jobs:
         id: addons
         run: |
           # An add-on directory is any top-level dir containing config.yaml or
-          # config.json. Output as a space-separated list (compatible with the
-          # downstream loop and the build matrix).
+          # config.json (currently caddy-mtls and frp-tunnel). Output as a
+          # space-separated list (compatible with the downstream loop and the
+          # build matrix).
           addons=()
           for cfg in */config.yaml */config.json; do
             [[ -e "${cfg}" ]] || continue
@@ -103,6 +106,11 @@ jobs:
       - name: Checkout the repository
         uses: actions/checkout@v5
 
+      # On a published GitHub release every add-on is pushed to
+      # ghcr.io/linumiq/{arch}-addon-<dir> (e.g. amd64-addon-frp-tunnel);
+      # otherwise it is only test-built. An add-on uses the published image
+      # only once its config.yaml sets `image:` (frp-tunnel does not yet, so
+      # Supervisor builds it locally from the Dockerfile).
       - name: Check if add-on is published
         id: publish
         run: |
