@@ -127,6 +127,7 @@ jobs:
           python -m py_compile
           frp-tunnel/rootfs/usr/lib/frp-mgr/app.py
           frp-tunnel/rootfs/usr/lib/frp-mgr/config.py
+          frp-tunnel/rootfs/usr/lib/frp-mgr/frpclog.py
           frp-tunnel/tests/e2e/approve.py
 
       # The panel's pinned, hash-checked dependencies (the same

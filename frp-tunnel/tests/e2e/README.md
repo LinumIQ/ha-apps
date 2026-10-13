@@ -76,7 +76,7 @@ never silently run against production.
 | `E2E_EXPECT` | first line of `http://LOCAL_HOST:LOCAL_PORT/` | Text the public page must contain (whoami: `Hostname: <id>`). |
 | `E2E_KEEP_PAIRED` | `0` | `1`: skip the final unpair (leaves a valid device token server-side). |
 | `E2E_KEEP_CONTAINER` | `0` | `1`: do not remove the add-on container (debugging). |
-| `E2E_ALLOWED_INGRESS_IPS` | `127.0.0.1` | Passed to the panel as `ALLOWED_INGRESS_IPS` (IPs/CIDRs). The harness drives the panel with `docker exec ... curl http://127.0.0.1:8099`, so loopback is enough. State-changing requests carry `Sec-Fetch-Site: same-origin` (the panel's CSRF guard refuses them otherwise). |
+| `E2E_ALLOWED_INGRESS_IPS` | `127.0.0.1` | Passed to the panel as `ALLOWED_INGRESS_IPS` (IPs/CIDRs). The harness drives the panel with `docker exec ... curl http://127.0.0.1:8099`, so loopback must be allowed explicitly (the add-on's default is the Supervisor ingress proxy `172.30.32.2` only - checked in a second container, see below). State-changing requests carry `Sec-Fetch-Site: same-origin` (the panel's CSRF guard refuses them otherwise). |
 | `E2E_BOOT_TIMEOUT` / `E2E_PAIR_TIMEOUT` / `E2E_FRPC_TIMEOUT` / `E2E_PUBLIC_TIMEOUT` | `90` / `180` / `60` / `180` s | Timeouts. The public timeout covers on-demand certificate issuance for a new subdomain. |
 | `E2E_BUILD_ARCH`, `E2E_BUILD_FROM`, `E2E_BUILD_TAG` | auto / base 20.1.0 / `frp-tunnel-e2e` | Build knobs. |
 
@@ -99,7 +99,10 @@ Each check prints `PASS`, `FAIL` or `SKIP`:
    image's log-level oneshot would otherwise ask the missing Supervisor API).
 2. Panel healthy; fresh add-on unpaired; frpc waits; the ingress guard answers
    403 to a non-allowed client address, also with a crafted `Host: x/_health?a=`
-   header and for `/_health` (no exemption); a POST without
+   header and for `/_health` (no exemption). A second, unpaired container of
+   the same image with the **default** allow-list (no `ALLOWED_INGRESS_IPS`)
+   must answer 403 on `127.0.0.1:8099` - to root and to the unprivileged user
+   `frpc` (`GET /api/status`, same-origin `POST /unpair`). A POST without
    `Sec-Fetch-Site`/`Origin` and a cross-site POST are refused (CSRF) and
    start nothing.
 3. `POST /pair/start` -> `user_code` from `GET /api/status` -> approval ->
@@ -117,12 +120,23 @@ Each check prints `PASS`, `FAIL` or `SKIP`:
 6. frpc is up (`s6-svstat` up and the PID is `frpc`) as the unprivileged user
    `frpc`, logged `login to server success` (over TLS; verified when
    `E2E_FRPS_CA_FILE` is set) without certificate errors, and
-   `start proxy success`.
+   `start proxy success`. With `E2E_FRPS_CA_FILE`, `/api/status` reports
+   `tls_verified=true` / `tls_login=ok` (set only after that login). The
+   container is started with a dummy `SUPERVISOR_TOKEN` (as Supervisor sets a
+   real one): it must be in the add-on environment
+   (`/run/s6/container_environment`) but not in frpc's
+   (`/proc/<frpc pid>/environ`, read as user `frpc`), which may only contain
+   `PATH`, `HOME` and `TZ`.
 7. `https://<sub>.<DOMAIN_BASE>/` returns the local service's content.
 8. **Refresh tunnel config** works and leaves `frpc.toml` unchanged; deleting
    `frpc.toml` and restarting the frpc service re-renders it identically from
    the state. With `E2E_FRPS_CA_FILE` (and `E2E_TLS_NEGATIVE=1`): a wrong
-   `serverName` is refused by frpc, the restored one logs in again.
+   `serverName` is refused by frpc and the panel reports `tls_login=failed`,
+   `tls_verified=false` and a red banner; the restored one logs in again
+   (`tls_verified=true`). Then fail-closed: with an invalid CA in the state
+   and no `/data/frps-ca.pem`, frpc is **not** started (`frpc is NOT
+   started`, no `frpc.toml`, `tls_mode=blocked`, no login); restoring the
+   state brings it back.
 9. Neither the tunnel token nor the device token appears in the container log.
 10. `POST /unpair` removes state, `frpc.toml` and the pinned CA and stops frpc,
     and revokes the device token server-side (the panel answers `ok=` only
@@ -192,7 +206,8 @@ docker cp frp-tunnel/tests "$c:/tests" && docker start -a "$c"; docker rm "$c"
 `frp-tunnel/tests/apparmor-smoke.sh <image> frp-tunnel/apparmor.txt` (needs
 sudo, docker and a kernel with AppArmor) loads the profile in enforce mode,
 boots the image confined by it and exercises start-up, the panel, the
-renderer with a pinned CA, frpc as user `frpc`, unpair and `docker stop`
-without any backend; it fails on any `apparmor="DENIED"` for the profile. CI
+renderer with a pinned CA, frpc as user `frpc` with its log watcher, unpair
+and `docker stop` without any backend; it fails on any `apparmor="DENIED"`
+for the profile. CI
 runs it on every push. For the full flow under the profile, run `run.sh` with
 `E2E_CREATE_ARGS="--security-opt apparmor=frp_tunnel"`.

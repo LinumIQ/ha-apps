@@ -7,7 +7,11 @@ name: Builder
 permissions: {}
 
 env:
-  MONITORED_FILES: "build.yaml config.yaml Dockerfile rootfs requirements.txt apparmor.txt"
+  # Files/dirs (relative to an add-on directory) whose change rebuilds that
+  # add-on; .dockerignore decides what goes into the build context.
+  MONITORED_FILES: "build.yaml config.yaml Dockerfile .dockerignore rootfs requirements.txt apparmor.txt"
+  # Repository files whose change rebuilds every add-on (the build itself).
+  MONITORED_GLOBAL_FILES: ".github/workflows/builder.yml"
   # home-assistant/builder 2024.08.2, pinned by image digest. The deprecated
   # home-assistant/builder *action* is only a wrapper around this image, and
   # it cannot be pinned by commit SHA (it derives the image tag from its own
@@ -105,20 +109,34 @@ jobs:
             fi
             printf 'Changed files:\n'
             printf '  %s\n' "${changed[@]}"
-            for addon in "${addons[@]}"; do
-              for file in "${changed[@]}"; do
-                hit=false
-                for watched in "${monitored[@]}"; do
-                  if [[ "${file}" == "${addon}/${watched}" || "${file}" == "${addon}/${watched}/"* ]]; then
-                    hit=true
-                  fi
-                done
-                if [[ "${hit}" == true ]]; then
-                  selected+=("${addon}")
-                  break
+            read -r -a monitored_global <<< "${MONITORED_GLOBAL_FILES}"
+            rebuild_all=false
+            for file in "${changed[@]}"; do
+              for watched in "${monitored_global[@]}"; do
+                if [[ "${file}" == "${watched}" ]]; then
+                  rebuild_all=true
                 fi
               done
             done
+            if [[ "${rebuild_all}" == true ]]; then
+              echo "A global build file changed (${MONITORED_GLOBAL_FILES}): rebuilding every add-on"
+              selected=("${addons[@]}")
+            else
+              for addon in "${addons[@]}"; do
+                for file in "${changed[@]}"; do
+                  hit=false
+                  for watched in "${monitored[@]}"; do
+                    if [[ "${file}" == "${addon}/${watched}" || "${file}" == "${addon}/${watched}/"* ]]; then
+                      hit=true
+                    fi
+                  done
+                  if [[ "${hit}" == true ]]; then
+                    selected+=("${addon}")
+                    break
+                  fi
+                done
+              done
+            fi
           fi
           if (( ${#selected[@]} > 0 )); then
             json="$(printf '"%s",' "${selected[@]}")"
@@ -126,7 +144,7 @@ jobs:
             echo "changed=true" >> "${GITHUB_OUTPUT}"
             echo "addons=[${json%,}]" >> "${GITHUB_OUTPUT}"
           else
-            echo "No add-on had any monitored files changed (${MONITORED_FILES})"
+            echo "No add-on had any monitored files changed (${MONITORED_FILES} ${MONITORED_GLOBAL_FILES})"
             echo "changed=false" >> "${GITHUB_OUTPUT}"
           fi
 

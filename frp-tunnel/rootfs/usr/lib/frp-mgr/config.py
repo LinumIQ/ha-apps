@@ -32,9 +32,19 @@ that signed it). A valid CA is persisted in the state, written to
 ``serverName``), unless the ``verify_server`` option is explicitly ``false``.
 Unlike the endpoint values, the CA and ``server_name`` are *kept* when a later
 response omits them (or sends garbage): a server rollback must never silently
-downgrade frpc to an unverified connection. Without any CA (servers older
-than v2.2) the connection is TLS-encrypted but unverified, and the panel says
-so.
+downgrade frpc to an unverified connection. Once the server has sent a CA,
+verification **fails closed**: a pinned CA that no longer passes validation
+is replaced by the last valid one frpc used (``/data/frps-ca.pem``) or, if
+there is none, frpc is not started at all (``render`` exits 4) - never an
+unverified fallback. Without any CA (servers older than v2.2) the connection
+is TLS-encrypted but unverified, and the panel says so.
+
+frpc renders its whole configuration file as a Go ``text/template`` (with the
+process environment as ``.Envs``) before parsing it. Every value written into
+``frpc.toml`` is therefore restricted to characters that cannot form a
+template action, and ``render_frpc_toml`` refuses ``{{``, ``}}`` and
+backticks in every field once more (``TemplateInjectionError``); frpc itself
+runs with a scrubbed environment (see the frpc s6 service).
 
 The module also holds the (pure) validators for everything the backend sends
 during pairing (``parse_pairing_response``), the log/flash sanitiser
@@ -48,6 +58,7 @@ from __future__ import annotations
 import base64
 import binascii
 import fcntl
+import hashlib
 import ipaddress
 import json
 import logging
@@ -115,10 +126,20 @@ TLS_VERIFIED = "verified"
 TLS_UNVERIFIED = "unverified"  # no CA known (server older than v2.2)
 TLS_DISABLED = "disabled"      # verify_server: false
 
+#: tls_mode when a CA is expected but none passes validation: frpc is NOT
+#: started (fail closed, never an unverified fallback).
+TLS_BLOCKED = "blocked"
+
+#: Settings.ca_problem values.
+CA_FALLBACK = "fallback"              # state CA invalid; the last valid frps-ca.pem is used
+CA_INVALID = "invalid"                # state CA invalid and no valid frps-ca.pem
+CA_SERVER_INVALID = "server_invalid"  # the server sent a CA, but never a valid one
+
 #: Exit codes of the ``render`` CLI. frpc/run starts frpc only on EXIT_OK.
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_NOT_PAIRED = 3
+EXIT_CA_BLOCKED = 4
 
 STATE_VERSION = 2
 
@@ -182,8 +203,13 @@ def default_paths() -> Paths:
 
 _LABEL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
 _SUBDOMAIN_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
-# Printable ASCII without space, '"' and '\' - safe inside a TOML string.
-_TOKEN_RE = re.compile(r"[\x21\x23-\x5b\x5d-\x7e]{8,1024}")
+# frp tunnel token (written into frpc.toml, which frpc renders as a Go
+# template): RFC 3986 unreserved characters only - no '{', '}', '`', quotes,
+# backslashes or whitespace.
+_TOKEN_RE = re.compile(r"[A-Za-z0-9._~-]{8,256}")
+# Device token (only ever sent as an HTTP bearer token, never written into
+# frpc.toml): printable ASCII without space, '"' and '\'.
+_DEVICE_TOKEN_RE = re.compile(r"[\x21\x23-\x5b\x5d-\x7e]{8,1024}")
 _PORT_RE = re.compile(r"[0-9]{1,5}")
 # RFC 8628 user code as issued by the LinumIQ dashboard: XXXX-XXXX.
 _USER_CODE_RE = re.compile(r"[A-Z0-9]{4}-[A-Z0-9]{4}")
@@ -264,10 +290,44 @@ def normalize_subdomain(value: Any) -> Optional[str]:
 
 
 def normalize_token(value: Any) -> Optional[str]:
-    """frp tunnel token: 8-1024 printable ASCII chars, no quotes/space."""
+    """frp tunnel token: 8-256 characters ``[A-Za-z0-9._~-]``."""
     if isinstance(value, str) and _TOKEN_RE.fullmatch(value):
         return value
     return None
+
+
+def normalize_device_token(value: Any) -> Optional[str]:
+    """Device token (HTTP bearer only): 8-1024 printable ASCII characters
+    without space, quotes or backslash (nothing that could break a header)."""
+    if isinstance(value, str) and _DEVICE_TOKEN_RE.fullmatch(value):
+        return value
+    return None
+
+
+# -- Go template safety ---------------------------------------------------------
+
+#: What starts/ends a Go text/template action, and its raw-string quote.
+_TEMPLATE_MARKERS = ("{{", "}}", "`")
+
+
+class TemplateInjectionError(ValueError):
+    """A value for frpc.toml contains Go template syntax (never rendered)."""
+
+
+def has_template_syntax(value: Any) -> bool:
+    """True if ``value`` contains ``{{``, ``}}`` or a backtick."""
+    return isinstance(value, str) and any(marker in value for marker in _TEMPLATE_MARKERS)
+
+
+def template_safe(field_name: str, value: Any) -> str:
+    """``value`` if it is a string without Go template syntax; raises
+    TemplateInjectionError (naming the field, never echoing the value)."""
+    if not isinstance(value, str) or has_template_syntax(value):
+        raise TemplateInjectionError(
+            f"{field_name} contains Go template syntax ('{{{{', '}}}}' or a backtick); "
+            "frpc.toml is not written"
+        )
+    return value
 
 
 def normalize_base_url(value: Any) -> Optional[str]:
@@ -314,20 +374,101 @@ def normalize_bool(value: Any) -> Optional[bool]:
 
 _PEM_BLOCK_RE = re.compile(r"-----BEGIN ([A-Z0-9 ]{1,40})-----([^-]*)-----END ([A-Z0-9 ]{1,40})-----")
 _BASE64_RE = re.compile(r"[A-Za-z0-9+/]+={0,2}")
+#: id-ce-basicConstraints (2.5.29.19), DER content octets.
+_OID_BASIC_CONSTRAINTS = bytes.fromhex("551d13")
 
 
-def normalize_ca_pem(value: Any) -> Optional[str]:
-    """One or more X.509 **CA** certificates in PEM form, normalised.
+def _der_tlv(der: bytes, pos: int, end: int) -> Tuple[int, int, int]:
+    """One DER TLV at ``pos``: ``(tag, value_start, value_end)``. Strict:
+    single-byte tags, definite minimal lengths, nothing beyond ``end``.
+    Raises ValueError."""
+    if pos + 2 > end:
+        raise ValueError("truncated DER")
+    tag, length = der[pos], der[pos + 1]
+    if tag & 0x1F == 0x1F:
+        raise ValueError("unsupported DER tag")
+    pos += 2
+    if length & 0x80:
+        count = length & 0x7F
+        if not 1 <= count <= 4 or pos + count > end:
+            raise ValueError("bad DER length")
+        if der[pos] == 0:
+            raise ValueError("non-minimal DER length")
+        length = int.from_bytes(der[pos:pos + count], "big")
+        if length < 0x80:
+            raise ValueError("non-minimal DER length")
+        pos += count
+    if pos + length > end:
+        raise ValueError("truncated DER")
+    return tag, pos, pos + length
 
-    Accepted: up to ``CA_MAX_CERTS`` ``CERTIFICATE`` blocks (at most
-    ``CA_PEM_MAX_CHARS`` characters, only whitespace around them) that
-    OpenSSL parses and recognises as CA certificates (``X509_check_ca``:
-    basicConstraints CA:TRUE, or a v1 self-signed root). Anything else -
-    other PEM block types such as private keys, junk between the blocks, a
-    leaf certificate, broken base64 or DER - yields None. The result is
-    re-encoded from the DER (64-column base64, ``\\n`` line ends, duplicates
-    removed), so the file written from it is canonical.
-    """
+
+def _der_is_ca_v3(der: bytes) -> bool:
+    """True if ``der`` is exactly one X.509 v3 certificate (no trailing
+    bytes) whose basicConstraints extension says ``cA: TRUE``. False for v1
+    certificates and certificates without that extension (or ``cA: FALSE``);
+    ValueError for malformed DER."""
+    tag, start, end = _der_tlv(der, 0, len(der))
+    if tag != 0x30 or end != len(der):
+        raise ValueError("not a single DER certificate (trailing data?)")
+    tag, pos, tbs_end = _der_tlv(der, start, end)  # tbsCertificate
+    if tag != 0x30:
+        raise ValueError("no tbsCertificate")
+    tag, value_start, value_end = _der_tlv(der, pos, tbs_end)
+    if tag != 0xA0:  # [0] version absent: v1, no extensions
+        return False
+    tag, int_start, int_end = _der_tlv(der, value_start, value_end)
+    if tag != 0x02 or int_end != value_end or der[int_start:int_end] != b"\x02":
+        return False  # not v3
+    pos = value_end
+    for _ in range(6):  # serialNumber, signature, issuer, validity, subject, subjectPublicKeyInfo
+        pos = _der_tlv(der, pos, tbs_end)[2]
+    while pos < tbs_end:
+        tag, value_start, pos = _der_tlv(der, pos, tbs_end)
+        if tag != 0xA3:  # [1] issuerUniqueID / [2] subjectUniqueID
+            continue
+        tag, ext, ext_end = _der_tlv(der, value_start, pos)  # SEQUENCE OF Extension
+        if tag != 0x30 or ext_end != pos:
+            raise ValueError("bad extensions")
+        while ext < ext_end:
+            tag, item, ext = _der_tlv(der, ext, ext_end)
+            if tag != 0x30:
+                raise ValueError("bad extension")
+            tag, oid_start, oid_end = _der_tlv(der, item, ext)
+            if tag != 0x06:
+                raise ValueError("bad extension id")
+            tag, value_start, value_end = _der_tlv(der, oid_end, ext)
+            if tag == 0x01:  # critical
+                tag, value_start, value_end = _der_tlv(der, value_end, ext)
+            if tag != 0x04:
+                raise ValueError("bad extension value")
+            if der[oid_start:oid_end] != _OID_BASIC_CONSTRAINTS:
+                continue
+            tag, bc_start, bc_end = _der_tlv(der, value_start, value_end)
+            if tag != 0x30 or bc_end != value_end:
+                raise ValueError("bad basicConstraints")
+            if bc_start == bc_end:
+                return False  # cA DEFAULT FALSE
+            tag, ca_start, ca_end = _der_tlv(der, bc_start, bc_end)
+            return tag == 0x01 and ca_end - ca_start == 1 and der[ca_start] == 0xFF
+    return False
+
+
+def _cert_time(value: Any) -> Optional[float]:
+    try:
+        return float(ssl.cert_time_to_seconds(value))
+    except (ValueError, TypeError):
+        return None
+
+
+def _day(stamp: Optional[float]) -> str:
+    return datetime.fromtimestamp(stamp, timezone.utc).strftime("%Y-%m-%d") if stamp is not None else ""
+
+
+def _parse_ca_bundle(value: Any) -> Optional[list]:
+    """``[(der, decoded)]`` for an acceptable CA bundle (see
+    ``normalize_ca_pem``), None otherwise. ``decoded`` is OpenSSL's view of
+    the certificate (subject, notBefore, notAfter, ...)."""
     if not isinstance(value, str) or len(value) > CA_PEM_MAX_CHARS:
         return None
     ders: list = []
@@ -349,46 +490,87 @@ def normalize_ca_pem(value: Any) -> Optional[str]:
         pos = match.end()
     if value[pos:].strip() or not ders or len(ders) > CA_MAX_CERTS:
         return None
-    pem = "".join(ssl.DER_cert_to_PEM_cert(der) for der in ders)
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    try:
-        ctx.load_verify_locations(cadata=pem)
-    except (ssl.SSLError, ValueError):
-        return None
-    stats = ctx.cert_store_stats()
-    if stats.get("x509") != len(ders) or stats.get("x509_ca") != len(ders):
-        return None
-    return pem
-
-
-def describe_ca(pem: Any) -> list:
-    """``[{"subject", "not_after", "expired"}]`` for a (valid) CA bundle, for
-    display; ``[]`` when it is unusable. Never raises."""
-    pem = normalize_ca_pem(pem)
-    if pem is None:
-        return []
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     out = []
-    try:
-        ctx.load_verify_locations(cadata=pem)
-        certs = ctx.get_ca_certs()
-    except (ssl.SSLError, ValueError):  # pragma: no cover - validated above
+    for der in ders:
+        try:
+            if not _der_is_ca_v3(der):
+                return None
+        except (ValueError, IndexError):
+            return None
+        # OpenSSL must parse it as exactly this certificate: loaded alone,
+        # one CA in the store, and its re-encoding is byte-identical.
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        try:
+            ctx.load_verify_locations(cadata=der)
+            decoded = ctx.get_ca_certs()
+            reencoded = ctx.get_ca_certs(binary_form=True)
+        except (ssl.SSLError, ValueError):
+            return None
+        stats = ctx.cert_store_stats()
+        if stats.get("x509") != 1 or stats.get("x509_ca") != 1 or reencoded != [der] or len(decoded) != 1:
+            return None
+        out.append((der, decoded[0]))
+    return out
+
+
+def normalize_ca_pem(value: Any) -> Optional[str]:
+    """One or more X.509 **CA** certificates in PEM form, normalised.
+
+    Accepted: up to ``CA_MAX_CERTS`` ``CERTIFICATE`` blocks (at most
+    ``CA_PEM_MAX_CHARS`` characters, only whitespace around them), each of
+    them exactly one DER-encoded X.509 v3 certificate (no trailing bytes;
+    OpenSSL's re-encoding must be byte-identical) with the basicConstraints
+    extension ``cA: TRUE``. Anything else - other PEM block types such as
+    private keys, junk between the blocks, a leaf or v1 certificate, broken
+    base64 or DER - yields None. The validity period is not judged here
+    (``describe_ca`` / ``ca_valid_now`` flag it). The result is re-encoded
+    from the DER (64-column base64, ``\n`` line ends, duplicates removed), so
+    the file written from it is canonical.
+    """
+    certs = _parse_ca_bundle(value)
+    if certs is None:
+        return None
+    return "".join(ssl.DER_cert_to_PEM_cert(der) for der, _ in certs)
+
+
+def describe_ca(pem: Any, now: Optional[float] = None) -> list:
+    """``[{"subject", "not_before", "not_after", "expired", "not_yet_valid"}]``
+    for a (valid) CA bundle, for display; ``[]`` when it is unusable. Never
+    raises."""
+    certs = _parse_ca_bundle(pem)
+    if certs is None:
         return []
-    now = time.time()
-    for cert in certs:
+    now = time.time() if now is None else now
+    out = []
+    for _, cert in certs:
         names = {key: value for rdn in cert.get("subject", ()) for key, value in rdn}
         subject = names.get("commonName") or names.get("organizationName") or "?"
-        try:
-            expires = ssl.cert_time_to_seconds(cert.get("notAfter", ""))
-        except (ValueError, TypeError):
-            expires = None
+        starts = _cert_time(cert.get("notBefore"))
+        expires = _cert_time(cert.get("notAfter"))
         out.append({
             "subject": sanitize_text(subject, 80),
-            "not_after": (datetime.fromtimestamp(expires, timezone.utc).strftime("%Y-%m-%d")
-                          if expires is not None else ""),
-            "expired": expires is not None and expires < now,
+            "not_before": _day(starts),
+            "not_after": _day(expires),
+            "expired": expires is None or expires < now,
+            "not_yet_valid": starts is None or starts > now,
         })
     return out
+
+
+def ca_valid_now(pem: Any, now: Optional[float] = None) -> bool:
+    """True if at least one certificate of the bundle is within its validity
+    period (a bundle frpc can verify against at all)."""
+    return any(not c["expired"] and not c["not_yet_valid"] for c in describe_ca(pem, now))
+
+
+def read_ca_file(paths: "Paths") -> Optional[str]:
+    """Content of ``/data/frps-ca.pem`` (the last CA frpc was given), or
+    None. Not validated here."""
+    try:
+        with paths.frps_ca.open(encoding="utf-8") as fh:
+            return fh.read(CA_PEM_MAX_CHARS + 1)
+    except (OSError, ValueError):
+        return None
 
 
 # A masked account e-mail as sent by the dashboard ("g***@linumiq.com"). Only
@@ -752,10 +934,14 @@ def apply_tunnel_response(
 
     ``server_ca_pem`` / ``server_name`` (v2.2) replace the stored values when
     they are present and valid, and are otherwise *kept*: a response without
-    a CA (server rollback) or with an invalid one never removes a pinned CA.
-    ``server_ca_note`` records why the stored CA was kept ("missing" /
-    "invalid") so the panel can warn. Returns ``(new_state, warnings)``;
-    raises TunnelResponseError.
+    a CA (server rollback) or with an invalid one never removes a pinned CA,
+    and a CA none of whose certificates is currently valid never replaces a
+    pinned one that is. ``server_ca_note`` records why the stored CA was kept
+    ("missing" / "invalid" / "expired") so the panel can warn. Any non-empty
+    ``server_ca_pem`` also sets ``server_ca_required``: from then on frpc is
+    only ever started with a verified connection (``TLS_BLOCKED`` while no
+    valid CA is known). Returns ``(new_state, warnings)``; raises
+    TunnelResponseError.
     """
     if not isinstance(body, Mapping):
         raise TunnelResponseError("Backend returned a malformed tunnel response.")
@@ -783,11 +969,13 @@ def apply_tunnel_response(
 
     new.pop("server_ca_note", None)
     raw_ca = body.get("server_ca_pem")
+    stored_ca = normalize_ca_pem(new.get("server_ca_pem")) if new.get("server_ca_pem") else None
     if _is_unset(raw_ca):
         if new.get("server_ca_pem"):
             new["server_ca_note"] = "missing"
             warnings.append("The server sent no server_ca_pem; the last known frps CA stays pinned.")
     else:
+        new["server_ca_required"] = True
         ca = normalize_ca_pem(raw_ca)
         if ca is None:
             new["server_ca_note"] = "invalid"
@@ -795,6 +983,10 @@ def apply_tunnel_response(
                 "Ignored an invalid server-provided server_ca_pem"
                 + ("; the last known frps CA stays pinned." if new.get("server_ca_pem") else ".")
             )
+        elif stored_ca and ca != stored_ca and not ca_valid_now(ca) and ca_valid_now(stored_ca):
+            new["server_ca_note"] = "expired"
+            warnings.append("Ignored a server-provided server_ca_pem that is expired or not yet valid; "
+                            "the last known frps CA stays pinned.")
         else:
             new["server_ca_pem"] = ca
     raw_name = body.get("server_name")
@@ -924,22 +1116,32 @@ class Settings:
     #: Name the frps certificate must be valid for (server-provided
     #: server_name, else the effective server_addr).
     server_name: str = ""
-    #: Validated CA bundle from the state (None: none known).
+    #: Validated CA bundle to pin (None: none usable).
     ca_pem: Optional[str] = field(default=None, repr=False)
+    #: "" or CA_FALLBACK / CA_INVALID / CA_SERVER_INVALID.
+    ca_problem: str = ""
 
     @property
     def tls_mode(self) -> str:
-        """TLS_VERIFIED, TLS_UNVERIFIED (no CA known) or TLS_DISABLED."""
+        """TLS_VERIFIED, TLS_UNVERIFIED (no CA known), TLS_DISABLED or
+        TLS_BLOCKED (a CA is expected but none is valid: frpc must not run)."""
         if not self.verify_server:
             return TLS_DISABLED
-        return TLS_VERIFIED if self.ca_pem else TLS_UNVERIFIED
+        if self.ca_pem:
+            return TLS_VERIFIED
+        if self.ca_problem in (CA_INVALID, CA_SERVER_INVALID):
+            return TLS_BLOCKED
+        return TLS_UNVERIFIED
 
     def describe_tls(self) -> str:
         mode = self.tls_mode
         if mode == TLS_VERIFIED:
-            return f"tls=verified (CA from server, serverName={self.server_name})"
+            source = "last valid CA, /data/frps-ca.pem" if self.ca_problem == CA_FALLBACK else "CA from server"
+            return f"tls=verified ({source}, serverName={self.server_name})"
         if mode == TLS_DISABLED:
             return "tls=on, frps certificate NOT verified (verify_server=false)"
+        if mode == TLS_BLOCKED:
+            return "tls=BLOCKED (no valid frps CA although the server requires verification; frpc is not started)"
         return "tls=on, frps certificate NOT verified (the server provided no CA)"
 
     def describe(self) -> str:
@@ -953,8 +1155,15 @@ class Settings:
         )
 
 
-def effective_settings(options: Mapping[str, Any], state: Mapping[str, Any]) -> Settings:
-    """Apply option > server > default precedence (see module docstring)."""
+def effective_settings(
+    options: Mapping[str, Any], state: Mapping[str, Any], fallback_ca_pem: Optional[str] = None
+) -> Settings:
+    """Apply option > server > default precedence (see module docstring).
+
+    ``fallback_ca_pem`` is the CA frpc was last given (``read_ca_file``): it
+    is pinned instead when the state's CA no longer passes validation, so
+    such a state never downgrades frpc to an unverified connection.
+    """
     sources: Dict[str, str] = {}
 
     def pick(key: str, default: Any) -> Any:
@@ -977,8 +1186,16 @@ def effective_settings(options: Mapping[str, Any], state: Mapping[str, Any]) -> 
         sources["domain_base"] = "server_addr"
 
     verify_server = pick("verify_server", True)
-    # Re-validated on every use: the state file may be old or tampered with.
-    ca_pem = normalize_ca_pem(state.get("server_ca_pem")) if state.get("server_ca_pem") else None
+    # Re-validated on every use: the state file may be old or tampered with,
+    # or written by a version with a laxer validator. Fail closed.
+    raw_ca = state.get("server_ca_pem")
+    ca_pem = normalize_ca_pem(raw_ca) if raw_ca else None
+    ca_problem = ""
+    if raw_ca and ca_pem is None:
+        ca_pem = normalize_ca_pem(fallback_ca_pem) if fallback_ca_pem else None
+        ca_problem = CA_FALLBACK if ca_pem else CA_INVALID
+    elif not raw_ca and state.get("server_ca_required") is True:
+        ca_problem = CA_SERVER_INVALID
     server_name = normalize_host(state.get("server_name")) or server_addr
 
     return Settings(
@@ -994,6 +1211,7 @@ def effective_settings(options: Mapping[str, Any], state: Mapping[str, Any]) -> 
         verify_server=verify_server,
         server_name=server_name,
         ca_pem=ca_pem,
+        ca_problem=ca_problem,
     )
 
 
@@ -1028,29 +1246,37 @@ def render_frpc_toml(
     """Render the frpc v0.65 TOML configuration.
 
     ``ca_file`` (the path ``settings.ca_pem`` was written to) is required
-    when ``settings.tls_mode`` is TLS_VERIFIED.
+    when ``settings.tls_mode`` is TLS_VERIFIED; TLS_BLOCKED is refused.
+
+    frpc expands Go template actions (``{{ .Envs.NAME }}``) anywhere in this
+    file before parsing it, so every string field is checked once more with
+    ``template_safe`` (independently of the validators that produced it), and
+    so is the result. Raises ValueError / TemplateInjectionError.
     """
     sub = normalize_subdomain(subdomain)
     tok = normalize_token(token)
     if sub is None or tok is None:
         raise ValueError("invalid subdomain or token")
-    if settings.tls_mode == TLS_VERIFIED:
+    mode = settings.tls_mode
+    if mode == TLS_BLOCKED:
+        raise ValueError("no valid frps CA although the server requires verification")
+    if mode == TLS_VERIFIED:
         if not ca_file or normalize_host(settings.server_name) is None:
             raise ValueError("server verification needs a CA file and a valid server name")
         tls_lines = [
             "# Verify the frps certificate: it must chain to the CA provided by the",
             "# LinumIQ server (pinned in the state file) and be valid for serverName.",
-            f"transport.tls.trustedCaFile = {toml_str(ca_file)}",
-            f"transport.tls.serverName = {toml_str(settings.server_name)}",
+            f"transport.tls.trustedCaFile = {toml_str(template_safe('trustedCaFile', ca_file))}",
+            f"transport.tls.serverName = {toml_str(template_safe('server_name', settings.server_name))}",
         ]
-    elif settings.tls_mode == TLS_DISABLED:
+    elif mode == TLS_DISABLED:
         tls_lines = ["# The frps certificate is NOT verified (add-on option verify_server: false)."]
     else:
         tls_lines = ["# The frps certificate is NOT verified (the server provided no CA)."]
     lines = [
         "# Generated by the FRP Tunnel add-on from /data/frp-state.json and the",
         "# add-on options. Re-rendered on every frpc (re)start: do not edit.",
-        f"serverAddr = {toml_str(settings.server_addr)}",
+        f"serverAddr = {toml_str(template_safe('server_addr', settings.server_addr))}",
         f"serverPort = {int(settings.server_port)}",
         "loginFailExit = false",
         "",
@@ -1060,27 +1286,54 @@ def render_frpc_toml(
         "",
         "# Per-tunnel credential, validated by the frps auth plugin (metas.token).",
         "[metadatas]",
-        f"token = {toml_str(tok)}",
+        f"token = {toml_str(template_safe('token', tok))}",
         "",
         "[log]",
         'to = "console"',
-        f"level = {toml_str(settings.log_level)}",
+        f"level = {toml_str(template_safe('log_level', settings.log_level))}",
         "",
         "[[proxies]]",
-        f"name = {toml_str(sub)}",
+        f"name = {toml_str(template_safe('subdomain', sub))}",
         'type = "http"',
-        f"customDomains = [{toml_str(public_hostname(settings, sub))}]",
-        f"localIP = {toml_str(settings.local_host)}",
+        f"customDomains = [{toml_str(template_safe('domain_base', public_hostname(settings, sub)))}]",
+        f"localIP = {toml_str(template_safe('local_host', settings.local_host))}",
         f"localPort = {int(settings.local_port)}",
         "",
     ]
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    template_safe("frpc.toml", text)  # also across field boundaries
+    return text
 
 
 class RenderResult:
     RENDERED = "rendered"
     UNCHANGED = "unchanged"
     NOT_PAIRED = "not_paired"
+
+
+class CAUnusableError(ValueError):
+    """The server requires a verified frps connection but no valid CA is
+    known: frpc must not be started (fail closed)."""
+
+
+def config_fingerprint(paths: Paths) -> Optional[str]:
+    """SHA-256 over ``frpc.toml`` and the pinned CA as frpc reads them at
+    start; None without ``frpc.toml``. The frpc log watcher records it with
+    every login result, so the panel can tell whether a login was made with
+    the configuration that is current now."""
+    try:
+        toml = paths.frpc_toml.read_bytes()
+    except OSError:
+        return None
+    try:
+        ca = paths.frps_ca.read_bytes()
+    except OSError:
+        ca = b""
+    digest = hashlib.sha256()
+    digest.update(len(toml).to_bytes(8, "big"))
+    digest.update(toml)
+    digest.update(ca)
+    return digest.hexdigest()
 
 
 def ensure_searchable(directory: Path, gid: Optional[int]) -> bool:
@@ -1123,6 +1376,10 @@ def render_from_disk(
     Without a valid pairing (state file missing, corrupt or incomplete) a
     leftover frpc.toml and frps-ca.pem are deleted, so the old token can
     never be used. frps-ca.pem exists only while frpc.toml references it.
+    When the state's CA fails validation, the existing frps-ca.pem is pinned
+    instead if it is valid; with no valid CA at all (``TLS_BLOCKED``) both
+    files are deleted and CAUnusableError is raised - frpc is never started
+    unverified once the server has asked for verification.
     Returns RENDERED when either file changed (frpc must restart). The caller
     should hold ``state_lock``.
     """
@@ -1134,7 +1391,17 @@ def render_from_disk(
         remove_file(paths.frpc_toml)
         remove_file(paths.frps_ca)
         return RenderResult.NOT_PAIRED, None
-    settings = effective_settings(options, state)
+    settings = effective_settings(options, state, read_ca_file(paths))
+    if settings.tls_mode == TLS_BLOCKED:
+        remove_file(paths.frpc_toml)
+        remove_file(paths.frps_ca)
+        raise CAUnusableError(
+            "no valid certificate authority for the tunnel server is known although the LinumIQ "
+            "server requires a verified connection"
+            + (" (the pinned CA failed validation)" if settings.ca_problem == CA_INVALID
+               else " (the server sent an invalid CA)")
+            + "; frpc is not started"
+        )
     mode, gid = frpc_file_access()
     ensure_searchable(paths.data_dir, gid)
     changed = False
@@ -1167,6 +1434,9 @@ def _cli(argv: list) -> int:
     try:
         with state_lock(paths, timeout=CLI_LOCK_TIMEOUT):
             result, settings = render_from_disk(paths)
+    except CAUnusableError as exc:
+        LOG.error("%s. Click 'Refresh tunnel config' in the panel.", sanitize_text(exc))
+        return EXIT_CA_BLOCKED
     except (OSError, ValueError) as exc:
         # Messages never contain secrets (paths / validation errors only).
         LOG.error("Cannot render frpc.toml: %s", sanitize_text(exc))
@@ -1175,6 +1445,9 @@ def _cli(argv: list) -> int:
         return EXIT_NOT_PAIRED
     assert settings is not None
     LOG.info("frpc.toml %s: %s", result, settings.describe())
+    if settings.ca_problem == CA_FALLBACK:
+        LOG.warning("The frps CA in the state file failed validation; frpc keeps verifying against "
+                    "the last valid one (%s).", paths.frps_ca)
     if settings.tls_mode != TLS_VERIFIED:
         LOG.warning("The frps server certificate is not verified (%s); see the add-on documentation.",
                     "verify_server is false" if settings.tls_mode == TLS_DISABLED

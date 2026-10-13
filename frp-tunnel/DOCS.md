@@ -82,9 +82,25 @@ options unset.)
 time `frpc` (re)starts, so a changed server value or option takes effect on
 the next restart. **Refresh tunnel config** in the panel re-fetches the
 tunnel settings from your account (and restarts `frpc` only when something
-changed). The panel also does this once in the background whenever the add-on
-starts. Use it after renaming your subdomain in the LinumIQ dashboard: the
+changed). Use it after renaming your subdomain in the LinumIQ dashboard: the
 rename rotates the tunnel token.
+
+The panel also refreshes **automatically**, exactly like the button:
+
+- once whenever the add-on starts;
+- every 12-24 hours (a random time in that window, so installations do not
+  all call the server at once; after a failed attempt - server unreachable -
+  again after one hour). This also keeps your device marked as in use: the
+  LinumIQ server expires devices that have not been seen for 180 days;
+- after 3 consecutive failed logins of `frpc` with the current configuration
+  that reached the tunnel server (certificate verification or authentication
+  failed - typically because the server rotated its certificate authority or
+  the tunnel token). Network errors (server unreachable) do not count. This
+  trigger fires at most every 10 minutes and backs off to every 6 hours while
+  the failures continue.
+
+The panel's status card shows the time and result of the last automatic
+refresh ("Config refresh").
 
 ### Transport encryption and server verification (TLS)
 
@@ -104,10 +120,26 @@ talks to an frps whose certificate chains to that CA and is valid for that
 name - an attacker on the network path can no longer impersonate the server,
 read the tunnel token or the proxied Home Assistant traffic.
 
+- **Only real CA certificates are pinned.** Each certificate must be exactly
+  one DER-encoded X.509 v3 certificate (no trailing data) with the
+  basicConstraints extension `CA:TRUE`; leaf certificates, X.509 v1 roots and
+  certificates without basicConstraints are rejected, like private keys or
+  anything else in the PEM. Certificates that are expired or not yet valid
+  are flagged in the panel.
 - **The CA is never silently dropped.** If a later response does not contain
-  a CA (for example after a server rollback) or contains an invalid one, the
+  a CA (for example after a server rollback), contains an invalid one, or one
+  that is expired / not yet valid while the pinned one is still valid, the
   add-on keeps the last known CA and the panel shows a yellow warning. A new
   valid CA from the server (rotation) replaces the old one and restarts frpc.
+- **Verification fails closed.** The pinned CA is validated again every time
+  `frpc.toml` is rendered. If it no longer passes (a damaged or tampered state
+  file), frpc keeps verifying against the last valid CA it was given
+  (`/data/frps-ca.pem`, yellow banner). If there is no valid CA at all - also
+  when the server sent a CA but never a valid one - **frpc is not started**:
+  the log says `frpc is NOT started: no valid certificate authority for the
+  tunnel server` and the panel shows a red banner. The add-on never falls back
+  to an unverified connection once the server has asked for verification;
+  **Refresh tunnel config** fetches the current CA.
 - **Older servers** (before contract v2.2) send no CA. The connection is then
   encrypted but not verified, and the panel says so in a yellow banner; the
   next **Refresh tunnel config** after the server update pins the CA.
@@ -117,10 +149,23 @@ read the tunnel token or the proxied Home Assistant traffic.
 - An explicit `server_addr` override does not change the certificate name:
   frpc still expects the server-provided `server_name`.
 
-The panel's "Tunnel server" row shows the state: *TLS, certificate verified for
-`<server_name>`; CA `<subject>` until `<date>`* or *TLS, certificate not
-verified*. Your browser's connection to `https://<subdomain>.linumiq.net`
-always uses a publicly trusted certificate.
+The panel's "Tunnel server" row shows the state:
+
+- *TLS, certificate verified for `<server_name>`; CA `<subject>` until
+  `<date>`; frpc logged in `<time>`* - only after frpc has actually logged in
+  to the tunnel server with exactly the pinned CA and the current
+  configuration (frpc's log output is watched for `login to server success`);
+- *TLS, CA pinned for `<server_name>` - waiting for frpc to log in with it*;
+- *TLS, login with the CA pinned for `<server_name>` failed* (plus a red
+  banner with frpc's error, e.g. `x509: certificate signed by unknown
+  authority`);
+- *frpc not started: no valid CA for the tunnel server* (fail closed, see
+  above);
+- *TLS, certificate not verified* (no CA from the server, or
+  `verify_server: false`).
+
+Your browser's connection to `https://<subdomain>.linumiq.net` always uses a
+publicly trusted certificate.
 
 ## Generated `frpc.toml`
 
@@ -160,6 +205,14 @@ frpc runs as the unprivileged system user `frpc`: `frpc.toml` and
 `frps-ca.pem` are `root:frpc` mode 640 (frpc can read, not change them); the
 state file with the device token is `root` mode 600 and unreadable for frpc.
 Tokens are never written to the log and never returned by the panel.
+
+frpc processes this file as a Go template (`{{ ... }}` actions, with access to
+frpc's environment variables) before it parses it. The add-on therefore never
+writes `{{`, `}}` or a backtick into it: every value is restricted to host
+name / token characters, and the renderer checks every field and the whole
+file once more before writing it. frpc is also started with an empty
+environment (`PATH`, `HOME` and `TZ` only), so it never sees the add-on's
+Supervisor API token.
 
 ## Configuration Options
 
@@ -265,11 +318,15 @@ retire it).
 ## Security notes
 
 - **Ingress only.** The panel answers only the Supervisor's ingress proxy
-  (172.30.32.2) and loopback, decided from the TCP peer address - never from
-  `Host`, `X-Forwarded-*` or the request path (2.1.x exempted `/_health`,
-  which a crafted `Host` header could abuse to reach every endpoint from
-  another container: Starlette GHSA-86qp-5c8j-p5mr). Static files and unknown
-  paths are behind the same check.
+  (172.30.32.2), decided from the TCP peer address - never from `Host`,
+  `X-Forwarded-*` or the request path (2.1.x exempted `/_health`, which a
+  crafted `Host` header could abuse to reach every endpoint from another
+  container: Starlette GHSA-86qp-5c8j-p5mr). Static files and unknown paths
+  are behind the same check. Since 2.2.0 not even loopback is accepted, so no
+  process inside the add-on container - in particular the unprivileged frpc
+  user - can drive the panel through `127.0.0.1:8099`. (`ALLOWED_INGRESS_IPS`
+  exists only for running the image outside Supervisor, e.g. the E2E harness;
+  the container environment cannot be set under Supervisor.)
 - **CSRF.** Every state-changing request (pairing, refresh, subdomain change,
   unpair) must be same-origin: `Sec-Fetch-Site: same-origin`, or - for
   browsers without Fetch Metadata - an `Origin` that names the requested host.
@@ -283,10 +340,17 @@ retire it).
   (your `app_base`), signed in to your own account, and only if you started
   that pairing yourself; never approve a code someone else sent you. The
   panel shows the masked e-mail of the account the device is paired with.
-- **Least privilege.** frpc runs as an unprivileged user; the AppArmor
-  profile (`apparmor.txt`) allows only the files, programs, capabilities
-  (`chown`, `fowner`, `kill`, `setgid`, `setuid`) and signals the add-on
-  needs; no host folders are mapped.
+- **Least privilege.** frpc runs as an unprivileged user with a scrubbed
+  environment; the AppArmor profile (`apparmor.txt`) allows only the files,
+  programs, capabilities (`chown`, `fowner`, `kill`, `setgid`, `setuid`) and
+  signals the add-on needs; no host folders are mapped.
+- **No template injection into frpc.** frpc expands Go template actions such
+  as `{{ .Envs.NAME }}` anywhere in its configuration file. The tunnel token
+  must consist of `A-Z a-z 0-9 . _ ~ -` (8-256 characters), host names and
+  domains of DNS characters, and the renderer refuses `{{`, `}}` and
+  backticks in every field and in the finished file - so a malicious or
+  compromised backend cannot make frpc send environment variables to frps.
+  frpc's environment contains nothing secret anyway.
 
 - **Untrusted pairing data.** Everything the backend returns from
   `POST /api/device/code` is validated before it is stored or shown in the
@@ -306,6 +370,7 @@ retire it).
   removed, max. 200-300 characters) with known secrets redacted. The panel
   never follows HTTP redirects, so the device token is only ever sent to
   `app_base`; a malformed device token is refused instead of being sent.
+  Backend responses larger than 256 KiB are rejected.
 - **frpc only runs from a valid pairing.** The frpc service starts frpc only
   when the renderer has just read a valid pairing from `/data/frp-state.json`
   (exit 0). Without one (no, corrupt or incomplete state) a leftover
@@ -355,9 +420,24 @@ retire it).
   this error on a production installation without knowing why it happened -
   it is exactly what an attacker in your network would cause.
 - **Yellow "Tunnel server not fully verified" banner**: the server provided no
-  CA (older server), verification is switched off (`verify_server: false`), or
-  the pinned CA has expired - the banner says which. Click **Refresh tunnel
-  config** once the server provides a (new) CA.
+  CA (older server), verification is switched off (`verify_server: false`),
+  the server sent an unusable CA (the last valid one stays pinned), or frpc
+  cannot reach the tunnel server - the banner says which. Click **Refresh
+  tunnel config** once the server provides a (new) CA.
+- **Red "Tunnel server verification failed" banner**: either frpc could not
+  log in with the pinned CA (the banner shows frpc's error; the add-on
+  re-fetches the configuration automatically after repeated failures - or
+  click **Refresh tunnel config**), the pinned CA has expired, or **frpc is
+  not started** because no valid CA is known although the server requires
+  verification (log: `frpc is NOT started: no valid certificate authority for
+  the tunnel server`). Click **Refresh tunnel config**; if the server still
+  sends no valid CA, contact LinumIQ support. `verify_server: false` would
+  start frpc without verification - only do that if you know why the CA is
+  missing.
+- **"Tunnel server: waiting for frpc to log in with it"**: the CA is pinned,
+  but frpc has not logged in with the current configuration yet (just
+  started, or the tunnel server is unreachable). The row turns into
+  "certificate verified" with the first successful login.
 - **"Paired with" shows an e-mail address that is not yours**: the device was
   approved by another account (for example after you approved a code someone
   sent you). Click **Unpair** immediately and pair again.

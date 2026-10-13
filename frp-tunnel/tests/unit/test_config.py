@@ -9,8 +9,11 @@ them inside the built image against /usr/lib/frp-mgr).
 """
 from __future__ import annotations
 
+import base64
+import dataclasses
 import json
 import os
+import ssl
 import stat
 import sys
 import tempfile
@@ -25,10 +28,30 @@ FRP_MGR = Path(
 sys.path.insert(0, str(FRP_MGR))
 
 import config as cfg  # noqa: E402
-from tls_fixtures import CA1, CA2, EXPIRED_CA, LEAF  # noqa: E402
+from tls_fixtures import CA1, CA2, EXPIRED_CA, FUTURE_CA, LEAF, NO_BC_CA, V1_ROOT  # noqa: E402
 
 TOKEN = "a" * 64
 OTHER_TOKEN = "b" * 64
+
+#: Go text/template payloads (frpc renders frpc.toml as a template with the
+#: process environment as .Envs) - none may ever reach frpc.toml.
+TEMPLATE_PAYLOADS = (
+    "{{.Envs.SUPERVISOR_TOKEN}}",
+    "{{ .Envs.SUPERVISOR_TOKEN }}",
+    "x{{.Envs.SUPERVISOR_TOKEN}}x",
+    "{{- .Envs.HOME -}}",
+    "{{",
+    "}}",
+    "a`b`c",
+)
+
+
+def pem_of(der: bytes) -> str:
+    return ssl.DER_cert_to_PEM_cert(der)
+
+
+def der_of(pem: str) -> bytes:
+    return base64.b64decode("".join(pem.strip().splitlines()[1:-1]))
 
 
 class ValidationTests(unittest.TestCase):
@@ -66,8 +89,19 @@ class ValidationTests(unittest.TestCase):
         for bad in ("-x", "x-", "a.b", "a_b", "", "a" * 64, None):
             self.assertIsNone(cfg.normalize_subdomain(bad), repr(bad))
         self.assertEqual(cfg.normalize_token(TOKEN), TOKEN)
-        for bad in ("short", 'abc"defghij', "abcdefgh\\ij", "abcd efghij", "abcdefghij\n", None, 12345678):
+        for ok in ("A-b_c.d~e", "0123456789abcdef" * 16, "x" * 8):
+            self.assertEqual(cfg.normalize_token(ok), ok)
+        for bad in ("short", 'abc"defghij', "abcdefgh\\ij", "abcd efghij", "abcdefghij\n", None, 12345678,
+                    "x" * 257, "abc{def}ghi", "abc+def/gh=", "abcdefgh$1", *TEMPLATE_PAYLOADS):
             self.assertIsNone(cfg.normalize_token(bad), repr(bad))
+
+    def test_device_token(self):
+        # Never written into frpc.toml: only what could break an HTTP header
+        # is refused (unchanged from 2.1).
+        for ok in ("DEVICE-TOKEN-SECRET-0123456789", "a+b/c=d{e}f", "x" * 1024):
+            self.assertEqual(cfg.normalize_device_token(ok), ok)
+        for bad in ("short", "bad token", 'a"bcdefghij', "abcdefgh\\ij", "abcdefghij\r\nX: y", "x" * 1025, None):
+            self.assertIsNone(cfg.normalize_device_token(bad), repr(bad))
 
     def test_base_url(self):
         self.assertEqual(cfg.normalize_base_url("https://app-dev.linumiq.net/"), "https://app-dev.linumiq.net")
@@ -94,6 +128,7 @@ class CaPemTests(unittest.TestCase):
         self.assertEqual(cfg.normalize_ca_pem(messy), CA1 + CA2)
         self.assertEqual(cfg.normalize_ca_pem(CA1 + CA1), CA1)  # duplicates dropped
         self.assertEqual(cfg.normalize_ca_pem(EXPIRED_CA), EXPIRED_CA)  # validity is not judged here
+        self.assertEqual(cfg.normalize_ca_pem(FUTURE_CA), FUTURE_CA)
 
     def test_rejects_everything_else(self):
         body = "".join(CA1.splitlines()[1:-1])
@@ -101,6 +136,9 @@ class CaPemTests(unittest.TestCase):
         for bad in (
             LEAF,                                   # not a CA
             CA1 + LEAF,                             # one non-CA spoils the bundle
+            V1_ROOT,                                # X.509 v1: no basicConstraints
+            NO_BC_CA,                               # keyCertSign, but no basicConstraints
+            CA1 + V1_ROOT,
             CA1.replace("CERTIFICATE", "PRIVATE KEY"),
             CA1 + "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n",
             CA1.replace("END CERTIFICATE", "END X509 CRL"),
@@ -116,6 +154,45 @@ class CaPemTests(unittest.TestCase):
         ):
             self.assertIsNone(cfg.normalize_ca_pem(bad), repr(bad)[:80])
 
+    def test_rejects_der_with_trailing_or_non_canonical_bytes(self):
+        der = der_of(CA1)
+        self.assertEqual(cfg.normalize_ca_pem(pem_of(der)), CA1)
+        for bad_der in (
+            der + b"\x00",                          # trailing byte
+            der + der,                              # two certificates in one block
+            der + b"\x05\x00",                      # trailing (valid) TLV
+            b"\x30\x83\x00" + der[2:],              # non-minimal outer length (BER)
+            der[:-1],                               # truncated
+            der[:4] + b"\xff" + der[5:],            # garbled tbsCertificate
+        ):
+            with self.subTest(prefix=bad_der[:5].hex(), size=len(bad_der)):
+                self.assertIsNone(cfg.normalize_ca_pem(pem_of(bad_der)))
+
+    def test_basic_constraints_parser(self):
+        self.assertTrue(cfg._der_is_ca_v3(der_of(CA1)))
+        self.assertTrue(cfg._der_is_ca_v3(der_of(EXPIRED_CA)))
+        self.assertFalse(cfg._der_is_ca_v3(der_of(LEAF)))      # CA:FALSE
+        self.assertFalse(cfg._der_is_ca_v3(der_of(V1_ROOT)))   # no extensions
+        self.assertFalse(cfg._der_is_ca_v3(der_of(NO_BC_CA)))  # no basicConstraints
+        for bad in (b"", b"\x30", b"\x30\x00", b"\x02\x01\x00", der_of(CA1) + b"\x00"):
+            with self.assertRaises(ValueError, msg=bad.hex()):
+                cfg._der_is_ca_v3(bad)
+
+    def test_validity_is_flagged(self):
+        now = 1_800_000_000  # 2027
+        info = {i["subject"]: i for i in cfg.describe_ca(CA1 + EXPIRED_CA + FUTURE_CA, now=now)}
+        self.assertEqual((info["Test frps CA 1"]["expired"], info["Test frps CA 1"]["not_yet_valid"]),
+                         (False, False))
+        self.assertEqual(info["Test frps CA 1"]["not_before"], "2026-01-01")
+        self.assertTrue(info["Expired test CA"]["expired"])
+        self.assertTrue(info["Future test CA"]["not_yet_valid"])
+        self.assertEqual(info["Future test CA"]["not_before"], "2120-01-01")
+        self.assertTrue(cfg.ca_valid_now(CA1, now))
+        self.assertTrue(cfg.ca_valid_now(EXPIRED_CA + CA1, now))  # one usable CA is enough
+        self.assertFalse(cfg.ca_valid_now(EXPIRED_CA, now))
+        self.assertFalse(cfg.ca_valid_now(FUTURE_CA, now))
+        self.assertFalse(cfg.ca_valid_now("garbage", now))
+
     def test_bundle_size_limit(self):
         with mock.patch.object(cfg, "CA_MAX_CERTS", 1):
             self.assertIsNone(cfg.normalize_ca_pem(CA1 + CA2))
@@ -129,6 +206,7 @@ class CaPemTests(unittest.TestCase):
         self.assertFalse(by_subject["Test frps CA 1"]["expired"])
         self.assertTrue(by_subject["Expired test CA"]["expired"])
         self.assertEqual(cfg.describe_ca(LEAF), [])
+        self.assertEqual(cfg.describe_ca(V1_ROOT), [])
         self.assertEqual(cfg.describe_ca(None), [])
 
 
@@ -431,10 +509,45 @@ class TunnelResponseTests(unittest.TestCase):
         self.assertEqual(state["server_ca_note"], "invalid")
         self.assertEqual(len(warnings), 2)  # CA + server_name
         self.assertNotIn("server_name", state)
-        # Without a previous CA there is nothing to keep: unverified, flagged.
+        # Without a previous CA there is nothing to keep - but the server
+        # asked for verification: fail closed, never unverified.
         state, _ = cfg.apply_tunnel_response({"device_token": "dt"}, body)
         self.assertNotIn("server_ca_pem", state)
         self.assertEqual(state["server_ca_note"], "invalid")
+        self.assertIs(state["server_ca_required"], True)
+        self.assertEqual(cfg.effective_settings({}, state).tls_mode, cfg.TLS_BLOCKED)
+        # A later valid CA resolves it.
+        state, _ = cfg.apply_tunnel_response(state, dict(body, server_ca_pem=CA1, server_name="frps.x.net"))
+        self.assertEqual(cfg.effective_settings({}, state).tls_mode, cfg.TLS_VERIFIED)
+
+    def test_server_ca_required_is_sticky(self):
+        state, _ = cfg.apply_tunnel_response({"device_token": "dt"},
+                                             {"subdomain": "home", "token": TOKEN, "server_ca_pem": CA1})
+        self.assertIs(state["server_ca_required"], True)
+        state, _ = cfg.apply_tunnel_response(state, {"subdomain": "home", "token": TOKEN})
+        self.assertIs(state["server_ca_required"], True)
+        self.assertEqual(state["server_ca_pem"], CA1)
+        # A pre-2.2 server never sets it: unverified stays possible there.
+        state, _ = cfg.apply_tunnel_response({"device_token": "dt"}, {"subdomain": "home", "token": TOKEN})
+        self.assertNotIn("server_ca_required", state)
+
+    def test_expired_ca_never_replaces_a_valid_pinned_one(self):
+        pinned = {"device_token": "dt", "server_ca_pem": CA1}
+        for stale in (EXPIRED_CA, FUTURE_CA):
+            with self.subTest(stale=stale[30:60]):
+                state, warnings = cfg.apply_tunnel_response(
+                    pinned, {"subdomain": "home", "token": TOKEN, "server_ca_pem": stale})
+                self.assertEqual(state["server_ca_pem"], CA1)
+                self.assertEqual(state["server_ca_note"], "expired")
+                self.assertTrue(any("expired or not yet valid" in w for w in warnings), warnings)
+        # A bundle with one current CA replaces it (rotation with overlap).
+        state, warnings = cfg.apply_tunnel_response(
+            pinned, {"subdomain": "home", "token": TOKEN, "server_ca_pem": EXPIRED_CA + CA2})
+        self.assertEqual((state["server_ca_pem"], warnings), (EXPIRED_CA + CA2, []))
+        # Nothing pinned: taken (verification stays on; frpc's login fails).
+        state, _ = cfg.apply_tunnel_response(
+            {"device_token": "dt"}, {"subdomain": "home", "token": TOKEN, "server_ca_pem": EXPIRED_CA})
+        self.assertEqual(state["server_ca_pem"], EXPIRED_CA)
 
     def test_ca_rotation_and_recovery_clear_the_note(self):
         state = {"device_token": "dt", "server_ca_pem": CA1, "server_ca_note": "missing"}
@@ -524,9 +637,28 @@ class PrecedenceTests(unittest.TestCase):
         self.assertIn("verify_server=false", s.describe())
         s = cfg.effective_settings(cfg.parse_options({"verify_server": True}), pinned)
         self.assertEqual(s.tls_mode, cfg.TLS_VERIFIED)
-        # A tampered CA / name in the state is never pinned.
-        s = cfg.effective_settings({}, dict(pinned, server_ca_pem=LEAF, server_name="bad name"))
-        self.assertEqual((s.tls_mode, s.server_name), (cfg.TLS_UNVERIFIED, "srv.example.net"))
+        # A tampered CA / name in the state is never pinned - and never
+        # downgrades to an unverified connection (fail closed) ...
+        tampered = dict(pinned, server_ca_pem=LEAF, server_name="bad name")
+        s = cfg.effective_settings({}, tampered)
+        self.assertEqual((s.tls_mode, s.server_name, s.ca_problem),
+                         (cfg.TLS_BLOCKED, "srv.example.net", cfg.CA_INVALID))
+        self.assertIn("tls=BLOCKED", s.describe())
+        # ... unless the last valid CA frpc was given (frps-ca.pem) is used.
+        s = cfg.effective_settings({}, tampered, fallback_ca_pem=CA2)
+        self.assertEqual((s.tls_mode, s.ca_pem, s.ca_problem), (cfg.TLS_VERIFIED, CA2, cfg.CA_FALLBACK))
+        self.assertIn("last valid CA", s.describe())
+        s = cfg.effective_settings({}, tampered, fallback_ca_pem=LEAF)  # an invalid file does not count
+        self.assertEqual(s.tls_mode, cfg.TLS_BLOCKED)
+        # A CA that passed the laxer 2.2.0-pre validation but not this one.
+        self.assertEqual(cfg.effective_settings({}, dict(pinned, server_ca_pem=V1_ROOT)).tls_mode,
+                         cfg.TLS_BLOCKED)
+        # The server asked for verification but never sent a valid CA.
+        s = cfg.effective_settings({}, dict(self.SERVER_STATE, server_ca_required=True))
+        self.assertEqual((s.tls_mode, s.ca_problem), (cfg.TLS_BLOCKED, cfg.CA_SERVER_INVALID))
+        # Only an explicit verify_server: false overrides it.
+        s = cfg.effective_settings(cfg.parse_options({"verify_server": False}), tampered)
+        self.assertEqual(s.tls_mode, cfg.TLS_DISABLED)
 
 
 class RenderTests(unittest.TestCase):
@@ -770,6 +902,170 @@ class RenderTests(unittest.TestCase):
         return ctx()
 
 
+class TemplateInjectionTests(unittest.TestCase):
+    """M-2: frpc renders frpc.toml as a Go text/template with the process
+    environment as .Envs - a "{{ .Envs.SUPERVISOR_TOKEN }}" in any value
+    would be expanded and sent to frps. No path may write one."""
+
+    STATE = {"device_token": "dt", "subdomain": "home", "token": TOKEN, "server_addr": "frps.example.net",
+             "server_port": 7000, "domain_base": "example.net", "server_name": "frps.example.net",
+             "server_ca_pem": CA1}
+
+    def test_helpers(self):
+        for payload in TEMPLATE_PAYLOADS:
+            self.assertTrue(cfg.has_template_syntax(payload), payload)
+            with self.assertRaises(cfg.TemplateInjectionError) as ctx:
+                cfg.template_safe("server_addr", payload)
+            self.assertIn("server_addr", str(ctx.exception))
+            if len(payload) > 2:
+                self.assertNotIn(payload, str(ctx.exception))  # never echoed
+        for ok in ("frps.example.net", "{a}", "a}b{c", "x" * 300):
+            self.assertFalse(cfg.has_template_syntax(ok), ok)
+            self.assertEqual(cfg.template_safe("f", ok), ok)
+        self.assertFalse(cfg.has_template_syntax(None))
+        with self.assertRaises(cfg.TemplateInjectionError):
+            cfg.template_safe("f", None)
+
+    def test_every_validator_rejects_template_payloads(self):
+        for payload in TEMPLATE_PAYLOADS:
+            for value in (payload, f"frps{payload}.example.net", f"{payload}.example.net"):
+                with self.subTest(value=value):
+                    self.assertIsNone(cfg.normalize_host(value))
+                    self.assertIsNone(cfg.normalize_domain_base(value))
+                    self.assertIsNone(cfg.normalize_subdomain(value))
+                    self.assertIsNone(cfg.normalize_token(value))
+                    self.assertIsNone(cfg.normalize_base_url(f"https://{value}"))
+                    self.assertIsNone(cfg.normalize_log_level(value))
+                    self.assertIsNone(cfg.normalize_masked_email(f"{value}@x.y"))
+
+    def test_options_with_template_payloads_are_ignored(self):
+        for payload in TEMPLATE_PAYLOADS:
+            raw = {"server_addr": f"a{payload}", "local_host": payload, "domain_base": f"{payload}.x.net",
+                   "app_base": f"https://a{payload}.net", "log_level": payload}
+            with self.subTest(payload=payload), self.assertLogs("frp-mgr.config", "ERROR"):
+                opts, errors = cfg.parse_options_report(raw)
+            self.assertEqual(opts, {})
+            self.assertEqual(set(errors), set(raw))
+
+    def test_tunnel_response_with_template_payloads(self):
+        base = {"subdomain": "home", "token": TOKEN}
+        for payload in TEMPLATE_PAYLOADS:
+            with self.subTest(payload=payload):
+                for key in ("subdomain", "token"):  # mandatory: the response is rejected
+                    with self.assertRaises(cfg.TunnelResponseError):
+                        cfg.apply_tunnel_response({}, dict(base, **{key: payload}))
+                state, warnings = cfg.apply_tunnel_response(
+                    {"device_token": "dt"},
+                    dict(base, server_addr=payload, domain_base=f"{payload}.net", server_name=payload))
+                self.assertEqual(len(warnings), 3)
+                for key in ("server_addr", "domain_base", "server_name"):
+                    self.assertNotIn(key, state)
+                self.assertFalse(any(cfg.has_template_syntax(v) for v in state.values()))
+
+    def test_render_refuses_template_payloads_in_every_field(self):
+        settings = cfg.effective_settings({}, self.STATE)
+        self.assertEqual(settings.tls_mode, cfg.TLS_VERIFIED)
+        ca_file = "/data/frps-ca.pem"
+        self.assertIn("serverAddr", cfg.render_frpc_toml(settings, "home", TOKEN, ca_file))
+        for payload in TEMPLATE_PAYLOADS:
+            # Settings built directly bypass every validator: the renderer's
+            # own check must still catch each field.
+            for field_name, value in (("server_addr", f"a{payload}"), ("domain_base", f"{payload}.net"),
+                                      ("local_host", payload), ("server_name", payload),
+                                      ("log_level", payload)):
+                with self.subTest(field=field_name, payload=payload):
+                    bad = dataclasses.replace(settings, **{field_name: value})
+                    with self.assertRaises(ValueError):
+                        cfg.render_frpc_toml(bad, "home", TOKEN, ca_file)
+            with self.subTest(field="trustedCaFile", payload=payload):
+                with self.assertRaises(cfg.TemplateInjectionError):
+                    cfg.render_frpc_toml(settings, "home", TOKEN, f"/data/{payload}.pem")
+            for sub, tok in ((payload, TOKEN), ("home", payload)):
+                with self.subTest(sub=sub, tok=tok), self.assertRaises(ValueError):
+                    cfg.render_frpc_toml(settings, sub, tok, ca_file)
+
+    @mock.patch.object(cfg, "frpc_file_access", return_value=(0o600, None))
+    def test_render_from_disk_never_writes_a_template(self, _access):
+        for payload in TEMPLATE_PAYLOADS:
+            for key in ("subdomain", "token", "server_addr", "domain_base", "server_name"):
+                with self.subTest(key=key, payload=payload), tempfile.TemporaryDirectory() as tmp:
+                    paths = cfg.Paths(Path(tmp))
+                    cfg.write_json(paths.state, dict(self.STATE, **{key: payload}))
+                    try:
+                        cfg.render_from_disk(paths)
+                    except ValueError:
+                        pass
+                    if paths.frpc_toml.exists():
+                        self.assertFalse(cfg.has_template_syntax(paths.frpc_toml.read_text()))
+                        self.assertNotIn("Envs", paths.frpc_toml.read_text())
+
+
+class FailClosedRenderTests(unittest.TestCase):
+    """L-9: a pinned CA that fails re-validation never downgrades frpc."""
+
+    PINNED = TemplateInjectionTests.STATE
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.paths = cfg.Paths(Path(self._tmp.name))
+        access = mock.patch.object(cfg, "frpc_file_access", return_value=(0o600, None))
+        access.start()
+        self.addCleanup(access.stop)
+        cfg.write_json(self.paths.state, self.PINNED)
+        cfg.render_from_disk(self.paths)
+        self.assertEqual(self.paths.frps_ca.read_text(), CA1)
+
+    def test_invalid_state_ca_falls_back_to_the_last_valid_ca_file(self):
+        cfg.write_json(self.paths.state, dict(self.PINNED, server_ca_pem=V1_ROOT))
+        result, settings = cfg.render_from_disk(self.paths)
+        self.assertEqual((settings.tls_mode, settings.ca_problem), (cfg.TLS_VERIFIED, cfg.CA_FALLBACK))
+        self.assertEqual(result, cfg.RenderResult.UNCHANGED)
+        self.assertEqual(self.paths.frps_ca.read_text(), CA1)
+        self.assertIn("trustedCaFile", self.paths.frpc_toml.read_text())
+
+    def test_no_valid_ca_anywhere_blocks_frpc(self):
+        self.paths.frps_ca.write_text(LEAF)
+        cfg.write_json(self.paths.state, dict(self.PINNED, server_ca_pem="garbage"))
+        with self.assertRaises(cfg.CAUnusableError) as ctx:
+            cfg.render_from_disk(self.paths)
+        self.assertIn("pinned CA failed validation", str(ctx.exception))
+        self.assertFalse(self.paths.frpc_toml.exists())  # frpc cannot start from it
+        self.assertFalse(self.paths.frps_ca.exists())
+        with self.assertRaises(cfg.CAUnusableError):  # stays blocked
+            cfg.render_from_disk(self.paths)
+        # verify_server: false is the only (explicit) way out.
+        cfg.write_json(self.paths.options, {"verify_server": False})
+        result, settings = cfg.render_from_disk(self.paths)
+        self.assertEqual(settings.tls_mode, cfg.TLS_DISABLED)
+
+    def test_server_required_but_never_valid_ca_blocks(self):
+        state = {k: v for k, v in self.PINNED.items() if k != "server_ca_pem"}
+        cfg.write_json(self.paths.state, dict(state, server_ca_required=True))
+        with self.assertRaises(cfg.CAUnusableError) as ctx:
+            cfg.render_from_disk(self.paths)
+        self.assertIn("server sent an invalid CA", str(ctx.exception))
+
+    def test_render_frpc_toml_refuses_blocked_settings(self):
+        settings = cfg.effective_settings({}, dict(self.PINNED, server_ca_pem="garbage"))
+        with self.assertRaises(ValueError):
+            cfg.render_frpc_toml(settings, "home", TOKEN, "/data/frps-ca.pem")
+
+    def test_config_fingerprint(self):
+        first = cfg.config_fingerprint(self.paths)
+        self.assertRegex(first, r"^[0-9a-f]{64}$")
+        self.assertEqual(cfg.config_fingerprint(self.paths), first)
+        cfg.write_json(self.paths.state, dict(self.PINNED, server_ca_pem=CA2 + CA1))
+        cfg.render_from_disk(self.paths)  # same frpc.toml, new CA
+        second = cfg.config_fingerprint(self.paths)
+        self.assertNotEqual(second, first)
+        cfg.write_json(self.paths.state, dict(self.PINNED, server_ca_pem=CA2 + CA1, server_port=7001))
+        cfg.render_from_disk(self.paths)
+        self.assertNotIn(cfg.config_fingerprint(self.paths), (first, second))
+        self.paths.frpc_toml.unlink()
+        self.assertIsNone(cfg.config_fingerprint(self.paths))
+
+
 class StateLockTests(unittest.TestCase):
     def test_lock_is_exclusive_and_released(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -830,6 +1126,21 @@ class CliTests(unittest.TestCase):
             self.assertNotIn("not verified", proc.stderr)
             self.assertNotIn("BEGIN CERTIFICATE", proc.stderr)
             self.assertEqual(Path(tmp, "frps-ca.pem").read_text(), CA1)
+            # The state's CA fails validation: the last valid one is kept.
+            Path(tmp, "frp-state.json").write_text(json.dumps(
+                {"device_token": device_token, "subdomain": "home", "token": TOKEN,
+                 "server_name": "frps.linumiq.net", "server_ca_pem": V1_ROOT}))
+            proc = run()
+            self.assertEqual(proc.returncode, cfg.EXIT_OK, proc.stderr)
+            self.assertIn("last valid CA", proc.stderr)
+            self.assertIn("failed validation", proc.stderr)
+            # ... and without a valid one frpc is not started (exit 4).
+            Path(tmp, "frps-ca.pem").write_text("garbage")
+            proc = run()
+            self.assertEqual(proc.returncode, cfg.EXIT_CA_BLOCKED, proc.stderr)
+            self.assertIn("frpc is not started", proc.stderr)
+            self.assertFalse(Path(tmp, "frpc.toml").exists())
+            self.assertNotIn(TOKEN, proc.stderr)
             Path(tmp, "frp-state.json").write_text(json.dumps(
                 {"device_token": device_token, "subdomain": "-bad-", "token": TOKEN}))
             self.assertEqual(run().returncode, cfg.EXIT_NOT_PAIRED)

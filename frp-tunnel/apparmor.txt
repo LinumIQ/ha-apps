@@ -82,6 +82,11 @@ profile frp_tunnel flags=(attach_disconnected,mediate_deleted) {
   /usr/lib/frp-mgr/** mr,
   /usr/lib/frp-mgr/.venv/bin/* rix,
   owner @{PROC}/[0-9]*/fd/ r,
+  # Own-uid environments only: lets the E2E harness verify (as user frpc)
+  # that frpc runs with a scrubbed environment. Exposes nothing new - root
+  # can read the container environment in /run/s6/container_environment
+  # anyway, and frpc's own environment holds no secret.
+  owner @{PROC}/[0-9]*/environ r,
   @{PROC}/[0-9]*/comm r,
   @{PROC}/[0-9]*/stat r,
   @{PROC}/[0-9]*/cgroup r,

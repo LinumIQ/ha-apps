@@ -17,6 +17,7 @@ import asyncio
 import http.server
 import json
 import os
+import random
 import re
 import sys
 import tempfile
@@ -42,12 +43,14 @@ except ImportError:  # pragma: no cover - host without the panel dependencies
         raise
     starlette = None
 
-from tls_fixtures import CA1, CA2, EXPIRED_CA  # noqa: E402
+from tls_fixtures import CA1, CA2, EXPIRED_CA, V1_ROOT  # noqa: E402
 
 TOKEN = "c" * 64
 DEVICE_TOKEN = "DEVICE-TOKEN-SECRET-0123456789"
 DEVICE_CODE = "0123456789abcdef" * 4
 SAME_ORIGIN = [("sec-fetch-site", "same-origin")]
+#: The Supervisor's ingress proxy - the only client allowed by default.
+INGRESS = ("172.30.32.2", 50123)
 
 
 def make_request(headers=()) -> "Request":
@@ -72,7 +75,7 @@ def device_code_response(**extra):
     return body
 
 
-def asgi_call(app, method, path, headers=(), client=("127.0.0.1", 50123), body=b"", host="panel.test"):
+def asgi_call(app, method, path, headers=(), client=INGRESS, body=b"", host="panel.test"):
     """Drive the ASGI app like uvicorn would; returns (status, headers, body)."""
     sent = []
     raw_headers = [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers]
@@ -109,6 +112,9 @@ class PanelFlowTests(unittest.TestCase):
         cls.app = app
         cls.cfg = cfg
         cls.real_http_json = staticmethod(app._http_json)
+        import frpclog  # noqa: PLC0415
+
+        cls.frpclog = frpclog
 
     @classmethod
     def tearDownClass(cls):
@@ -129,6 +135,10 @@ class PanelFlowTests(unittest.TestCase):
             mock.patch.object(self.app, "_stop_frpc", return_value=True),
             mock.patch.object(self.app, "_start_frpc_service"),
             mock.patch.object(self.app, "_frpc_status", return_value="running"),
+            mock.patch.object(self.app, "FRPC_STATUS", self.paths.data_dir / "run" / "frpc-status.json"),
+            mock.patch.object(self.app, "ALLOWED_CLIENT_NETS",
+                              self.app._parse_allowed_clients(self.app.DEFAULT_ALLOWED_INGRESS_IPS)),
+            mock.patch.dict(self.app._AUTO_REFRESH_STATUS, clear=True),
         ]
         for p in patches:
             p.start()
@@ -159,6 +169,19 @@ class PanelFlowTests(unittest.TestCase):
 
     def _state(self):
         return json.loads(self.paths.state.read_text())
+
+    def _frpc_log(self, state="connected", login_failures=0, network_failures=0, last_error="",
+                  fingerprint=None):
+        """Write the frpc log watcher's status for the current frpc.toml."""
+        status = {
+            "version": self.frpclog.STATUS_VERSION, "pid": 1, "started_at": 1.0, "updated_at": 2.0,
+            "fingerprint": fingerprint or self.cfg.config_fingerprint(self.paths),
+            "state": state, "logged_in_at": 1_800_000_000.0 if state == "connected" else None,
+            "login_failures": login_failures, "network_failures": network_failures,
+            "last_error": last_error, "last_error_kind": "", "last_error_at": None,
+        }
+        self.app.FRPC_STATUS.parent.mkdir(parents=True, exist_ok=True)
+        self.app.FRPC_STATUS.write_text(json.dumps(status))
 
     # -- pairing -----------------------------------------------------------
 
@@ -459,6 +482,12 @@ class PanelFlowTests(unittest.TestCase):
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):  # noqa: N802
                 hits.append((self.path, self.headers.get("Authorization")))
+                if self.path.startswith("/big"):
+                    self.send_response(500 if self.path == "/big-error" else 200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"error": "' + b"x" * (300 * 1024) + b'"}')
+                    return
                 if self.path.startswith("/redirect"):
                     self.send_response(302)
                     self.send_header("Location", f"http://127.0.0.1:{self.server.server_port}/landing")
@@ -493,6 +522,16 @@ class PanelFlowTests(unittest.TestCase):
                 self.real_http_json("GET", f"{base}/plain", bearer="SECRETDEVICETOKEN\n")
         self.assertNotIn("SECRETDEVICETOKEN", " ".join(logs.output) + str(ctx.exception))
         self.assertEqual(len(hits), 2)
+
+        # Response bodies are limited (L-11): oversized = unusable; an
+        # oversized error body is cut.
+        with self.assertLogs("frp-mgr", "ERROR"):
+            with self.assertRaises(self.app.BackendUnavailable) as ctx:
+                self.real_http_json("GET", f"{base}/big", bearer=DEVICE_TOKEN)
+        self.assertIn("oversized", str(ctx.exception))
+        code, body = self.real_http_json("GET", f"{base}/big-error", bearer=DEVICE_TOKEN)
+        self.assertEqual(code, 500)
+        self.assertLessEqual(len(body), self.app.MAX_RESPONSE_BYTES)
 
     def test_http_json_maps_protocol_errors_to_backend_unavailable(self):
         import socket
@@ -561,16 +600,32 @@ class PanelFlowTests(unittest.TestCase):
         self.assertIn(f'transport.tls.trustedCaFile = "{self.paths.frps_ca}"', toml)
         self.assertIn('transport.tls.serverName = "frps.linumiq.net"', toml)
         status = self.app.api_status()
-        self.assertEqual((status["tls_mode"], status["tls_verified"]), ("verified", True))
+        # Pinned, but "verified" only once frpc has logged in with it (L-10).
+        self.assertEqual((status["tls_mode"], status["tls_verified"], status["tls_login"]),
+                         ("verified", False, "unknown"))
         self.assertEqual(status["server_name"], "frps.linumiq.net")
         self.assertEqual(status["account_email_masked"], "g***@linumiq.com")
-        self.assertEqual(status["tls_warnings"], [])
+        self.assertEqual((status["tls_warnings"], status["tls_errors"]), ([], []))
         self.assertNotIn("BEGIN CERTIFICATE", json.dumps(status))
         body = self.app.index(get_request()).body.decode()
         self.assertIn("Paired with <strong>g***@linumiq.com</strong>", body)
+        self.assertIn("waiting for frpc to log in with it", body)
+        self.assertNotIn("certificate verified", body)
+        # A login reported for an older configuration does not count.
+        self._frpc_log("connected", fingerprint="0" * 64)
+        self.assertFalse(self.app.api_status()["tls_verified"])
+        self._frpc_log("connecting")
+        self.assertEqual(self.app.api_status()["tls_login"], "pending")
+        self._frpc_log("connected")
+        status = self.app.api_status()
+        self.assertEqual((status["tls_verified"], status["tls_login"]), (True, "ok"))
+        self.assertTrue(status["frpc_logged_in_at"].endswith("UTC"))
+        body = self.app.index(get_request()).body.decode()
         self.assertIn("certificate verified for <code>frps.linumiq.net</code>", body)
         self.assertIn("Test frps CA 1 until 2125-12-31", body)
+        self.assertIn("frpc logged in 20", body)
         self.assertNotIn("flash-warn", body)
+        self.assertNotIn("flash-error", body)
 
     def test_old_server_without_ca_is_flagged(self):
         self._paired()
@@ -618,11 +673,189 @@ class PanelFlowTests(unittest.TestCase):
             self.assertEqual(status["tls_mode"], "disabled")
             self.assertTrue(any("verify_server" in w for w in status["tls_warnings"]))
 
-    def test_expired_ca_is_warned_about(self):
+    def test_expired_ca_is_an_error(self):
         self._paired(**self._tunnel_v22(server_ca_pem=EXPIRED_CA))
-        self.assertTrue(any("expired" in w for w in self.app.api_status()["tls_warnings"]))
+        self.assertTrue(any("has expired or is not yet valid" in e for e in self.app.api_status()["tls_errors"]))
+        # One current CA in the bundle: only a warning.
+        self._paired(**self._tunnel_v22(server_ca_pem=EXPIRED_CA + CA1))
+        status = self.app.api_status()
+        self.assertEqual(status["tls_errors"], [])
+        self.assertTrue(any("expired or is not yet valid" in w for w in status["tls_warnings"]))
+
+    # -- fail closed (L-9) / login state (L-10) ----------------------------------
+
+    def test_unusable_ca_fails_closed_with_a_red_banner(self):
+        self._paired(**self._tunnel_v22())
+        self._frpc_log("connected")
+        # The state's CA no longer validates and no valid copy exists.
+        state = self._state()
+        state["server_ca_pem"] = V1_ROOT
+        self.cfg.write_json(self.paths.state, state)
+        self.paths.frps_ca.write_text("garbage")
+        self.backend[("GET", "/api/device/tunnel")] = (200, self._tunnel_v22(server_ca_pem="garbage"))
+        with self.assertRaises(self.app.FlashError) as ctx:
+            self.app.tunnel_refresh(make_request())
+        self.assertIn("never falls back", ctx.exception.message)
+        self.assertFalse(self.paths.frpc_toml.exists())  # the run script refuses to start frpc
+        self.assertFalse(self.paths.frps_ca.exists())
+        self.app._restart_frpc.assert_called_once()     # a running frpc is taken down
+        status = self.app.api_status()
+        self.assertEqual((status["tls_mode"], status["tls_verified"]), ("blocked", False))
+        self.assertTrue(any("never falls back" in e for e in status["tls_errors"]))
+        body = self.app.index(get_request()).body.decode()
+        self.assertIn("flash-error", body)
+        self.assertIn("frpc not started: no valid CA", body)
+        # A valid CA from the server recovers.
+        self.backend[("GET", "/api/device/tunnel")] = (200, self._tunnel_v22(server_ca_pem=CA2))
+        resp = self.app.tunnel_refresh(make_request())
+        self.assertIn("updated", resp.headers["location"])
+        self.assertEqual(self.paths.frps_ca.read_text(), CA2)
+        self.assertEqual(self.app.api_status()["tls_mode"], "verified")
+
+    def test_first_pairing_with_an_invalid_ca_never_runs_unverified(self):
+        self._start_pairing()
+        self.backend[("POST", "/api/device/token")] = (200, {"device_token": DEVICE_TOKEN})
+        self.backend[("GET", "/api/device/tunnel")] = (200, self._tunnel_v22(server_ca_pem=V1_ROOT))
+        self.assertEqual(self.app.pair_poll()["status"], "paired")
+        self.assertFalse(self.paths.frpc_toml.exists())
+        status = self.app.api_status()
+        self.assertEqual(status["tls_mode"], "blocked")
+        self.assertTrue(status["tls_errors"])
+        # Same for a subdomain change: an error, frpc stays down.
+        self.backend[("POST", "/api/device/tunnel")] = (
+            200, self._tunnel_v22(subdomain="other", server_ca_pem="still invalid"))
+        with self.assertRaises(self.app.FlashError) as ctx:
+            self.app.subdomain_change(make_request(), subdomain="other")
+        self.assertIn("never falls back", ctx.exception.message)
+        self.assertFalse(self.paths.frpc_toml.exists())
+
+    def test_invalid_state_ca_falls_back_to_the_last_valid_one(self):
+        self._paired(**self._tunnel_v22())
+        state = self._state()
+        state["server_ca_pem"] = V1_ROOT  # accepted by older validators, not by this one
+        self.cfg.write_json(self.paths.state, state)
+        status = self.app.api_status()
+        self.assertEqual(status["tls_mode"], "verified")
+        self.assertTrue(any("last valid one" in w for w in status["tls_warnings"]))
+        self.assertEqual(status["tls_errors"], [])
+
+    def test_login_failures_are_shown_without_secrets(self):
+        self._paired(**self._tunnel_v22())
+        self._frpc_log("failed", login_failures=2,
+                       last_error=f"x509: certificate signed by unknown authority {TOKEN}")
+        status = self.app.api_status()
+        self.assertEqual((status["tls_login"], status["tls_verified"]), ("failed", False))
+        self.assertEqual(len(status["tls_errors"]), 1)
+        self.assertIn("unknown authority", status["tls_errors"][0])
+        self.assertNotIn(TOKEN, json.dumps(status))
+        self.assertIn("login with the CA pinned", self.app.index(get_request()).body.decode())
+        # Still failed while frpc is between two attempts ("connecting").
+        self._frpc_log("connecting", login_failures=2)
+        self.assertEqual(self.app.api_status()["tls_login"], "failed")
+        self._frpc_log("failed", network_failures=4, last_error="dial tcp: connection refused")
+        status = self.app.api_status()
+        self.assertEqual((status["tls_login"], status["tls_errors"]), ("unreachable", []))
+        self.assertTrue(any("cannot reach" in w for w in status["tls_warnings"]))
+
+    # -- automatic refresh (L-6) --------------------------------------------------
+
+    def test_auto_refresh_schedule(self):
+        app = self.app
+        lo, hi = app.AUTO_REFRESH_INTERVAL
+        first = app.LOGIN_FAILURE_BACKOFF[0]
+        threshold = app.LOGIN_FAILURE_THRESHOLD
+        schedule = app.AutoRefresh(0.0, random.Random(7))
+        self.assertEqual(schedule.due(0.0, 0), "startup")
+        schedule.done("startup", 0.0, "unchanged")
+        self.assertTrue(lo <= schedule.next_periodic <= hi)
+        self.assertIsNone(schedule.due(lo - 1, 0))
+        self.assertEqual(schedule.due(schedule.next_periodic, 0), "periodic")
+        # Jitter: different instances pick different times.
+        times = set()
+        for seed in range(5):
+            other = app.AutoRefresh(0.0, random.Random(seed))
+            other.done("startup", 0.0, "unchanged")
+            times.add(other.next_periodic)
+        self.assertEqual(len(times), 5)
+        # Login failures: threshold, first backoff counted from the start-up.
+        self.assertIsNone(schedule.due(first - 1, 99))
+        self.assertIsNone(schedule.due(first, threshold - 1))
+        self.assertEqual(schedule.due(first, threshold), "login-failures")
+        schedule.done("login-failures", first, "unchanged")
+        self.assertIsNone(schedule.due(2 * first - 1, threshold))
+        self.assertEqual(schedule.due(2 * first, threshold), "login-failures")
+        schedule.done("login-failures", 2 * first, "unchanged")
+        self.assertIsNone(schedule.due(4 * first - 1, threshold))   # doubled
+        self.assertEqual(schedule.due(4 * first, threshold), "login-failures")
+        for _ in range(20):
+            schedule.done("login-failures", 0.0, "unchanged")
+        self.assertEqual(schedule.backoff, app.LOGIN_FAILURE_BACKOFF[1])  # capped
+        schedule.logged_in()
+        self.assertEqual(schedule.backoff, first)
+        # A failed refresh (backend unreachable) is retried after an hour.
+        schedule.done("periodic", 100.0, "error")
+        self.assertEqual(schedule.next_periodic, 100.0 + app.AUTO_REFRESH_RETRY)
+
+    def test_auto_refresh_applies_changes_like_a_manual_refresh(self):
+        self._paired()
+        schedule = self.app.AutoRefresh(0.0, random.Random(1))
+        self.backend[("GET", "/api/device/tunnel")] = (200, self._tunnel(server_port=7000))
+        self.assertEqual(self.app._auto_refresh_tick(schedule, 0.0), "updated")  # start-up
+        self.app._restart_frpc.assert_called_once()
+        self.assertIn("serverPort = 7000", self.paths.frpc_toml.read_text())
+        self.assertEqual(self.calls[-1][3], DEVICE_TOKEN)
+        auto = self.app.api_status()["auto_refresh"]
+        self.assertEqual((auto["reason"], auto["outcome"]), ("startup", "updated"))
+        self.assertIsNone(self.app._auto_refresh_tick(schedule, 60.0))  # nothing due
+        self.assertEqual(self.app._auto_refresh_tick(schedule, schedule.next_periodic), "unchanged")
+        self.assertEqual(len([c for c in self.calls if c[:2] == ("GET", "/api/device/tunnel")]), 2)
+        self.assertIn("Config refresh", self.app.index(get_request()).body.decode())
+
+    def test_auto_refresh_after_repeated_login_failures(self):
+        self._paired(**self._tunnel_v22())
+        schedule = self.app.AutoRefresh(0.0, random.Random(1))
+        schedule.done("startup", 0.0, "unchanged")
+        first = self.app.LOGIN_FAILURE_BACKOFF[0]
+        self._frpc_log("connecting", login_failures=self.app.LOGIN_FAILURE_THRESHOLD,
+                       last_error="x509: certificate signed by unknown authority")
+        self.backend[("GET", "/api/device/tunnel")] = (200, self._tunnel_v22(server_ca_pem=CA2))  # rotated
+        self.assertIsNone(self.app._auto_refresh_tick(schedule, first - 1))
+        self.assertEqual(self.app._auto_refresh_tick(schedule, first), "updated")
+        self.assertEqual(self.paths.frps_ca.read_text(), CA2)
+        self.app._restart_frpc.assert_called_once()
+        # The failures were reported for the old configuration: ignored now.
+        self.assertIsNone(self.app._auto_refresh_tick(schedule, 100 * first))
+        # Network errors (frps down) never trigger it.
+        self._frpc_log("failed", network_failures=50, last_error="connection refused")
+        self.assertIsNone(self.app._auto_refresh_tick(schedule, 100 * first))
+
+    def test_auto_refresh_never_raises(self):
+        schedule = self.app.AutoRefresh(0.0, random.Random(1))
+        self.assertEqual(self.app._auto_refresh_tick(schedule, 0.0), "skipped")  # not paired
+        self._paired()
+        self.backend[("GET", "/api/device/tunnel")] = self.app.BackendUnavailable("down")
+        self.assertEqual(self.app._auto_refresh_tick(schedule, schedule.next_periodic), "error")
+        self.backend[("GET", "/api/device/tunnel")] = (401, {"error": "unauthorized"})
+        self.assertEqual(self.app._auto_refresh_tick(schedule, schedule.next_periodic), "unauthorized")
+        self.assertTrue(self.paths.frpc_toml.exists())
 
     # -- ingress guard / CSRF (ASGI level, as uvicorn drives the app) ----------
+
+    def test_default_allow_list_is_the_ingress_proxy_only(self):
+        # L-8: loopback is not allowed by default - the unprivileged frpc
+        # user must not be able to drive the panel via 127.0.0.1.
+        self.assertEqual(self.app.DEFAULT_ALLOWED_INGRESS_IPS, "172.30.32.2")
+        self._paired()
+        self.backend[("DELETE", "/api/device/tunnel")] = (200, {"ok": True})
+        for client in (("127.0.0.1", 40000), ("::1", 40000), ("172.30.32.1", 1), ("172.30.33.2", 1)):
+            with self.subTest(client=client):
+                self.assertEqual(asgi_call(self.app.app, "GET", "/api/status", client=client)[0], 403)
+                self.assertEqual(asgi_call(self.app.app, "POST", "/unpair", SAME_ORIGIN, client=client)[0], 403)
+        self.assertTrue(self.paths.state.exists())
+        self.assertEqual(asgi_call(self.app.app, "GET", "/api/status")[0], 200)  # from INGRESS
+        # Loopback only when explicitly configured (E2E harness, smoke test).
+        with mock.patch.object(self.app, "ALLOWED_CLIENT_NETS", self.app._parse_allowed_clients("127.0.0.1")):
+            self.assertEqual(asgi_call(self.app.app, "GET", "/api/status", client=("127.0.0.1", 1))[0], 200)
 
     def test_health_has_no_ingress_exemption(self):
         self.assertEqual(asgi_call(self.app.app, "GET", "/_health")[:1], (200,))

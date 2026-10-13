@@ -7,7 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.2.0] - 2026-10-13
 
-Security release (platform audit 2026-10-12: H4, M3, M4, add-on lows).
+Security release (platform audit 2026-10-12: H4, M3, M4, add-on lows; add-on
+review 2026-10-13: M-2, L-6, L-8 to L-11).
 
 ### Breaking - what a 2.1.x user must know
 
@@ -17,6 +18,15 @@ Security release (platform audit 2026-10-12: H4, M3, M4, add-on lows).
   pinned on the next start or **Refresh tunnel config**. If frpc then logs
   `certificate verify failed` / `x509: ...`, see DOCS.md, Troubleshooting.
   Only an explicit `verify_server: false` disables verification.
+- **Verification fails closed.** Once the server has sent a CA, frpc is never
+  started unverified: if the pinned CA no longer passes validation, the last
+  valid one (`/data/frps-ca.pem`) is used, and without any valid CA frpc is
+  not started at all (red banner in the panel; **Refresh tunnel config**
+  fetches the current CA).
+- **The tunnel token must be URL-safe** (`A-Z a-z 0-9 . _ ~ -`, 8-256
+  characters). A token with other characters (or a server sending one) is
+  treated as "not paired"; **Refresh tunnel config** fetches a new one. Tokens
+  issued by the LinumIQ server (hex) are unaffected.
 - **Pairing data is excluded from Home Assistant backups** (`backup_exclude`):
   the state file with the device and tunnel tokens, `frpc.toml`, the pinned CA
   and a pairing in progress. A restored backup starts **unpaired** - pair
@@ -24,6 +34,9 @@ Security release (platform audit 2026-10-12: H4, M3, M4, add-on lows).
 - Requests that change state (pairing, refresh, subdomain change, unpair) must
   be same-origin. Nothing changes in the Home Assistant UI; scripts that call
   the panel must send `Sec-Fetch-Site: same-origin`.
+- The panel answers only the Supervisor's ingress proxy (172.30.32.2) by
+  default - no longer loopback. Tooling inside the container (outside
+  Supervisor) must set `ALLOWED_INGRESS_IPS` explicitly.
 - `frpc.toml` is now `root:frpc` mode 640 (frpc runs as the unprivileged user
   `frpc`); the unused `addon_config` folder mapping was removed.
 - Upgrading from 2.0.x: the notes of 2.1.0 below still apply - in particular
@@ -32,15 +45,57 @@ Security release (platform audit 2026-10-12: H4, M3, M4, add-on lows).
 ### Security
 
 - **frps is authenticated (H4).** The server-provided `server_ca_pem` is
-  accepted only if it consists of 1-8 PEM `CERTIFICATE` blocks that OpenSSL
-  parses as X.509 CA certificates (anything else - private keys, leaf
-  certificates, junk - is rejected), re-encoded, persisted in the state and
-  written to `/data/frps-ca.pem` (atomic, `root:frpc` 0640). `frpc.toml` pins
-  it with `transport.tls.trustedCaFile` and `transport.tls.serverName`
-  (`server_name`, else `server_addr`). A response without a CA or with an
-  invalid one never removes a pinned CA (no silent downgrade); the panel warns
-  instead. Without any CA (older servers) or with `verify_server: false` the
-  panel shows a permanent warning and the renderer logs one on every start.
+  accepted only if it consists of 1-8 PEM `CERTIFICATE` blocks, each exactly
+  one DER-encoded X.509 **v3** certificate (no trailing bytes; OpenSSL's
+  re-encoding must be byte-identical) with the basicConstraints extension
+  `cA: TRUE` - private keys, leaf certificates, v1 roots, certificates
+  without basicConstraints and junk are rejected. It is re-encoded, persisted
+  in the state and written to `/data/frps-ca.pem` (atomic, `root:frpc` 0640).
+  `frpc.toml` pins it with `transport.tls.trustedCaFile` and
+  `transport.tls.serverName` (`server_name`, else `server_addr`). A response
+  without a CA, with an invalid one, or with one that is expired / not yet
+  valid while the pinned one is current never replaces or removes a pinned
+  CA (no silent downgrade); the panel warns instead. Without any CA (older
+  servers) or with `verify_server: false` the panel shows a permanent warning
+  and the renderer logs one on every start.
+- **Verification fails closed (L-9).** The CA is re-validated on every render.
+  A pinned CA that fails (tampered state file, or a CA a laxer validator had
+  accepted) falls back to the last valid CA frpc was given
+  (`/data/frps-ca.pem`, yellow banner); with no valid CA at all - also when
+  the server sent a CA but never a valid one (`server_ca_required`) - the
+  renderer removes `frpc.toml`, exits 4 and the frpc service does **not**
+  start frpc (red banner). Previously such a CA silently downgraded frpc to an
+  unverified connection.
+- **"Verified" means frpc logged in with the pinned CA (L-10).** frpc's output
+  now passes through a log watcher (`frpclog.py`, unchanged in the add-on log)
+  that records login results per configuration fingerprint
+  (`/run/frp-mgr/frpc-status.json`). The panel shows *certificate verified*
+  only after `login to server success` with exactly the current `frpc.toml` +
+  CA; until then *waiting for frpc to log in*, and a red banner when logins
+  with the pinned CA fail. Expired / not-yet-valid CAs are flagged (red when
+  no certificate of the bundle is currently valid).
+- **No Go-template injection into frpc (M-2).** frpc renders its whole
+  configuration file as a Go `text/template` with the process environment as
+  `.Envs`, and frpc inherited the add-on environment incl. `SUPERVISOR_TOKEN`:
+  a tunnel token such as `{{ .Envs.SUPERVISOR_TOKEN }}` from a malicious or
+  compromised backend (or `app_base` override) would have been expanded and
+  sent to frps. The tunnel token is now restricted to `[A-Za-z0-9._~-]{8,256}`
+  (the device token, only ever an HTTP bearer, keeps its header-safe rule);
+  every string written into `frpc.toml` (server address, server name, token,
+  subdomain, domain, local host, CA path, log level) is checked once more for
+  `{{`, `}}` and backticks before rendering, and so is the whole file.
+- **frpc runs with a scrubbed environment.** The frpc service starts it with
+  `env -i PATH=/usr/bin:/bin HOME=/data [TZ]`, so frpc never sees
+  `SUPERVISOR_TOKEN` or any other add-on variable (verified by the E2E
+  harness via `/proc/<pid>/environ`).
+- **Ingress allow-list without loopback (L-8).** `ALLOWED_INGRESS_IPS`
+  defaults to `172.30.32.2` only: the unprivileged frpc user (or any other
+  process in the container) can no longer drive the panel through
+  `127.0.0.1:8099`. Loopback is accepted only when configured explicitly
+  (E2E harness, smoke test - never under Supervisor).
+- **Backend responses are size-limited (L-11).** The panel reads at most
+  256 KiB of a device-API response; a larger one is rejected (error bodies are
+  cut).
 - **Ingress allow-list bypass fixed (M3).** The `/_health` exemption, which
   compared Starlette's `request.url.path` (rebuilt from the `Host` header,
   GHSA-86qp-5c8j-p5mr), is gone; a pure ASGI guard in front of every route
@@ -77,19 +132,34 @@ Security release (platform audit 2026-10-12: H4, M3, M4, add-on lows).
 ### Added
 
 - Advanced option `verify_server` (bool, default on).
-- Panel: TLS state of the tunnel server (verified for `<server_name>`, CA
-  subject and expiry, or a warning), the paired account, warnings when the
-  server stops sending its CA, sends an invalid one, or the pinned CA expired.
-- `GET /api/status`: `tls_mode`, `tls_verified`, `server_name`, `server_ca`,
-  `tls_warnings`, `account_email_masked`.
+- **Automatic tunnel refresh (L-6).** A background thread of the panel
+  re-fetches `GET /api/device/tunnel` exactly like **Refresh tunnel config**:
+  at start-up, every 12-24 h (random jitter; retried after 1 h when the
+  backend is unreachable) and after 3 consecutive frpc login failures with
+  the current configuration (TLS verification or authentication - e.g. a CA
+  or token rotated server-side; network errors do not count; at most every
+  10 min, backing off to 6 h). This also keeps the device's `last_used_at`
+  fresh against the server's 180-day inactivity expiry.
+- Panel: TLS state of the tunnel server (verified for `<server_name>` after
+  frpc's login, CA subject and expiry, or a warning/error), the paired
+  account, warnings when the server stops sending its CA, sends an invalid
+  one, or the pinned CA expired, and the last automatic refresh.
+- `GET /api/status`: `tls_mode` (`verified`, `unverified`, `disabled`,
+  `blocked`), `tls_verified`, `tls_login`, `frpc_logged_in_at`, `server_name`,
+  `server_ca`, `tls_errors`, `tls_warnings`, `auto_refresh`,
+  `account_email_masked`.
 - E2E harness: `E2E_FRPS_CA_FILE` (asserts the pinned CA, `trustedCaFile` /
   `serverName`, a verified login and - `E2E_TLS_NEGATIVE` - that frpc refuses
   a certificate for the wrong name), `E2E_FRPS_SERVER_NAME`,
   `E2E_ACCOUNT_EMAIL_MASKED`, `E2E_CREATE_ARGS` (e.g. an AppArmor profile),
   and checks for CSRF, the crafted-`Host` bypass, pairing-code hygiene and the
-  unprivileged frpc.
+  unprivileged frpc; frpc's environment (a dummy `SUPERVISOR_TOKEN` must not
+  reach it), the default allow-list (a second container: user `frpc` gets 403
+  on `127.0.0.1:8099`), `tls_verified` only after the verified login, the
+  red `tls_login=failed` state with a wrong `serverName`, and fail-closed
+  (no valid CA: frpc not started, `tls_mode=blocked`).
 - `tests/apparmor-smoke.sh`: boots the image confined by `apparmor.txt` and
-  fails on any denial (run in CI).
+  fails on any denial (run in CI); also checks the frpc log watcher.
 
 ### Changed
 
@@ -97,6 +167,13 @@ Security release (platform audit 2026-10-12: H4, M3, M4, add-on lows).
   virtualenv at `/usr/lib/frp-mgr/.venv`; Python writes no bytecode at runtime.
 - Unit tests: `FRP_TESTS_REQUIRE_PANEL=1` replaces `FRP_TESTS_REQUIRE_FASTAPI`
   (still accepted).
+- AppArmor: processes may read `/proc/<pid>/environ` of their own uid (the
+  E2E harness checks frpc's scrubbed environment through it; nothing new is
+  exposed).
+- Repository: Dependabot also updates the panel's pip requirements
+  (`requirements.in` -> hashed `requirements.txt`) and the Dockerfiles' base
+  images; the Builder workflow also rebuilds on `.dockerignore` changes and
+  rebuilds every add-on when the workflow itself changes.
 
 ## [2.1.0] - 2026-10-12
 

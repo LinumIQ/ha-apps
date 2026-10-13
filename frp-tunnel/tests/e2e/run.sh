@@ -62,10 +62,15 @@ PANEL="http://127.0.0.1:8099"
 # guard); a browser sends this header itself, the harness has to add it.
 SAME_ORIGIN=(-H "Sec-Fetch-Site: same-origin")
 
+# A stand-in for the Supervisor API token every add-on container gets: frpc
+# must never see it (it renders its config as a Go template with .Envs).
+SUPERVISOR_DUMMY="e2e-dummy-supervisor-token-$$-${RANDOM}"
+
 PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
 CTR=""
+CTR_DEFAULT=""
 WORK_DIR=""
 UNPAIRED=false
 SECRETS=()
@@ -149,6 +154,7 @@ cleanup() {
             "${DOCKER}" rm -f "${CTR}" >/dev/null 2>&1 || true
         fi
     fi
+    [[ -n "${CTR_DEFAULT}" ]] && "${DOCKER}" rm -f "${CTR_DEFAULT}" >/dev/null 2>&1
     [[ -n "${WORK_DIR}" ]] && rm -rf "${WORK_DIR}"
     exit "${rc}"
 }
@@ -224,12 +230,32 @@ file_owner_is() { [[ "$(cexec stat -c '%U:%G' "$1" 2>/dev/null)" == "$2" ]]; }
 # (the add-on re-encodes the PEM, so line wrapping may differ).
 pem_body() { grep -v -- '-----' | tr -d ' \t\r\n'; }
 log_count() { "${DOCKER}" logs "${CTR}" 2>&1 | grep -c -F -- "$1" || true; }
-frpc_user() {
+frpc_pid() {
     local out up pid
     out="$(cexec s6-svstat -o up,pid /run/service/frpc 2>/dev/null)" || return 1
     read -r up pid <<<"${out}"
     [[ "${up}" == true && "${pid}" =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "${pid}"
+}
+frpc_user() {
+    local pid
+    pid="$(frpc_pid)" || return 1
     cexec stat -c '%U' "/proc/${pid}" 2>/dev/null
+}
+# frpc's environment, one variable per line. Read as user frpc (root would
+# need CAP_SYS_PTRACE for another user's process; the AppArmor profile allows
+# reading own-uid environments).
+frpc_environ() {
+    local pid
+    pid="$(frpc_pid)" || return 1
+    "${DOCKER}" exec --user frpc "${CTR}" cat "/proc/${pid}/environ" 2>/dev/null | tr '\0' '\n'
+}
+# Names of the variables in frpc's environment, one per line.
+frpc_env_names() {
+    local env
+    env="$(frpc_environ)" || return 1
+    [[ -n "${env}" ]] || return 1
+    printf '%s\n' "${env}" | cut -d= -f1 | sort
 }
 # In-shell match (no grep): the expected line may contain the tunnel token.
 toml_has_line() {
@@ -329,16 +355,17 @@ fi
 mkdir -p "${WORK_DIR}/data" "${WORK_DIR}/tmp/.bashio"
 cp "${WORK_DIR}/options.json" "${WORK_DIR}/data/options.json"
 cp "${WORK_DIR}/options.json" "${WORK_DIR}/tmp/.bashio/addons.self.options.config.cache"
-# copy_into <host-dir> <container-dir>: copy the directory's content owned by
-# root, as Supervisor would create it (`docker cp` keeps the host uid, which
-# root inside the container could only read with CAP_DAC_OVERRIDE - not
-# granted by the add-on's AppArmor profile).
+# copy_into <host-dir> <container-dir> [container]: copy the directory's
+# content owned by root, as Supervisor would create it (`docker cp` keeps the
+# host uid, which root inside the container could only read with
+# CAP_DAC_OVERRIDE - not granted by the add-on's AppArmor profile).
 copy_into() {
-    tar -C "$1" --owner=0 --group=0 --numeric-owner -cf - . | "${DOCKER}" cp - "${CTR}:$2"
+    tar -C "$1" --owner=0 --group=0 --numeric-owner -cf - . | "${DOCKER}" cp - "${3:-${CTR}}:$2"
 }
 
 CTR="frp-tunnel-e2e-$$-${RANDOM}"
-create_args=(--name "${CTR}" -e "ALLOWED_INGRESS_IPS=${ALLOWED_IPS}")
+# SUPERVISOR_TOKEN: what Supervisor puts into every add-on's environment.
+create_args=(--name "${CTR}" -e "ALLOWED_INGRESS_IPS=${ALLOWED_IPS}" -e "SUPERVISOR_TOKEN=${SUPERVISOR_DUMMY}")
 [[ -n "${NETWORK}" ]] && create_args+=(--network "${NETWORK}")
 # e.g. E2E_CREATE_ARGS="--security-opt apparmor=frp_tunnel" (profile loaded on the host)
 create_args+=("${CREATE_EXTRA[@]+"${CREATE_EXTRA[@]}"}")
@@ -372,6 +399,41 @@ if [[ -n "${CTR_IP}" && "${CTR_IP}" != 127.* ]]; then
 else
     skip "ingress guard rejects non-ingress clients" "container IP unknown"
 fi
+# The DEFAULT allow-list (no ALLOWED_INGRESS_IPS: the Supervisor's ingress
+# proxy only) must refuse loopback - in particular the unprivileged frpc user,
+# who could otherwise drive the panel (unpair, refresh). Checked in a second,
+# unpaired container of the same image.
+CTR_DEFAULT="${CTR}-default"
+default_args=(--name "${CTR_DEFAULT}")
+[[ -n "${NETWORK}" ]] && default_args+=(--network "${NETWORK}")
+default_args+=("${CREATE_EXTRA[@]+"${CREATE_EXTRA[@]}"}")
+if "${DOCKER}" create "${default_args[@]}" "${IMAGE}" >/dev/null \
+    && copy_into "${WORK_DIR}/data" /data "${CTR_DEFAULT}" >/dev/null \
+    && copy_into "${WORK_DIR}/tmp" /tmp "${CTR_DEFAULT}" >/dev/null \
+    && "${DOCKER}" start "${CTR_DEFAULT}" >/dev/null; then
+    # default_code <user> <METHOD> <path>: HTTP status from inside that container
+    default_code() {
+        "${DOCKER}" exec --user "$1" "${CTR_DEFAULT}" curl -s -o /dev/null -w '%{http_code}' \
+            "${SAME_ORIGIN[@]}" -X "$2" "${PANEL}$3" 2>/dev/null || printf '000'
+    }
+    default_panel_up() { [[ "$(default_code root GET /_health)" == 403 ]]; }
+    if wait_for "${BOOT_TIMEOUT}" default_panel_up; then
+        pass "default allow-list: loopback refused for root (HTTP 403)"
+        code="$(default_code frpc GET /api/status)"
+        check "default allow-list: user frpc gets HTTP ${code} for GET 127.0.0.1:8099/api/status (want 403)" \
+            test "${code}" == 403
+        code="$(default_code frpc POST /unpair)"
+        check "default allow-list: user frpc gets HTTP ${code} for a same-origin POST /unpair (want 403)" \
+            test "${code}" == 403
+    else
+        fail "default allow-list: loopback refused" "last HTTP $(default_code root GET /_health)"
+    fi
+    "${DOCKER}" rm -f "${CTR_DEFAULT}" >/dev/null 2>&1 || true
+else
+    fail "default allow-list container started"
+fi
+CTR_DEFAULT=""
+
 code="$(panel_code POST /pair/start)"
 check "CSRF: POST without Sec-Fetch-Site/Origin refused (HTTP ${code})" test "${code}" == 403
 code="$(panel_code POST /pair/start -H 'Sec-Fetch-Site: cross-site')"
@@ -536,6 +598,31 @@ fi
 no_tls_errors() { ! logs_contain "x509:" && ! logs_contain "tls: failed to verify"; }
 check "no certificate verification errors in the log" no_tls_errors
 check "frpc runs as the unprivileged user frpc ($(frpc_user || echo '?'))" test "$(frpc_user)" == frpc
+if [[ -n "${CA_FILE}" ]]; then
+    # The panel calls the frps certificate "verified" only after frpc has
+    # logged in with the pinned CA (reported by the frpc log watcher).
+    tls_verified() { [[ "$(status_field tls_verified)" == true && "$(status_field tls_login)" == ok ]]; }
+    check "status: tls_verified = true after frpc's login with the pinned CA" wait_for "${FRPC_TIMEOUT}" tls_verified
+fi
+
+# frpc must run with a scrubbed environment: it expands {{ .Envs.NAME }} in
+# its configuration file, so it must never see the add-on's SUPERVISOR_TOKEN.
+contenv_token="$(cexec cat /run/s6/container_environment/SUPERVISOR_TOKEN 2>/dev/null || true)"
+check "precondition: the add-on environment carries SUPERVISOR_TOKEN" \
+    test "${contenv_token}" == "${SUPERVISOR_DUMMY}"
+FRPC_ENV="$(frpc_env_names | tr '\n' ' ' || true)"
+FRPC_ENV="${FRPC_ENV% }"
+check "frpc environment readable (variables: ${FRPC_ENV:-none})" test -n "${FRPC_ENV}"
+env_has_no_token() { [[ -n "${FRPC_ENV}" && "${FRPC_ENV}" != *SUPERVISOR_TOKEN* ]]; }
+check "frpc environment has no SUPERVISOR_TOKEN" env_has_no_token
+env_scrubbed() {
+    local name
+    [[ -n "${FRPC_ENV}" ]] || return 1
+    for name in ${FRPC_ENV}; do
+        [[ "${name}" == PATH || "${name}" == HOME || "${name}" == TZ ]] || return 1
+    done
+}
+check "frpc environment is scrubbed (PATH, HOME, TZ only)" env_scrubbed
 if wait_for "${FRPC_TIMEOUT}" logs_contain "start proxy success"; then
     pass "frps accepted the http proxy for ${EXPECTED_HOST}"
 else
@@ -620,10 +707,36 @@ if [[ -n "${CA_FILE}" && "${TLS_NEGATIVE}" == 1 ]]; then
         wait_for "${FRPC_TIMEOUT}" tls_refused
     check "TLS pin enforced: no login with the wrong serverName" \
         test "$(log_count "login to server success")" == "${LOGINS_BEFORE}"
+    tls_login_failed() {
+        [[ "$(status_field tls_login)" == failed && "$(status_field tls_verified)" == false ]] \
+            && status_field tls_errors | grep -F "could not log in" >/dev/null
+    }
+    check "status: tls_login = failed, tls_verified = false, red banner (wrong serverName)" \
+        wait_for "${FRPC_TIMEOUT}" tls_login_failed
     cexec sh -c 'cp -p /data/.e2e-state.bak /data/frp-state.json && rm -f /data/.e2e-state.bak' \
         && cexec s6-svc -r /run/service/frpc
     relogged() { (( $(log_count "login to server success") > LOGINS_BEFORE )); }
     check "frpc logs in again after restoring serverName" wait_for "${FRPC_TIMEOUT}" relogged
+    check "frpc.toml restored" wait_for "${FRPC_TIMEOUT}" toml_back
+    check "status: tls_verified = true again" wait_for "${FRPC_TIMEOUT}" tls_verified
+
+    # Fail closed: a pinned CA that no longer passes validation, with no
+    # valid copy left, must stop frpc - never an unverified connection.
+    LOGINS_BEFORE="$(log_count "login to server success")"
+    # shellcheck disable=SC2016  # jq program
+    cexec sh -c 'cp -p /data/frp-state.json /data/.e2e-state.bak &&
+        jq ".server_ca_pem = \"garbage\"" /data/.e2e-state.bak >/data/frp-state.json &&
+        rm -f /data/frps-ca.pem' \
+        && cexec s6-svc -r /run/service/frpc
+    blocked() { logs_contain "frpc is NOT started" && ! frpc_running; }
+    check "fail closed: frpc not started without a valid CA" wait_for "${FRPC_TIMEOUT}" blocked
+    check "fail closed: no frpc.toml" file_absent /data/frpc.toml
+    check "status: tls_mode = blocked (got $(status_field tls_mode))" test "$(status_field tls_mode)" == blocked
+    check "fail closed: no login without a valid CA" \
+        test "$(log_count "login to server success")" == "${LOGINS_BEFORE}"
+    cexec sh -c 'cp -p /data/.e2e-state.bak /data/frp-state.json && rm -f /data/.e2e-state.bak' \
+        && cexec s6-svc -r /run/service/frpc
+    check "frpc logs in again after restoring the CA" wait_for "${FRPC_TIMEOUT}" relogged
     check "frpc.toml restored" wait_for "${FRPC_TIMEOUT}" toml_back
 elif [[ -n "${CA_FILE}" ]]; then
     skip "TLS pin enforced (wrong serverName refused)" "E2E_TLS_NEGATIVE=0"

@@ -79,7 +79,8 @@ RUN find /etc/s6-overlay/s6-rc.d /usr/lib/frp-mgr -path /usr/lib/frp-mgr/.venv -
         /etc/s6-overlay/s6-rc.d/frpc/finish \
         /etc/s6-overlay/s6-rc.d/frp-mgr/run \
         /etc/s6-overlay/s6-rc.d/frp-mgr/finish \
-    && /usr/lib/frp-mgr/.venv/bin/python3 -m compileall -q /usr/lib/frp-mgr/app.py /usr/lib/frp-mgr/config.py \
+    && /usr/lib/frp-mgr/.venv/bin/python3 -m compileall -q \
+        /usr/lib/frp-mgr/app.py /usr/lib/frp-mgr/config.py /usr/lib/frp-mgr/frpclog.py \
     && mkdir -p /data
 
 # OCI image labels

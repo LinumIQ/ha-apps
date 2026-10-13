@@ -19,16 +19,32 @@
 #          it too and keep waiting. Without a state file the renderer is not
 #          even started (cheap wait loop); the panel restarts this service
 #          after every pairing, so nothing is missed.
+#   exit 4 (the server requires a verified frps connection, but no valid CA
+#          is known) - fail closed: frpc is not started (never unverified);
+#          retried every 10 seconds, "Refresh tunnel config" fixes it.
 #   other  (render error, lock timeout) - frpc is not started from the
 #          previous file; retried every 10 seconds.
 #
 # frpc itself runs as the unprivileged system user `frpc` (s6-setuidgid). It
 # can read frpc.toml and the pinned frps CA (root:frpc 0640, written by the
 # renderer) but not the state file with the device token (root 0600).
+#
+# frpc gets a SCRUBBED environment (env -i: PATH, HOME and TZ only). This
+# script runs under with-contenv, i.e. with the add-on's full environment
+# incl. SUPERVISOR_TOKEN - and frpc renders its configuration file as a Go
+# template with the process environment available as {{ .Envs.NAME }}, so a
+# template in a config value would otherwise send that token to frps.
+#
+# frpc's console output goes through the log watcher (frpclog.py, run as a
+# coprocess): every line reaches the add-on log unchanged, and login results are recorded in
+# /run/frp-mgr/frpc-status.json for the panel (TLS "verified" only after a
+# successful login with the pinned CA; automatic refresh after repeated
+# login failures).
 # ==============================================================================
 readonly CONFIG_FILE="/data/frpc.toml"
 readonly STATE_FILE="/data/frp-state.json"
 readonly RENDERER="/usr/lib/frp-mgr/config.py"
+readonly WATCHER="/usr/lib/frp-mgr/frpclog.py"
 readonly PYTHON="/usr/lib/frp-mgr/.venv/bin/python3"
 readonly OPTIONS_FILE="/data/options.json"
 readonly FRPC_USER="frpc"
@@ -58,8 +74,19 @@ while true; do
         0)
             # Rendered (or already up to date) from a valid pairing.
             if [[ -s "${CONFIG_FILE}" ]]; then
-                bashio::log.info "Starting frpc (as user ${FRPC_USER})..."
-                exec s6-setuidgid "${FRPC_USER}" /usr/bin/frpc -c "${CONFIG_FILE}"
+                bashio::log.info "Starting frpc (as user ${FRPC_USER}, scrubbed environment)..."
+                frpc_env=(PATH=/usr/bin:/bin HOME=/data)
+                [[ -n "${TZ:-}" ]] && frpc_env+=("TZ=${TZ}")
+                # stdout/stderr -> the log watcher, a coprocess writing to the
+                # original stdout (fd duplication only: a process substitution
+                # would open /dev/fd/N, which the AppArmor profile denies).
+                exec 3>&1
+                coproc WATCH { exec "${PYTHON}" "${WATCHER}" >&3 3>&-; }
+                exec >&"${WATCH[1]}" 2>&1 3>&-
+                watch_out="${WATCH[0]}"
+                exec {watch_out}<&-
+                exec /usr/bin/env -i "${frpc_env[@]}" \
+                    /command/s6-setuidgid "${FRPC_USER}" /usr/bin/frpc -c "${CONFIG_FILE}"
             fi
             bashio::log.error "Renderer succeeded but ${CONFIG_FILE} is missing."
             ;;
@@ -69,6 +96,14 @@ while true; do
             if [[ "${waiting_logged}" == false ]]; then
                 bashio::log.info "Not paired yet - open the FRP Tunnel panel to pair this device."
                 waiting_logged=true
+            fi
+            ;;
+        4)
+            # No valid frps CA although the server requires verification:
+            # fail closed (the renderer has removed frpc.toml).
+            rm -f "${CONFIG_FILE}"
+            if [[ "${last_rc}" != "${rc}" ]]; then
+                bashio::log.error "frpc is NOT started: no valid certificate authority for the tunnel server (see the panel). Retrying every 10 s."
             fi
             ;;
         *)

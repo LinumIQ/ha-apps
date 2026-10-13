@@ -44,6 +44,11 @@
       <div class="flash flash-ok" role="status">{{ flash_ok }}</div>
       {% endif %}
 
+      {% for message in tls_errors %}
+      <div class="flash flash-error" role="alert">
+        <strong>Tunnel server verification failed:</strong>&nbsp;{{ message }}
+      </div>
+      {% endfor %}
       {% for message in tls_warnings %}
       <div class="flash flash-warn" role="alert">
         <strong>Tunnel server not fully verified:</strong>&nbsp;{{ message }}
@@ -289,7 +294,14 @@
             <dd class="meta-list__value">
               <code>{{ server_addr }}:{{ server_port }}</code>
               {% if tls_verified %}
-              (TLS, certificate verified for <code>{{ server_name }}</code>{% for ca in server_ca %}{% if loop.first %}; CA {% else %}, {% endif %}{{ ca.subject }}{% if ca.not_after %} until {{ ca.not_after }}{% endif %}{% endfor %})
+              (TLS, certificate verified for <code>{{ server_name }}</code>{% for ca in server_ca %}{% if loop.first %}; CA {% else %}, {% endif %}{{ ca.subject }}{% if ca.not_after %} until {{ ca.not_after }}{% endif %}{% endfor %}{% if frpc_logged_in_at %}; frpc logged in {{ frpc_logged_in_at }}{% endif %})
+              {% elif tls_mode == "verified" and tls_login == "failed" %}
+              (TLS, <span class="status-error">login with the CA pinned for <code>{{ server_name }}</code> failed</span>)
+              {% elif tls_mode == "verified" %}
+              (TLS, CA pinned for <code>{{ server_name }}</code> -
+              <span class="status-warn">waiting for frpc to log in with it</span>)
+              {% elif tls_mode == "blocked" %}
+              (<span class="status-error">frpc not started: no valid CA for the tunnel server</span>)
               {% else %}
               (TLS, <span class="status-warn">certificate not verified</span>)
               {% endif %}
@@ -299,6 +311,13 @@
             <dt class="meta-list__label">Forwarding</dt>
             <dd class="meta-list__value">
               {{ local_host or "homeassistant" }}:{{ local_port or "8123" }}
+            </dd>
+          </div>
+          <div class="meta-list__row">
+            <dt class="meta-list__label">Config refresh</dt>
+            <dd class="meta-list__value">
+              automatic (start-up, every 12-24 h, after repeated login failures)
+              {%- if auto_refresh.at %}; last {{ auto_refresh.at }}: {{ auto_refresh.outcome }}{% endif %}
             </dd>
           </div>
         </dl>

@@ -1,6 +1,7 @@
 ---
-# Keeps the SHA-pinned GitHub Actions current (each pin carries a version
-# comment that Dependabot updates together with the SHA).
+# Keeps the SHA-pinned GitHub Actions, the panel's hash-pinned Python
+# dependencies and the Dockerfile base images current. Each Actions pin carries
+# a version comment that Dependabot updates together with the SHA.
 version: 2
 updates:
   - package-ecosystem: "github-actions"
@@ -9,3 +10,26 @@ updates:
       interval: "weekly"
     commit-message:
       prefix: "ci"
+
+  # frp-tunnel/requirements.in (direct pins) -> requirements.txt
+  # (pip-compile --generate-hashes; Dependabot re-runs pip-compile with the
+  # options recorded in the file's header, so the hashes stay complete).
+  - package-ecosystem: "pip"
+    directory: "/frp-tunnel"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "deps"
+
+  # FROM lines with a literal image (e.g. caddy-mtls' golang builder stage).
+  # The Home Assistant base image comes in through build.yaml /
+  # ARG BUILD_FROM, which Dependabot does not resolve - bump it by hand in
+  # build.yaml, the Dockerfiles' ARG defaults and the CI/E2E build commands.
+  - package-ecosystem: "docker"
+    directories:
+      - "/frp-tunnel"
+      - "/caddy-mtls"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "deps"

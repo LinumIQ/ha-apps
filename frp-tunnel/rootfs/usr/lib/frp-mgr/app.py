@@ -3,7 +3,9 @@ FRP Tunnel - device pairing management web UI.
 
 Runs on the Home Assistant ingress port (8099), only reachable via the
 Supervisor's ingress proxy at 172.30.32.2 (IngressGuard: client IP from the
-TCP peer, never from headers; every POST must also be same-origin - CSRF).
+TCP peer, never from headers - not even loopback by default, so the
+unprivileged frpc user cannot drive the panel; every POST must also be
+same-origin - CSRF).
 Provides a browser-based device-authorization pairing flow so users never
 touch tokens or subdomains in the add-on configuration.
 
@@ -31,6 +33,14 @@ config" or re-pairing picks up changed server values. Precedence of the
 frpc settings: explicitly set add-on option > server-provided value >
 built-in default (details in config.py).
 
+A background thread refreshes the tunnel configuration exactly like the
+"Refresh tunnel config" button: at start-up, every 12-24 h (random jitter;
+this also keeps the device's ``last_used_at`` fresh against the server's
+inactivity expiry) and after repeated frpc login failures with the current
+configuration (CA or token rotated server-side), as reported by the frpc log
+watcher (frpclog.py). The panel shows the frps certificate as "verified" only
+after frpc has logged in with the pinned CA.
+
 Tokens (device token, frp tunnel token) are NEVER logged or returned by
 any endpoint of this panel; backend text is sanitised (config.sanitize_text)
 before it reaches a log line or a banner, and the panel never follows HTTP
@@ -43,9 +53,11 @@ import ipaddress
 import json
 import logging
 import os
+import random
 import re
 import subprocess
 import threading
+import time
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional, Tuple
@@ -65,6 +77,7 @@ from starlette.staticfiles import StaticFiles
 from starlette.templating import Jinja2Templates
 
 import config as cfg
+import frpclog
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -94,6 +107,22 @@ BLOCKING_OPTIONS = ("app_base", "options.json")
 
 FRPC_SERVICE = "/run/service/frpc"
 USER_AGENT = "linumiq-frp-tunnel-addon"
+#: Status file of the frpc log watcher (frpclog.py).
+FRPC_STATUS = frpclog.default_status_path()
+#: Largest backend response body read (the biggest legitimate one, a tunnel
+#: response with a CA bundle, is < 70 KiB).
+MAX_RESPONSE_BYTES = 256 * 1024
+
+#: Automatic tunnel refresh: periodic interval (seconds, uniformly random in
+#: this range), retry delay after a failed one, and the frpc login-failure
+#: trigger (consecutive failures with the current configuration; at most
+#: once per backoff interval, doubling from the first to the second value
+#: while the failures continue).
+AUTO_REFRESH_INTERVAL = (12 * 3600, 24 * 3600)
+AUTO_REFRESH_RETRY = 3600
+LOGIN_FAILURE_THRESHOLD = 3
+LOGIN_FAILURE_BACKOFF = (600, 6 * 3600)
+AUTO_REFRESH_TICK = 30
 
 
 def _parse_allowed_clients(raw: str) -> list:
@@ -110,12 +139,15 @@ def _parse_allowed_clients(raw: str) -> list:
     return nets
 
 
-# Home Assistant Supervisor's ingress proxy IP (+ loopback for the s6
-# health check and local tooling). Refuse anything else. The container
-# environment is not user-configurable under Supervisor; the variable only
-# exists for running the image outside Supervisor (E2E tests).
+# Home Assistant Supervisor's ingress proxy - and nothing else by default.
+# Loopback is deliberately NOT allowed: the unprivileged frpc user (and any
+# other process in the container) could otherwise drive the panel
+# (refresh, unpair, ...) via 127.0.0.1. The container environment is not
+# user-configurable under Supervisor; the variable only exists for running
+# the image outside Supervisor (E2E harness / smoke test: 127.0.0.1).
+DEFAULT_ALLOWED_INGRESS_IPS = "172.30.32.2"
 ALLOWED_CLIENT_NETS = _parse_allowed_clients(
-    os.environ.get("ALLOWED_INGRESS_IPS", "172.30.32.2,127.0.0.1")
+    os.environ.get("ALLOWED_INGRESS_IPS", DEFAULT_ALLOWED_INGRESS_IPS)
 )
 
 # Early-feedback copy of the server's built-in reserved names (UX only).
@@ -192,9 +224,11 @@ def _http_json(
 ) -> Tuple[int, Any]:
     """JSON request. Returns (status, parsed body or text).
 
-    Raises BackendUnavailable on network errors and on redirects. Never logs
-    request bodies or headers (they carry device codes / tokens); error texts
-    are sanitised with the bearer token redacted.
+    Raises BackendUnavailable on network errors, on redirects and on
+    response bodies larger than MAX_RESPONSE_BYTES (error bodies are cut to
+    that size instead). Never logs request bodies or headers (they carry
+    device codes / tokens); error texts are sanitised with the bearer token
+    redacted.
     """
     secrets = (bearer,) if bearer else ()
     host = urlsplit(url).netloc
@@ -206,7 +240,7 @@ def _http_json(
     if bearer:
         # A token with spaces/controls would end up in an exception message
         # (urllib echoes invalid header values) - refuse it without echoing.
-        if cfg.normalize_token(bearer) is None:
+        if cfg.normalize_device_token(bearer) is None:
             LOG.error("Refusing to send a malformed device token (stored state corrupt?).")
             raise BackendUnavailable("The stored device token is malformed. Unpair and pair again.")
         headers["Authorization"] = f"Bearer {bearer}"
@@ -216,8 +250,14 @@ def _http_json(
     req = URLRequest(url, data=data, headers=headers, method=method)
     try:
         with _OPENER.open(req, timeout=timeout) as resp:  # noqa: S310 (https/http only)
-            raw = resp.read().decode("utf-8", errors="replace")
+            payload = resp.read(MAX_RESPONSE_BYTES + 1)
             code = resp.status
+        if len(payload) > MAX_RESPONSE_BYTES:
+            LOG.error("HTTP %s %s: response larger than %d bytes - rejected.", method,
+                      cfg.sanitize_text(url, 200), MAX_RESPONSE_BYTES)
+            raise BackendUnavailable(f"{host} sent an oversized response (more than "
+                                     f"{MAX_RESPONSE_BYTES // 1024} KiB); it was rejected.")
+        raw = payload.decode("utf-8", errors="replace")
     except HTTPError as exc:
         code = exc.code
         if 300 <= code < 400:
@@ -228,7 +268,7 @@ def _http_json(
                 "Check the app_base option."
             ) from None
         try:
-            raw = exc.read().decode("utf-8", errors="replace")
+            raw = exc.read(MAX_RESPONSE_BYTES).decode("utf-8", errors="replace")
         except Exception:  # pragma: no cover - defensive
             raw = ""
     except (URLError, OSError, http.client.HTTPException) as exc:
@@ -274,7 +314,10 @@ def _state() -> Dict[str, Any]:
 
 
 def _settings(state: Optional[Dict[str, Any]] = None) -> cfg.Settings:
-    return cfg.effective_settings(OPTIONS, _state() if state is None else state)
+    """Effective settings as the renderer computes them (incl. the fallback
+    to the last valid CA in /data/frps-ca.pem)."""
+    return cfg.effective_settings(OPTIONS, _state() if state is None else state,
+                                  cfg.read_ca_file(PATHS))
 
 
 def _pairing() -> Dict[str, Any]:
@@ -300,8 +343,18 @@ def _clear_pairing() -> None:
 
 
 def _render_and_restart(force_restart: bool = False) -> str:
-    """Render frpc.toml from the state; restart frpc when it changed."""
-    result, settings = cfg.render_from_disk(PATHS, OPTIONS)
+    """Render frpc.toml from the state; restart frpc when it changed.
+
+    Raises cfg.CAUnusableError when no valid frps CA is known although the
+    server requires verification: frpc.toml is gone then and frpc is
+    restarted into its run script, which refuses to start it (fail closed).
+    """
+    try:
+        result, settings = cfg.render_from_disk(PATHS, OPTIONS)
+    except cfg.CAUnusableError as exc:
+        LOG.error("%s.", cfg.sanitize_text(exc))
+        _restart_frpc()
+        raise
     if settings is not None:
         LOG.info("frpc.toml %s: %s", result, settings.describe())
     if result == cfg.RenderResult.RENDERED or force_restart:
@@ -382,6 +435,7 @@ def _fetch_tunnel(device_token: str) -> Tuple[str, str]:
     """GET /api/device/tunnel and apply it.
 
     Returns (outcome, message) with outcome one of: "updated", "unchanged",
+    "blocked" (state updated, but no valid frps CA: frpc is not started),
     "no_tunnel", "unauthorized", "error". Caller must hold _locked().
     """
     code, body = _http_json("GET", _backend_url("/api/device/tunnel"), bearer=device_token)
@@ -391,7 +445,10 @@ def _fetch_tunnel(device_token: str) -> Tuple[str, str]:
         except cfg.TunnelResponseError as exc:
             LOG.error("Tunnel response rejected: %s", exc)
             return "error", str(exc)
-        result = _render_and_restart()
+        try:
+            result = _render_and_restart()
+        except cfg.CAUnusableError:
+            return "blocked", BLOCKED_MESSAGE
         return ("updated" if result == cfg.RenderResult.RENDERED else "unchanged"), ""
     if code == 404:
         return "no_tunnel", "Device approved but no tunnel exists yet. Choose a subdomain."
@@ -405,26 +462,143 @@ def _fetch_tunnel(device_token: str) -> Tuple[str, str]:
     return "error", f"Tunnel fetch failed: {msg}"
 
 
-def _startup_refresh() -> None:
-    """Best effort: pick up server-side changes (e.g. a new frps port or
-    domain_base, or a token rotated from the dashboard) on add-on start."""
+BLOCKED_MESSAGE = (
+    "frpc is not started: no valid certificate authority (CA) of the tunnel server is known "
+    "although the LinumIQ server requires a verified connection. The add-on never falls back "
+    "to an unverified connection; click 'Refresh tunnel config' to fetch the current CA."
+)
+
+#: What the background refresh did last (shown in the panel / status API).
+_AUTO_REFRESH_STATUS: Dict[str, Any] = {}
+
+
+class AutoRefresh:
+    """Schedule of the background tunnel refresh (monotonic seconds)."""
+
+    def __init__(self, now: float, rng: random.Random) -> None:
+        self.rng = rng
+        self.next_periodic = now  # the first run is the start-up refresh
+        self.first = True
+        self.backoff = LOGIN_FAILURE_BACKOFF[0]
+        # The start-up refresh covers the first backoff interval as well.
+        self.next_failure_refresh = now + self.backoff
+
+    def due(self, now: float, login_failures: int) -> Optional[str]:
+        """The reason a refresh is due now ("startup", "periodic",
+        "login-failures"), else None."""
+        if now >= self.next_periodic:
+            return "startup" if self.first else "periodic"
+        if login_failures >= LOGIN_FAILURE_THRESHOLD and now >= self.next_failure_refresh:
+            return "login-failures"
+        return None
+
+    def logged_in(self) -> None:
+        """frpc logged in with the current configuration: reset the backoff."""
+        self.backoff = LOGIN_FAILURE_BACKOFF[0]
+
+    def done(self, reason: str, now: float, outcome: str) -> None:
+        self.first = False
+        if reason == "login-failures":
+            self.next_failure_refresh = now + self.backoff
+            self.backoff = min(self.backoff * 2, LOGIN_FAILURE_BACKOFF[1])
+        if outcome == "error":  # backend unreachable etc.: retry sooner
+            self.next_periodic = now + AUTO_REFRESH_RETRY
+        else:
+            self.next_periodic = now + self.rng.uniform(*AUTO_REFRESH_INTERVAL)
+
+
+def _auto_refresh(reason: str) -> Tuple[str, str]:
+    """Re-fetch and apply the tunnel configuration exactly like the
+    "Refresh tunnel config" button. Never raises; returns (outcome, message)
+    as _fetch_tunnel, or "skipped" without a device token."""
     try:
         with _locked():
             state = _state()
             device_token = state.get("device_token")
-            if not device_token or not cfg.is_paired(state):
-                return
+            if not device_token:
+                return "skipped", "not paired"
             outcome, message = _fetch_tunnel(device_token)
-    except (BackendUnavailable, FlashError) as exc:
-        LOG.warning("Start-up tunnel refresh skipped: %s", cfg.sanitize_text(exc))
-        return
+    except FlashError as exc:
+        outcome, message = "error", exc.message
+    except BackendUnavailable as exc:
+        outcome, message = "error", cfg.sanitize_text(exc)
     except Exception as exc:  # pragma: no cover - never crash the panel
-        LOG.warning("Start-up tunnel refresh failed: %s", cfg.sanitize_text(exc))
-        return
+        outcome, message = "error", cfg.sanitize_text(exc) or type(exc).__name__
     if outcome in ("updated", "unchanged"):
-        LOG.info("Start-up tunnel refresh: %s", outcome)
+        LOG.info("Automatic tunnel refresh (%s): %s", reason, outcome)
     else:
-        LOG.warning("Start-up tunnel refresh: %s - %s", outcome, message)
+        LOG.warning("Automatic tunnel refresh (%s): %s - %s", reason, outcome, cfg.sanitize_text(message))
+    return outcome, message
+
+
+def _frpc_login(status: Dict[str, Any], fingerprint: Optional[str]) -> Dict[str, Any]:
+    """frpc's login state with the CURRENT configuration, from the log
+    watcher's status (ignored unless its fingerprint is that of the current
+    frpc.toml + CA). ``state``: "ok" (logged in), "failed" (logins reached the
+    server and failed since the last success: TLS verification,
+    authentication), "unreachable" (network errors only), "pending" or
+    "unknown". ``verified``: frpc has logged in with this configuration and
+    no login failed since."""
+    def count(value: Any) -> int:
+        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+    if not fingerprint or not status or status.get("fingerprint") != fingerprint:
+        return {"state": "unknown", "verified": False, "login_failures": 0, "last_error": "",
+                "logged_in_at": ""}
+    failures = count(status.get("login_failures"))
+    network = count(status.get("network_failures"))
+    logged_in_at = status.get("logged_in_at")
+    if not isinstance(logged_in_at, (int, float)) or isinstance(logged_in_at, bool):
+        logged_in_at = None
+    # A successful login resets both counters, so they tell the state even
+    # while frpc is between two attempts ("connecting").
+    if status.get("state") == "connected":
+        state = "ok"
+    elif failures:
+        state = "failed"
+    elif network:
+        state = "unreachable"
+    else:
+        state = "ok" if logged_in_at else "pending"
+    return {
+        "state": state,
+        "verified": logged_in_at is not None and not failures,
+        "login_failures": failures,
+        "last_error": cfg.sanitize_text(status.get("last_error") or "", 160),
+        "logged_in_at": (time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(logged_in_at))
+                         if logged_in_at is not None else ""),
+    }
+
+
+def _current_login() -> Dict[str, Any]:
+    return _frpc_login(frpclog.read_status(FRPC_STATUS), cfg.config_fingerprint(PATHS))
+
+
+def _auto_refresh_tick(schedule: AutoRefresh, now: float) -> Optional[str]:
+    """One iteration of the background thread; returns the outcome of a
+    refresh it ran, else None."""
+    login = _current_login()
+    if login["state"] == "ok":
+        schedule.logged_in()
+    reason = schedule.due(now, login["login_failures"])
+    if reason is None:
+        return None
+    outcome, message = _auto_refresh(reason)
+    schedule.done(reason, now, outcome)
+    _AUTO_REFRESH_STATUS.update(at=cfg.utc_now(), reason=reason, outcome=outcome,
+                                message=cfg.sanitize_text(message, 200))
+    return outcome
+
+
+def _auto_refresh_loop(stop: threading.Event) -> None:
+    schedule = AutoRefresh(time.monotonic(), random.SystemRandom())
+    while True:
+        try:
+            _auto_refresh_tick(schedule, time.monotonic())
+        except Exception as exc:  # pragma: no cover - never let the thread die
+            LOG.warning("Automatic tunnel refresh failed: %s", cfg.sanitize_text(exc))
+        if stop.wait(AUTO_REFRESH_TICK):
+            return
 
 
 # ---------------------------------------------------------------------------
@@ -550,8 +724,12 @@ async def _lifespan(_app: Starlette):
         _BASE.sources.get("app_base"),
         _settings().describe(),
     )
-    threading.Thread(target=_startup_refresh, name="startup-refresh", daemon=True).start()
-    yield
+    stop = threading.Event()
+    threading.Thread(target=_auto_refresh_loop, args=(stop,), name="auto-refresh", daemon=True).start()
+    try:
+        yield
+    finally:
+        stop.set()
 
 
 async def _flash_error_handler(request: Request, exc: Exception) -> Response:
@@ -597,11 +775,18 @@ def _redirect_home(
     return RedirectResponse(url=f"{ingress_prefix}/{qs}", status_code=status.HTTP_303_SEE_OTHER)
 
 
-def _tls_warnings(settings: cfg.Settings, state: Dict[str, Any], ca: list) -> list:
-    """User-facing warnings about the frps server verification."""
-    warnings = []
+def _tls_banners(settings: cfg.Settings, state: Dict[str, Any], ca: list,
+                 login: Dict[str, Any]) -> Tuple[list, list]:
+    """User-facing ``(errors, warnings)`` about the frps server verification
+    (errors: red - the tunnel is down or not verified although it must be)."""
+    errors: list = []
+    warnings: list = []
     mode = settings.tls_mode
-    if mode == cfg.TLS_UNVERIFIED:
+    if mode == cfg.TLS_BLOCKED:
+        errors.append(BLOCKED_MESSAGE + (
+            " The pinned CA no longer passes validation." if settings.ca_problem == cfg.CA_INVALID
+            else " The server sent an invalid CA."))
+    elif mode == cfg.TLS_UNVERIFIED:
         warnings.append(
             "The LinumIQ server did not provide the certificate authority of the tunnel "
             "server, so frpc cannot verify the server it connects to: the connection is "
@@ -613,6 +798,12 @@ def _tls_warnings(settings: cfg.Settings, state: Dict[str, Any], ca: list) -> li
             "Server certificate verification is turned off (add-on option verify_server: "
             "false). The connection is encrypted but the tunnel server is not authenticated."
         )
+    if settings.ca_problem == cfg.CA_FALLBACK and mode == cfg.TLS_VERIFIED:
+        warnings.append(
+            "The certificate authority stored in the pairing state failed validation; frpc keeps "
+            "verifying the tunnel server against the last valid one (/data/frps-ca.pem). Click "
+            "'Refresh tunnel config' to fetch the current one."
+        )
     note = state.get("server_ca_note")
     if note == "missing" and mode == cfg.TLS_VERIFIED:
         warnings.append(
@@ -620,18 +811,46 @@ def _tls_warnings(settings: cfg.Settings, state: Dict[str, Any], ca: list) -> li
             "The add-on keeps verifying against the last known one; if frpc cannot connect "
             "('certificate verify failed'), see the add-on documentation."
         )
-    elif note == "invalid":
+    elif note == "invalid" and mode != cfg.TLS_BLOCKED:
         warnings.append(
             "The LinumIQ server sent an invalid certificate authority for the tunnel server; "
             "it was ignored"
             + (" and the last known one stays pinned." if mode == cfg.TLS_VERIFIED else ".")
         )
-    if mode == cfg.TLS_VERIFIED and any(entry["expired"] for entry in ca):
+    elif note == "expired":
         warnings.append(
-            "The pinned certificate authority of the tunnel server has expired; frpc will "
-            "fail to connect. Click 'Refresh tunnel config' to fetch the current one."
+            "The LinumIQ server sent a certificate authority for the tunnel server that is "
+            "expired or not yet valid; it was ignored and the last known one stays pinned."
         )
-    return warnings
+    if mode == cfg.TLS_VERIFIED:
+        if any(entry["expired"] for entry in ca) or any(entry["not_yet_valid"] for entry in ca):
+            dead = all(entry["expired"] or entry["not_yet_valid"] for entry in ca)
+            (errors if dead else warnings).append(
+                "The pinned certificate authority of the tunnel server "
+                + ("has expired or is not yet valid; frpc cannot log in." if dead
+                   else "contains a certificate that has expired or is not yet valid.")
+                + " The add-on re-fetches the configuration automatically after repeated login "
+                "failures; click 'Refresh tunnel config' to fetch the current one now."
+            )
+        if login["state"] == "failed":
+            errors.append(
+                "frpc could not log in to the tunnel server with the pinned certificate authority"
+                + (f" ({login['last_error']})" if login["last_error"] else "")
+                + ". If the LinumIQ server rotated it, 'Refresh tunnel config' fetches the new one "
+                "(the add-on also does this automatically after repeated failures)."
+            )
+    if login["state"] == "failed" and mode != cfg.TLS_VERIFIED:
+        warnings.append(
+            "frpc could not log in to the tunnel server"
+            + (f" ({login['last_error']})" if login["last_error"] else "") + "."
+        )
+    elif login["state"] == "unreachable":
+        warnings.append(
+            "frpc cannot reach the tunnel server"
+            + (f" ({login['last_error']})" if login["last_error"] else "")
+            + "; it keeps retrying."
+        )
+    return errors, warnings
 
 
 def _view_model() -> Dict[str, Any]:
@@ -643,9 +862,16 @@ def _view_model() -> Dict[str, Any]:
     settings = _settings(state)
     subdomain = state.get("subdomain", "") if paired else ""
     public_host = cfg.public_hostname(settings, subdomain) if subdomain else ""
-    verified = settings.tls_mode == cfg.TLS_VERIFIED
-    ca = cfg.describe_ca(settings.ca_pem) if verified else []
+    pinned = settings.tls_mode == cfg.TLS_VERIFIED
+    ca = cfg.describe_ca(settings.ca_pem) if pinned else []
     has_device = bool(state.get("device_token"))
+    login = _current_login() if paired else _frpc_login({}, None)
+    # Never echo a token, should frps or frpc ever put one into an error.
+    login["last_error"] = cfg.sanitize_text(
+        login["last_error"], 160, (state.get("token"), state.get("device_token")))
+    # "verified" only once frpc has logged in with exactly this pinned CA.
+    verified = pinned and login["verified"]
+    tls_errors, tls_warnings = _tls_banners(settings, state, ca, login) if paired else ([], [])
     return {
         "paired": paired,
         "approved_no_tunnel": bool(state.get("device_token")) and not paired,
@@ -666,9 +892,13 @@ def _view_model() -> Dict[str, Any]:
         "tls": True,
         "tls_mode": settings.tls_mode,
         "tls_verified": verified,
-        "server_name": settings.server_name if verified else "",
+        "tls_login": login["state"],
+        "frpc_logged_in_at": login["logged_in_at"],
+        "server_name": settings.server_name if pinned else "",
         "server_ca": ca,
-        "tls_warnings": _tls_warnings(settings, state, ca) if paired else [],
+        "tls_errors": tls_errors,
+        "tls_warnings": tls_warnings,
+        "auto_refresh": dict(_AUTO_REFRESH_STATUS),
         "account_email_masked": (
             cfg.normalize_masked_email(state.get("account_email_masked")) or "" if has_device else ""
         ),
@@ -764,7 +994,7 @@ def pair_poll() -> Dict[str, Any]:
             device_token = body.get("device_token") if isinstance(body, dict) else None
             if not device_token:
                 return {"status": "error", "error": "No device_token in response."}
-            if cfg.normalize_token(device_token) is None:
+            if cfg.normalize_device_token(device_token) is None:
                 # Never stored or sent as a header: it could inject headers.
                 _clear_pairing()
                 LOG.error("Backend returned a malformed device token (rejected).")
@@ -782,7 +1012,9 @@ def pair_poll() -> Dict[str, Any]:
             except BackendUnavailable as exc:
                 return {"status": "no_tunnel",
                         "error": f"{cfg.sanitize_text(exc)}. Use 'Refresh' to retry."}
-            if outcome in ("updated", "unchanged"):
+            if outcome in ("updated", "unchanged", "blocked"):
+                # "blocked": paired, but frpc is not started (no valid CA);
+                # the panel page shows why.
                 state = _state()
                 LOG.info("Pairing complete: subdomain=%s", state.get("subdomain"))
                 return {"status": "paired", "subdomain": state.get("subdomain")}
@@ -822,7 +1054,7 @@ def tunnel_refresh(request: Request) -> Response:
         return _redirect_home(request, ok="Tunnel configuration updated; frpc restarted.")
     if outcome == "unchanged":
         return _redirect_home(request, ok="Tunnel configuration is up to date.")
-    raise FlashError(message)
+    raise FlashError(message)  # incl. "blocked"
 
 
 def subdomain_change(request: Request, subdomain: str) -> Response:
@@ -845,7 +1077,10 @@ def subdomain_change(request: Request, subdomain: str) -> Response:
                 new_state = _apply_tunnel(state, body)
             except cfg.TunnelResponseError as exc:
                 raise FlashError(str(exc)) from None
-            _render_and_restart(force_restart=True)
+            try:
+                _render_and_restart(force_restart=True)
+            except cfg.CAUnusableError:
+                raise FlashError(BLOCKED_MESSAGE) from None
             host = cfg.public_hostname(_settings(new_state), new_state["subdomain"])
             LOG.info("Subdomain changed to %s", new_state["subdomain"])
             return _redirect_home(request, ok=f"Subdomain changed to {host}")

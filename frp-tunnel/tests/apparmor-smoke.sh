@@ -10,8 +10,9 @@
 # processes or the network without a LinumIQ backend: s6-overlay start-up,
 # bashio, the panel (health, status, a same-origin POST), the renderer writing
 # frpc.toml + the pinned frps CA (root:frpc 0640), frpc started as user frpc
-# (it fails to connect - nothing listens - which is expected), unpair and a
-# clean `docker stop`. Fails on any AppArmor denial for the profile.
+# (it fails to connect - nothing listens - which is expected) with its log
+# watcher, unpair and a clean `docker stop`. Fails on any AppArmor denial for
+# the profile.
 # Env: DOCKER (default docker).
 # ==============================================================================
 # Helper functions are called indirectly (check, wait_for, trap).
@@ -124,6 +125,11 @@ check "frpc.toml + frps-ca.pem are 640 root:frpc" \
 # 127.0.0.1:7000 is closed: frpc must get as far as connecting (config, CA
 # file and DNS-free address all readable as user frpc).
 check "frpc read its config and tried to connect" wait_for 30 logs_contain "connection refused"
+# The log watcher (coprocess of the frpc service) records it for the panel.
+watcher_saw_it() {
+    [[ "$(cexec jq -r '"\(.state) \(.network_failures)"' /run/frp-mgr/frpc-status.json 2>/dev/null)" == "failed "[1-9]* ]]
+}
+check "frpc log watcher recorded the failed connection" wait_for 30 watcher_saw_it
 check "no 'permission denied' in the log" logs_lack "ermission denied"
 code="$(http_code GET /)"
 check "panel page renders (paired, pinned CA; got ${code})" test "${code}" == 200
