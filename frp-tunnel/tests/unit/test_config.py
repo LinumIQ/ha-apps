@@ -15,7 +15,8 @@ import stat
 import sys
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from unittest import mock
 
 FRP_MGR = Path(
     os.environ.get("FRP_MGR_DIR")
@@ -24,6 +25,7 @@ FRP_MGR = Path(
 sys.path.insert(0, str(FRP_MGR))
 
 import config as cfg  # noqa: E402
+from tls_fixtures import CA1, CA2, EXPIRED_CA, LEAF  # noqa: E402
 
 TOKEN = "a" * 64
 OTHER_TOKEN = "b" * 64
@@ -80,6 +82,66 @@ class ValidationTests(unittest.TestCase):
             self.assertIsNone(cfg.normalize_base_url(bad), repr(bad))
 
 
+class CaPemTests(unittest.TestCase):
+    """normalize_ca_pem: only parseable X.509 CA certificates are pinned."""
+
+    def test_accepts_ca_certificates_and_normalises(self):
+        self.assertEqual(cfg.normalize_ca_pem(CA1), CA1)
+        self.assertEqual(cfg.normalize_ca_pem(CA1 + CA2), CA1 + CA2)  # order kept
+        # CRLF, indentation, blank lines and a missing final newline are fine;
+        # the result is canonical PEM.
+        messy = "\n\n" + CA1.replace("\n", "\r\n").replace("MII", "  MII") + "\n" + CA2.rstrip("\n")
+        self.assertEqual(cfg.normalize_ca_pem(messy), CA1 + CA2)
+        self.assertEqual(cfg.normalize_ca_pem(CA1 + CA1), CA1)  # duplicates dropped
+        self.assertEqual(cfg.normalize_ca_pem(EXPIRED_CA), EXPIRED_CA)  # validity is not judged here
+
+    def test_rejects_everything_else(self):
+        body = "".join(CA1.splitlines()[1:-1])
+        bad_der = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"
+        for bad in (
+            LEAF,                                   # not a CA
+            CA1 + LEAF,                             # one non-CA spoils the bundle
+            CA1.replace("CERTIFICATE", "PRIVATE KEY"),
+            CA1 + "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n",
+            CA1.replace("END CERTIFICATE", "END X509 CRL"),
+            "junk\n" + CA1,
+            CA1 + "trailing junk",
+            CA1 + "\nx\n" + CA2,
+            CA1.replace(body[10:14], "!!!!"),       # not base64
+            CA1.replace(body[:8], "AAAAAAAA"),      # base64, but broken DER
+            bad_der,
+            "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n",
+            body, "", "   ", None, 42, [CA1], b"x",
+            CA1 + " " * cfg.CA_PEM_MAX_CHARS,       # too large
+        ):
+            self.assertIsNone(cfg.normalize_ca_pem(bad), repr(bad)[:80])
+
+    def test_bundle_size_limit(self):
+        with mock.patch.object(cfg, "CA_MAX_CERTS", 1):
+            self.assertIsNone(cfg.normalize_ca_pem(CA1 + CA2))
+            self.assertEqual(cfg.normalize_ca_pem(CA1), CA1)
+
+    def test_describe_ca(self):
+        info = cfg.describe_ca(CA1 + EXPIRED_CA)
+        self.assertEqual(sorted(i["subject"] for i in info), ["Expired test CA", "Test frps CA 1"])
+        by_subject = {i["subject"]: i for i in info}
+        self.assertEqual(by_subject["Test frps CA 1"]["not_after"], "2125-12-31")
+        self.assertFalse(by_subject["Test frps CA 1"]["expired"])
+        self.assertTrue(by_subject["Expired test CA"]["expired"])
+        self.assertEqual(cfg.describe_ca(LEAF), [])
+        self.assertEqual(cfg.describe_ca(None), [])
+
+
+class MaskedEmailTests(unittest.TestCase):
+    def test_masked_email(self):
+        for ok in ("g***@linumiq.com", "j***.d***@e***.co.uk", "a@b.c", "x+tag***@sub-domain.example"):
+            self.assertEqual(cfg.normalize_masked_email(ok), ok)
+        self.assertEqual(cfg.normalize_masked_email(" g***@linumiq.com\n"), "g***@linumiq.com")
+        for bad in ("", "no-at-sign", "a@@b.c", "<b>x</b>@e.com", "a b@c.d", "a@b.c\r\nX: y",
+                    "g***@linumiq.com‮", "a@" + "b" * 254, None, 3):
+            self.assertIsNone(cfg.normalize_masked_email(bad), repr(bad))
+
+
 class LogLevelTests(unittest.TestCase):
     def test_addon_levels_map_to_frpc_levels(self):
         expected = {"trace": "trace", "debug": "debug", "info": "info", "notice": "info",
@@ -116,6 +178,16 @@ class OptionsTests(unittest.TestCase):
 
     def test_non_mapping(self):
         self.assertEqual(cfg.parse_options([]), {})
+
+    def test_verify_server_option(self):
+        self.assertEqual(cfg.parse_options({"verify_server": False}), {"verify_server": False})
+        self.assertEqual(cfg.parse_options({"verify_server": True}), {"verify_server": True})
+        self.assertEqual(cfg.parse_options({"verify_server": "false"}), {"verify_server": False})
+        self.assertEqual(cfg.parse_options({"verify_server": None}), {})  # unset -> default (on)
+        with self.assertLogs("frp-mgr.config", "ERROR"):
+            opts, errors = cfg.parse_options_report({"verify_server": "nope"})
+        self.assertEqual(opts, {})  # invalid -> ignored -> verification stays on
+        self.assertIn("true or false", errors["verify_server"])
 
     def test_report_lists_invalid_options_with_hints(self):
         raw = {"log_level": "warn", "server_addr": "my_ha\nhost", "domain_base": "x",
@@ -327,6 +399,58 @@ class TunnelResponseTests(unittest.TestCase):
         for key in cfg.SERVER_KEYS:
             self.assertNotIn(key, state)
 
+    def test_v22_tls_and_account_fields(self):
+        body = {"subdomain": "home", "token": TOKEN, "server_addr": "linumiq.net",
+                "server_name": "FRPS.linumiq.net", "server_ca_pem": CA1.replace("\n", "\r\n"),
+                "account_email_masked": "g***@linumiq.com"}
+        state, warnings = cfg.apply_tunnel_response({"device_token": "dt"}, body)
+        self.assertEqual(warnings, [])
+        self.assertEqual(state["server_ca_pem"], CA1)  # normalised
+        self.assertEqual(state["server_name"], "frps.linumiq.net")
+        self.assertEqual(state["account_email_masked"], "g***@linumiq.com")
+        self.assertNotIn("server_ca_note", state)
+
+    def test_ca_is_kept_when_the_server_stops_sending_it(self):
+        pinned = {"device_token": "dt", "server_ca_pem": CA1, "server_name": "frps.linumiq.net",
+                  "account_email_masked": "g***@linumiq.com"}
+        for missing in ({}, {"server_ca_pem": None}, {"server_ca_pem": ""}, {"server_ca_pem": "  "}):
+            body = dict({"subdomain": "home", "token": TOKEN}, **missing)
+            with self.subTest(missing=missing):
+                state, warnings = cfg.apply_tunnel_response(pinned, body)
+                self.assertEqual(state["server_ca_pem"], CA1)
+                self.assertEqual(state["server_name"], "frps.linumiq.net")  # sticky as well
+                self.assertEqual(state["server_ca_note"], "missing")
+                self.assertTrue(any("stays pinned" in w for w in warnings), warnings)
+                self.assertNotIn("account_email_masked", state)  # authoritative, not sticky
+
+    def test_invalid_ca_never_replaces_or_downgrades(self):
+        pinned = {"device_token": "dt", "server_ca_pem": CA1}
+        body = {"subdomain": "home", "token": TOKEN, "server_ca_pem": LEAF, "server_name": "bad name"}
+        state, warnings = cfg.apply_tunnel_response(pinned, body)
+        self.assertEqual(state["server_ca_pem"], CA1)
+        self.assertEqual(state["server_ca_note"], "invalid")
+        self.assertEqual(len(warnings), 2)  # CA + server_name
+        self.assertNotIn("server_name", state)
+        # Without a previous CA there is nothing to keep: unverified, flagged.
+        state, _ = cfg.apply_tunnel_response({"device_token": "dt"}, body)
+        self.assertNotIn("server_ca_pem", state)
+        self.assertEqual(state["server_ca_note"], "invalid")
+
+    def test_ca_rotation_and_recovery_clear_the_note(self):
+        state = {"device_token": "dt", "server_ca_pem": CA1, "server_ca_note": "missing"}
+        state, warnings = cfg.apply_tunnel_response(
+            state, {"subdomain": "home", "token": TOKEN, "server_ca_pem": CA2 + CA1})
+        self.assertEqual(warnings, [])
+        self.assertEqual(state["server_ca_pem"], CA2 + CA1)
+        self.assertNotIn("server_ca_note", state)
+
+    def test_invalid_account_email_is_dropped(self):
+        state, warnings = cfg.apply_tunnel_response(
+            {"device_token": "dt", "account_email_masked": "old***@x.y"},
+            {"subdomain": "home", "token": TOKEN, "account_email_masked": "<script>@x"})
+        self.assertNotIn("account_email_masked", state)
+        self.assertEqual(len(warnings), 1)
+
     def test_missing_or_invalid_mandatory_fields(self):
         for body in (None, [], {}, {"subdomain": "home"}, {"token": TOKEN},
                      {"subdomain": "bad.sub", "token": TOKEN},
@@ -381,6 +505,29 @@ class PrecedenceTests(unittest.TestCase):
         s = cfg.effective_settings({}, state)
         self.assertEqual((s.server_addr, s.server_port, s.domain_base), ("linumiq.net", 7000, "linumiq.net"))
 
+    def test_tls_modes(self):
+        s = cfg.effective_settings({}, self.SERVER_STATE)
+        self.assertEqual(s.tls_mode, cfg.TLS_UNVERIFIED)  # no CA known (pre-2.2 server)
+        self.assertEqual(s.server_name, "srv.example.net")  # falls back to server_addr
+        self.assertIn("NOT verified (the server provided no CA)", s.describe())
+        pinned = dict(self.SERVER_STATE, server_ca_pem=CA1, server_name="frps.example.net")
+        s = cfg.effective_settings({}, pinned)
+        self.assertEqual((s.tls_mode, s.server_name, s.ca_pem), (cfg.TLS_VERIFIED, "frps.example.net", CA1))
+        self.assertIn("tls=verified (CA from server, serverName=frps.example.net)", s.describe())
+        self.assertNotIn("BEGIN", s.describe() + repr(s))  # the PEM is not logged
+        # An explicit server_addr override does not change the certificate name.
+        s = cfg.effective_settings(cfg.parse_options({"server_addr": "10.0.0.7"}), pinned)
+        self.assertEqual((s.server_addr, s.server_name), ("10.0.0.7", "frps.example.net"))
+        # Only an explicit verify_server: false disables verification.
+        s = cfg.effective_settings(cfg.parse_options({"verify_server": False}), pinned)
+        self.assertEqual(s.tls_mode, cfg.TLS_DISABLED)
+        self.assertIn("verify_server=false", s.describe())
+        s = cfg.effective_settings(cfg.parse_options({"verify_server": True}), pinned)
+        self.assertEqual(s.tls_mode, cfg.TLS_VERIFIED)
+        # A tampered CA / name in the state is never pinned.
+        s = cfg.effective_settings({}, dict(pinned, server_ca_pem=LEAF, server_name="bad name"))
+        self.assertEqual((s.tls_mode, s.server_name), (cfg.TLS_UNVERIFIED, "srv.example.net"))
+
 
 class RenderTests(unittest.TestCase):
     def setUp(self):
@@ -420,6 +567,116 @@ class RenderTests(unittest.TestCase):
             self.assertEqual(doc["metadatas"]["token"], TOKEN)
             self.assertEqual(doc["proxies"][0]["customDomains"], ["home.dev.linumiq.net"])
 
+    PINNED = {"device_token": "dt", "subdomain": "home", "token": TOKEN, "server_addr": "linumiq.net",
+              "server_port": 7000, "domain_base": "linumiq.net", "server_name": "frps.linumiq.net",
+              "server_ca_pem": CA1}
+
+    def test_render_verified_pins_ca_and_server_name(self):
+        self._write(self.paths.state, self.PINNED)
+        result, settings = cfg.render_from_disk(self.paths)
+        self.assertEqual(result, cfg.RenderResult.RENDERED)
+        self.assertEqual(settings.tls_mode, cfg.TLS_VERIFIED)
+        self.assertEqual(self.paths.frps_ca.read_text(), CA1)
+        text = self.paths.frpc_toml.read_text()
+        lines = text.splitlines()
+        self.assertIn(f'transport.tls.trustedCaFile = "{self.paths.frps_ca}"', lines)
+        self.assertIn('transport.tls.serverName = "frps.linumiq.net"', lines)
+        self.assertIn("transport.tls.enable = true", lines)
+        first_table = next(i for i, l in enumerate(lines) if l.startswith("["))
+        self.assertLess(lines.index('transport.tls.serverName = "frps.linumiq.net"'), first_table)
+        if sys.version_info >= (3, 11):
+            import tomllib
+            tls = tomllib.loads(text)["transport"]["tls"]
+            self.assertEqual(tls, {"enable": True, "trustedCaFile": str(self.paths.frps_ca),
+                                   "serverName": "frps.linumiq.net"})
+        for path in (self.paths.frps_ca, self.paths.frpc_toml):
+            # 0600 here, 0640 root:frpc in the image (frpc runs as that user)
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), cfg.frpc_file_access()[0])
+        self.assertEqual(cfg.render_from_disk(self.paths)[0], cfg.RenderResult.UNCHANGED)
+
+    def test_ca_rotation_rerenders_even_if_frpc_toml_is_unchanged(self):
+        self._write(self.paths.state, self.PINNED)
+        cfg.render_from_disk(self.paths)
+        toml_before = self.paths.frpc_toml.read_text()
+        self._write(self.paths.state, dict(self.PINNED, server_ca_pem=CA2 + CA1))
+        self.assertEqual(cfg.render_from_disk(self.paths)[0], cfg.RenderResult.RENDERED)
+        self.assertEqual(self.paths.frpc_toml.read_text(), toml_before)
+        self.assertEqual(self.paths.frps_ca.read_text(), CA2 + CA1)
+
+    def test_render_unverified_and_disabled(self):
+        unpinned = {k: v for k, v in self.PINNED.items() if k != "server_ca_pem"}
+        self._write(self.paths.state, unpinned)
+        result, settings = cfg.render_from_disk(self.paths)
+        self.assertEqual(settings.tls_mode, cfg.TLS_UNVERIFIED)
+        text = self.paths.frpc_toml.read_text()
+        self.assertNotIn("trustedCaFile", text)
+        self.assertIn("NOT verified (the server provided no CA)", text)
+        self.assertFalse(self.paths.frps_ca.exists())
+        # Pinned, then verification switched off explicitly: the CA file goes.
+        self._write(self.paths.state, self.PINNED)
+        cfg.render_from_disk(self.paths)
+        self.assertTrue(self.paths.frps_ca.exists())
+        self._write(self.paths.options, {"verify_server": False})
+        result, settings = cfg.render_from_disk(self.paths)
+        self.assertEqual((result, settings.tls_mode), (cfg.RenderResult.RENDERED, cfg.TLS_DISABLED))
+        self.assertFalse(self.paths.frps_ca.exists())
+        self.assertIn("verify_server: false", self.paths.frpc_toml.read_text())
+        self.assertNotIn("trustedCaFile", self.paths.frpc_toml.read_text())
+
+    def test_render_requires_ca_file_and_name_when_verified(self):
+        settings = cfg.effective_settings({}, self.PINNED)
+        with self.assertRaises(ValueError):
+            cfg.render_frpc_toml(settings, "home", TOKEN)  # no ca_file
+
+    def test_unpaired_render_removes_pinned_ca(self):
+        self._write(self.paths.state, self.PINNED)
+        cfg.render_from_disk(self.paths)
+        self.paths.state.unlink()
+        self.assertEqual(cfg.render_from_disk(self.paths)[0], cfg.RenderResult.NOT_PAIRED)
+        self.assertFalse(self.paths.frps_ca.exists())
+        self.assertFalse(self.paths.frpc_toml.exists())
+
+    def test_files_frpc_reads_are_group_readable_for_the_frpc_group(self):
+        gid = os.getgid()  # stand-in for the image's frpc group
+        self._write(self.paths.state, self.PINNED)
+        self._write(self.paths.frpc_toml, "old 2.1 file")
+        os.chmod(self.paths.frpc_toml, 0o600)
+        with mock.patch.object(cfg, "frpc_file_access", return_value=(0o640, gid)):
+            cfg.render_from_disk(self.paths)
+            for path in (self.paths.frps_ca, self.paths.frpc_toml):
+                st = os.stat(path)
+                self.assertEqual((stat.S_IMODE(st.st_mode), st.st_gid), (0o640, gid), path)
+            # Unchanged content with wrong permissions (written 0600 by 2.1.x)
+            # is fixed without a rewrite.
+            os.chmod(self.paths.frpc_toml, 0o600)
+            self.assertEqual(cfg.render_from_disk(self.paths)[0], cfg.RenderResult.UNCHANGED)
+            self.assertEqual(stat.S_IMODE(os.stat(self.paths.frpc_toml).st_mode), 0o640)
+        # The state file (device token) stays private.
+        cfg.write_json(self.paths.state, self.PINNED)
+        self.assertEqual(stat.S_IMODE(os.stat(self.paths.state).st_mode), 0o600)
+
+    def test_data_dir_is_made_searchable_for_frpc(self):
+        gid = os.getgid()
+        self._write(self.paths.state, self.PINNED)
+        os.chmod(self.paths.data_dir, 0o700)
+        try:
+            with mock.patch.object(cfg, "frpc_file_access", return_value=(0o640, gid)), \
+                    self.assertLogs("frp-mgr.config", "WARNING"):
+                cfg.render_from_disk(self.paths)
+            self.assertEqual(stat.S_IMODE(os.stat(self.paths.data_dir).st_mode), 0o701)
+            # Already searchable (other x, or group x for the frpc group): untouched.
+            for mode in (0o755, 0o751, 0o710):
+                os.chmod(self.paths.data_dir, mode)
+                self.assertFalse(cfg.ensure_searchable(self.paths.data_dir, os.stat(self.paths.data_dir).st_gid))
+                self.assertEqual(stat.S_IMODE(os.stat(self.paths.data_dir).st_mode), mode)
+            self.assertFalse(cfg.ensure_searchable(self.paths.data_dir, None))  # no frpc group
+        finally:
+            os.chmod(self.paths.data_dir, 0o700)
+
+    def test_frpc_file_access_without_the_group(self):
+        with mock.patch("grp.getgrnam", side_effect=KeyError("frpc")):
+            self.assertEqual(cfg.frpc_file_access(), (0o600, None))
+
     def test_toml_str_escapes(self):
         self.assertEqual(cfg.toml_str('a"b\\c\n'), '"a\\"b\\\\c\\u000a"')
 
@@ -437,7 +694,7 @@ class RenderTests(unittest.TestCase):
         self._write(self.paths.options, {"log_level": "info"})
         self.assertEqual(cfg.render_from_disk(self.paths)[0], cfg.RenderResult.RENDERED)
         mode = stat.S_IMODE(os.stat(self.paths.frpc_toml).st_mode)
-        self.assertEqual(mode, 0o600)
+        self.assertEqual(mode, cfg.frpc_file_access()[0])  # 0600, or 0640 root:frpc in the image
         self.assertEqual(cfg.render_from_disk(self.paths)[0], cfg.RenderResult.UNCHANGED)
         # Server value changes (e.g. after "Refresh") -> re-rendered.
         new_state, _ = cfg.apply_tunnel_response(
@@ -563,9 +820,48 @@ class CliTests(unittest.TestCase):
             self.assertNotIn(device_token, proc.stderr)
             self.assertIn("domain_base=dev.linumiq.net (from server)", proc.stderr)
             self.assertEqual(run().returncode, cfg.EXIT_OK)  # unchanged
+            self.assertIn("frps server certificate is not verified", proc.stderr)  # pre-2.2 server
+            Path(tmp, "frp-state.json").write_text(json.dumps(
+                {"device_token": device_token, "subdomain": "home", "token": TOKEN,
+                 "server_name": "frps.linumiq.net", "server_ca_pem": CA1}))
+            proc = run()
+            self.assertEqual(proc.returncode, cfg.EXIT_OK, proc.stderr)
+            self.assertIn("tls=verified (CA from server, serverName=frps.linumiq.net)", proc.stderr)
+            self.assertNotIn("not verified", proc.stderr)
+            self.assertNotIn("BEGIN CERTIFICATE", proc.stderr)
+            self.assertEqual(Path(tmp, "frps-ca.pem").read_text(), CA1)
             Path(tmp, "frp-state.json").write_text(json.dumps(
                 {"device_token": device_token, "subdomain": "-bad-", "token": TOKEN}))
             self.assertEqual(run().returncode, cfg.EXIT_NOT_PAIRED)
+            self.assertFalse(Path(tmp, "frps-ca.pem").exists())
+
+
+class BackupExcludeTests(unittest.TestCase):
+    """config.yaml's backup_exclude must cover every pairing secret, using
+    Supervisor's matching (PurePath(<data dir>/<file>).match(pattern))."""
+
+    def test_pairing_files_are_excluded_from_ha_backups(self):
+        config_yaml = Path(__file__).resolve().parents[2] / "config.yaml"  # frp-tunnel/config.yaml
+        if not config_yaml.exists():  # e.g. only tests/ mounted into the image
+            self.skipTest("config.yaml not available")
+        patterns, inside = [], False
+        for line in config_yaml.read_text().splitlines():
+            if line.startswith("backup_exclude:"):
+                inside = True
+                continue
+            if inside:
+                if not line.startswith("  - "):
+                    break
+                patterns.append(line[4:].strip().strip('"'))
+        self.assertTrue(patterns)
+        supervisor_dir = PurePosixPath("/data/addons/data/local_frp_tunnel")
+        paths = cfg.Paths(Path("/data"))
+        secret_files = [paths.state, paths.pairing, paths.frpc_toml, paths.frps_ca, paths.lock,
+                        Path(".frp-state.json.k2j3h4.tmp"), Path(".frpc.toml.abc123.tmp")]
+        for file in secret_files:
+            full = supervisor_dir / file.name
+            self.assertTrue(any(full.match(p) for p in patterns), f"{file.name} not excluded by {patterns}")
+        self.assertFalse(any((supervisor_dir / "options.json").match(p) for p in patterns))
 
 
 if __name__ == "__main__":

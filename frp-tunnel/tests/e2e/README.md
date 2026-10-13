@@ -53,11 +53,21 @@ never silently run against production.
   - `E2E_AUTH_COOKIE_NAME`: cookie name for the fallback (default
     `sb-<first label of the API_BASE host>-auth-token`).
 
+### Server verification (contract v2.2)
+
+| Variable | Default | Meaning |
+| -------- | ------- | ------- |
+| `E2E_FRPS_CA_FILE` | - | Path (on the harness host) of the PEM CA that signed the frps certificate - what the dashboard returns as `server_ca_pem`. When set, the harness asserts that the add-on received and pinned it: `tls_mode=verified` in `/api/status`, `server_ca_pem` in the state file and `/data/frps-ca.pem` equal to this file (compared as base64, line wrapping ignored), `frps-ca.pem` is `root:frpc` 640, `frpc.toml` has `transport.tls.trustedCaFile = "/data/frps-ca.pem"` and `transport.tls.serverName = "<server_name>"`, frpc logged in (`login to server success`) without any `x509:` / `tls: failed to verify` error, and a v2.2 server sent `account_email_masked`. Without it these checks are skipped (`SKIP`, with the panel's `tls_mode`). |
+| `E2E_FRPS_SERVER_NAME` | the server-provided `server_name` | Expected `server_name` (the name in the frps certificate). Without it the harness only requires a non-empty `server_name` and uses it for the `serverName` check. |
+| `E2E_TLS_NEGATIVE` | `1` | With `E2E_FRPS_CA_FILE`: temporarily set `server_name` in the state to `wrong-name.invalid`, restart frpc and require that it refuses the server (`... not wrong-name.invalid`, no new login), then restore the state and require a new login. Proves the pin is enforced by frpc. `0` skips it. |
+| `E2E_ACCOUNT_EMAIL_MASKED` | - | Expected `account_email_masked` (e.g. `e***@example.com`); otherwise only its presence is checked (required when `E2E_FRPS_CA_FILE` is set). |
+
 ### Optional environment
 
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
 | `DOCKER` | `docker` | Container CLI (`podman` works). |
+| `E2E_CREATE_ARGS` | - | Extra arguments for `$DOCKER create` of the add-on container (word-split), e.g. `--security-opt apparmor=frp_tunnel` after `sudo apparmor_parser -r -W frp-tunnel/apparmor.txt`, to run the whole flow confined by the add-on's AppArmor profile (then check `dmesg \| grep DENIED`). |
 | `ADDON_IMAGE` | - | Use this image; otherwise build `frp-tunnel-e2e` with `$DOCKER build --build-arg BUILD_FROM=ghcr.io/hassio-addons/base:20.1.0 --build-arg BUILD_ARCH=<amd64\|aarch64> -t frp-tunnel-e2e frp-tunnel/`. |
 | `NETWORK` | default bridge | Docker network to attach the add-on container to (must reach `LOCAL_HOST`). |
 | `E2E_PIN_SERVER` | `1` | `1`: also write `server_addr`/`server_port`/`domain_base` overrides (= `SERVER_*`/`DOMAIN_BASE`) into `options.json`. `0`: leave them unset so the **server-provided** values drive `frpc.toml` (also verifies the dashboard's `FRP_SERVER_*`/`TUNNEL_DOMAIN_BASE`). Running both is recommended. |
@@ -66,7 +76,7 @@ never silently run against production.
 | `E2E_EXPECT` | first line of `http://LOCAL_HOST:LOCAL_PORT/` | Text the public page must contain (whoami: `Hostname: <id>`). |
 | `E2E_KEEP_PAIRED` | `0` | `1`: skip the final unpair (leaves a valid device token server-side). |
 | `E2E_KEEP_CONTAINER` | `0` | `1`: do not remove the add-on container (debugging). |
-| `E2E_ALLOWED_INGRESS_IPS` | `127.0.0.1` | Passed to the panel as `ALLOWED_INGRESS_IPS` (IPs/CIDRs). The harness drives the panel with `docker exec ... curl http://127.0.0.1:8099`, so loopback is enough. |
+| `E2E_ALLOWED_INGRESS_IPS` | `127.0.0.1` | Passed to the panel as `ALLOWED_INGRESS_IPS` (IPs/CIDRs). The harness drives the panel with `docker exec ... curl http://127.0.0.1:8099`, so loopback is enough. State-changing requests carry `Sec-Fetch-Site: same-origin` (the panel's CSRF guard refuses them otherwise). |
 | `E2E_BOOT_TIMEOUT` / `E2E_PAIR_TIMEOUT` / `E2E_FRPC_TIMEOUT` / `E2E_PUBLIC_TIMEOUT` | `90` / `180` / `60` / `180` s | Timeouts. The public timeout covers on-demand certificate issuance for a new subdomain. |
 | `E2E_BUILD_ARCH`, `E2E_BUILD_FROM`, `E2E_BUILD_TAG` | auto / base 20.1.0 / `frp-tunnel-e2e` | Build knobs. |
 
@@ -88,27 +98,36 @@ Each check prints `PASS`, `FAIL` or `SKIP`:
    `/data/options.json`; bashio's option cache is pre-seeded because the base
    image's log-level oneshot would otherwise ask the missing Supervisor API).
 2. Panel healthy; fresh add-on unpaired; frpc waits; the ingress guard answers
-   403 to a non-allowed client address.
+   403 to a non-allowed client address, also with a crafted `Host: x/_health?a=`
+   header and for `/_health` (no exemption); a POST without
+   `Sec-Fetch-Site`/`Origin` and a cross-site POST are refused (CSRF) and
+   start nothing.
 3. `POST /pair/start` -> `user_code` from `GET /api/status` -> approval ->
-   `POST /pair/poll` until `paired`.
-4. `/api/status` (paired, subdomain, `public_url`, tls); state file has
-   `subdomain`, `token`, `device_token` and the server-provided `domain_base`
-   (= `DOMAIN_BASE`) - plus `server_addr`/`server_port` when not pinned; state
-   and `frpc.toml` are mode 600.
+   `POST /pair/poll` until `paired`. The user code appears neither in the
+   redirect URL nor in the container log.
+4. `/api/status` (paired, subdomain, `public_url`, tls, `account_email_masked`);
+   state file has `subdomain`, `token`, `device_token` and the server-provided
+   `domain_base` (= `DOMAIN_BASE`) - plus `server_addr`/`server_port` when not
+   pinned; the state is mode 600, `frpc.toml` `root:frpc` 640.
 5. `frpc.toml` contains `serverAddr = "<SERVER_ADDR>"`, `serverPort = <SERVER_PORT>`,
    `customDomains = ["<sub>.<DOMAIN_BASE>"]`, `transport.tls.enable = true`,
    `loginFailExit = false`, the state's token, `localIP`/`localPort`, and passes
-   `frpc verify`.
-6. frpc is up (`s6-svstat` up and the PID is `frpc`), logged
-   `login to server success` (over TLS) and `start proxy success`.
+   `frpc verify`. With `E2E_FRPS_CA_FILE`: the server verification checks
+   listed above.
+6. frpc is up (`s6-svstat` up and the PID is `frpc`) as the unprivileged user
+   `frpc`, logged `login to server success` (over TLS; verified when
+   `E2E_FRPS_CA_FILE` is set) without certificate errors, and
+   `start proxy success`.
 7. `https://<sub>.<DOMAIN_BASE>/` returns the local service's content.
 8. **Refresh tunnel config** works and leaves `frpc.toml` unchanged; deleting
    `frpc.toml` and restarting the frpc service re-renders it identically from
-   the state.
+   the state. With `E2E_FRPS_CA_FILE` (and `E2E_TLS_NEGATIVE=1`): a wrong
+   `serverName` is refused by frpc, the restored one logs in again.
 9. Neither the tunnel token nor the device token appears in the container log.
-10. `POST /unpair` removes state + `frpc.toml` and stops frpc, and revokes the
-    device token server-side (the panel answers `ok=` only when the server
-    confirmed the revocation, `error=` otherwise - which fails this check).
+10. `POST /unpair` removes state, `frpc.toml` and the pinned CA and stops frpc,
+    and revokes the device token server-side (the panel answers `ok=` only
+    when the server confirmed the revocation, `error=` otherwise - which fails
+    this check).
 
 Tokens are never printed and never put on a command line (where `ps` would
 show them): expected `frpc.toml` lines are matched in-shell, and the
@@ -143,24 +162,37 @@ E2E_TOTP_SECRET_FILE=/root/.addon-e2e-totp frp-tunnel/tests/e2e/run.sh
 
 `python3 -m unittest discover -s frp-tunnel/tests/unit -v` runs the pure logic
 tests (`test_config.py`, `test_totp.py`) anywhere; the panel flow tests
-(`test_app.py`) need FastAPI and run inside the image. `FRP_MGR_DIR` points
-the tests at the panel code installed in the image, and
-`FRP_TESTS_REQUIRE_FASTAPI=1` turns a missing FastAPI into a failure. This is
-what CI runs:
+(`test_app.py`, including ASGI-level tests of the ingress guard and the CSRF
+check) need the panel's dependencies: `pip install --require-hashes
+--only-binary=:all: -r frp-tunnel/requirements.txt` (Python 3.12, as in the
+image), or run them inside the image. `FRP_MGR_DIR` points the tests at the
+panel code installed in the image, and `FRP_TESTS_REQUIRE_PANEL=1` turns
+missing dependencies into a failure. This is what CI runs (besides the host
+run with the pinned dependencies):
 
 ```sh
 docker build --build-arg BUILD_FROM=ghcr.io/hassio-addons/base:20.1.0 \
     --build-arg BUILD_ARCH=amd64 -t frp-tunnel-test frp-tunnel
 docker run --rm -v "$PWD/frp-tunnel/tests:/tests:ro" \
-    -e FRP_MGR_DIR=/usr/lib/frp-mgr -e FRP_TESTS_REQUIRE_FASTAPI=1 \
-    -e PYTHONDONTWRITEBYTECODE=1 --entrypoint python3 frp-tunnel-test \
+    -e FRP_MGR_DIR=/usr/lib/frp-mgr -e FRP_TESTS_REQUIRE_PANEL=1 \
+    --entrypoint python3 frp-tunnel-test \
     -m unittest discover -s /tests/unit -v
 ```
 
 Without bind mounts (e.g. a remote podman):
 
 ```sh
-c=$(docker create -e FRP_MGR_DIR=/usr/lib/frp-mgr -e FRP_TESTS_REQUIRE_FASTAPI=1 \
+c=$(docker create -e FRP_MGR_DIR=/usr/lib/frp-mgr -e FRP_TESTS_REQUIRE_PANEL=1 \
     --entrypoint python3 frp-tunnel-test -m unittest discover -s /tests/unit -v)
 docker cp frp-tunnel/tests "$c:/tests" && docker start -a "$c"; docker rm "$c"
 ```
+
+## AppArmor smoke test
+
+`frp-tunnel/tests/apparmor-smoke.sh <image> frp-tunnel/apparmor.txt` (needs
+sudo, docker and a kernel with AppArmor) loads the profile in enforce mode,
+boots the image confined by it and exercises start-up, the panel, the
+renderer with a pinned CA, frpc as user `frpc`, unpair and `docker stop`
+without any backend; it fails on any `apparmor="DENIED"` for the profile. CI
+runs it on every push. For the full flow under the profile, run `run.sh` with
+`E2E_CREATE_ARGS="--security-opt apparmor=frp_tunnel"`.

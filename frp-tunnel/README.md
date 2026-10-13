@@ -14,16 +14,20 @@ to a remote frps server — by default the LinumIQ tunneling service at
 - **Zero-config pairing**: Open the ingress panel, click a button, approve
   in your browser — done. No manual tokens or subdomain config.
 - **Outbound-only, TLS-encrypted connection** to frps (no inbound
-  port-forwarding required).
+  port-forwarding required); the frps certificate is **verified** against the
+  certificate authority provided by your LinumIQ account's server.
+- **Least privilege**: frpc runs as an unprivileged user under a strict
+  AppArmor profile; pairing secrets are never put into Home Assistant backups.
 - **Stable public URL**: `https://<subdomain>.linumiq.net`.
 - **Server-managed settings**: the frps endpoint and public domain come from
   your LinumIQ account and are re-applied on every restart or refresh.
-- **Ingress management panel**: view connection status, change subdomain,
-  refresh the tunnel configuration, unpair — all from within Home Assistant.
+- **Ingress management panel**: view connection status and the paired
+  account, change subdomain, refresh the tunnel configuration, unpair — all
+  from within Home Assistant.
 - **Pinned upstream `frpc` v0.65.0**.
 - **s6-overlay v3** with auto-restart on crash.
-- **Tested**: unit tests and an end-to-end harness that pairs a real
-  container against a LinumIQ stack (`tests/`).
+- **Tested**: unit tests, an AppArmor smoke test and an end-to-end harness
+  that pairs a real container against a LinumIQ stack (`tests/`).
 
 ## Quick Start
 

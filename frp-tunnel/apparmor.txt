@@ -1,56 +1,98 @@
 #include <tunables/global>
 
+# AppArmor profile of the FRP Tunnel add-on - least privilege, no `file,`
+# catch-all. Supervisor renames the profile to the add-on's slug when it
+# loads it. AppArmor 3.x syntax only (Home Assistant OS rejects abi/4.0
+# features). Everything runs in this one profile (all exec rules are `ix`):
+# s6-overlay + execline, bashio, the frp-mgr panel (Python virtualenv) and
+# frpc (started via s6-setuidgid as the unprivileged user `frpc`).
 profile frp_tunnel flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/base>
   #include <abstractions/nameservice>
   #include <abstractions/openssl>
   #include <abstractions/ssl_certs>
 
+  # Network: frpc -> frps and the local service, the panel's listener (8099)
+  # and its calls to the LinumIQ API, bashio -> Supervisor API, DNS.
+  network inet stream,
+  network inet6 stream,
+  network inet dgram,
+  network inet6 dgram,
+  network unix stream,
+  network unix dgram,
+  network netlink raw,
+
+  # Signals only inside the add-on (s6 supervision, frpc restarts) and from
+  # the container runtime (stop/kill).
+  signal (send, receive) peer=@{profile_name},
+  signal (receive) peer=unconfined,
+  # The panel / s6-svstat read /proc/<pid>/* of processes of this add-on.
+  ptrace (read, readby) peer=@{profile_name},
+
   # Capabilities
-  file,
-  umount,
-  signal,
-  network,
-
-  capability chown,
-  capability dac_override,
-  capability dac_read_search,
+  capability chown,     # renderer: frpc.toml / frps-ca.pem root:frpc
   capability fowner,
-  capability fsetid,
-  capability kill,
-  capability setgid,
+  capability kill,      # s6 (root) signals frpc (user frpc)
+  capability setgid,    # s6-setuidgid frpc, s6-overlay-suexec
   capability setuid,
-  capability sys_admin,
-  capability sys_ptrace,
+  # Not needed (it only keeps a setgid bit); the kernel probes it when root
+  # chmods a root:frpc file. Denied without a log entry.
+  deny capability fsetid,
+  umount,
 
-  # S6-Overlay
-  /init ix,
-  /bin/** ix,
-  /usr/bin/** ix,
-  /usr/sbin/** ix,
-  /run/{s6,s6-rc*,service}/** ix,
-  /package/** ix,
-  /command/** ix,
+  # S6-Overlay v3 (+ execline, s6-rc, s6-linux-init)
+  /init rix,
+  /bin/** rix,
+  /sbin/** rix,
+  /usr/bin/** rix,
+  /usr/sbin/** rix,
+  /package/** rix,
+  /command/** rix,
   /etc/s6-overlay/** rix,
-  /etc/services.d/** rwix,
-  /etc/cont-init.d/** rwix,
-  /etc/cont-finish.d/** rwix,
-  /run/{,**} rwk,
+  /etc/services.d/** rix,
+  /etc/cont-init.d/** rix,
+  /etc/cont-finish.d/** rix,
+  /run/{s6,s6-rc*,service}/** ix,
+  /run/{,**} rwkl,
   /dev/tty rw,
+  /dev/console rw,
+  /dev/pts/* rw,
 
   # Bashio
-  /usr/lib/bashio/** ix,
-  /tmp/** rwk,
+  /usr/lib/bashio/** rix,
+  /tmp/{,**} rwk,
 
-  # frpc binary
-  /usr/bin/frpc mrix,
+  # Time zone (TZ is set by Supervisor) and other read-only system data
+  /etc/localtime r,
+  /etc/timezone r,
+  /usr/share/zoneinfo/{,**} r,
+  /etc/mime.types r,
+  /etc/os-release r,
+  /usr/lib/os-release r,
+  /etc/alpine-release r,
 
-  # frp-mgr FastAPI panel (Python + uvicorn)
-  /usr/bin/python3 mrix,
+  # frpc binary (exec covered by /usr/bin/**)
+  /usr/bin/frpc mr,
+
+  # frp-mgr panel + renderer: CPython from Alpine, run from the panel's
+  # virtualenv (pinned, hash-checked dependencies)
+  /usr/lib/python3*/ r,
   /usr/lib/python3*/** mr,
-  /usr/lib/frp-mgr/** r,
+  /usr/lib/frp-mgr/ r,
+  /usr/lib/frp-mgr/** mr,
+  /usr/lib/frp-mgr/.venv/bin/* rix,
+  owner @{PROC}/[0-9]*/fd/ r,
+  @{PROC}/[0-9]*/comm r,
+  @{PROC}/[0-9]*/stat r,
+  @{PROC}/[0-9]*/cgroup r,
+  @{PROC}/[0-9]*/mountinfo r,
+  @{PROC}/sys/net/core/somaxconn r,
+  /sys/fs/cgroup/** r,
+  /sys/kernel/mm/transparent_hugepage/hpage_pmd_size r,
 
-  # Persistent add-on data
+  # Persistent add-on data (state, frpc.toml, pinned frps CA, options);
+  # `w` on /data/ itself only for the renderer's o+x fix of its mode.
+  /data/ rw,
   /data/** rwk,
 
   # Deny dangerous operations

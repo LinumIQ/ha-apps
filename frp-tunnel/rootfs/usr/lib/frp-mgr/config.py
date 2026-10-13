@@ -1,7 +1,7 @@
 """
 FRP Tunnel - configuration logic shared by the pairing panel and frpc/run.
 
-This module is deliberately free of FastAPI (stdlib only) so it can be
+This module is deliberately free of third-party imports (stdlib only) so it can be
 unit-tested on any Python 3.9+ and executed by the ``frpc`` s6 service:
 
     python3 /usr/lib/frp-mgr/config.py render
@@ -22,8 +22,19 @@ Where each frpc setting comes from (highest precedence first):
    servers that do not return ``domain_base`` working) and finally to
    ``linumiq.net``.
 
-``app_base``, ``api_base``, ``local_host``, ``local_port`` and ``log_level``
-are never server-provided: option, then default.
+``app_base``, ``api_base``, ``local_host``, ``local_port``, ``log_level`` and
+``verify_server`` are never server-provided: option, then default.
+
+Server verification (contract v2.2): the server also sends ``server_name``
+(the host name in the frps certificate) and ``server_ca_pem`` (the private CA
+that signed it). A valid CA is persisted in the state, written to
+``/data/frps-ca.pem`` and pinned in ``frpc.toml`` (``trustedCaFile`` +
+``serverName``), unless the ``verify_server`` option is explicitly ``false``.
+Unlike the endpoint values, the CA and ``server_name`` are *kept* when a later
+response omits them (or sends garbage): a server rollback must never silently
+downgrade frpc to an unverified connection. Without any CA (servers older
+than v2.2) the connection is TLS-encrypted but unverified, and the panel says
+so.
 
 The module also holds the (pure) validators for everything the backend sends
 during pairing (``parse_pairing_response``), the log/flash sanitiser
@@ -34,12 +45,15 @@ Secrets (frp tunnel token, device token, device code) are never logged.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import fcntl
 import ipaddress
 import json
 import logging
 import os
 import re
+import ssl
 import sys
 import tempfile
 import time
@@ -78,8 +92,28 @@ LOG_LEVELS = {
     "fatal": "error",
 }
 
-#: Keys the server may provide in the tunnel response (contract v2.1).
+#: Endpoint keys the server may provide in the tunnel response (contract
+#: v2.1). The response is authoritative for them: a key the server stops
+#: sending is dropped from the state.
 SERVER_KEYS = ("server_addr", "server_port", "domain_base")
+
+#: TLS trust keys of the tunnel response (contract v2.2). Kept when a later
+#: response omits them (never a silent downgrade to an unverified frps).
+TLS_KEYS = ("server_name", "server_ca_pem")
+
+#: Limits for a server-provided CA bundle.
+CA_PEM_MAX_CHARS = 64 * 1024
+CA_MAX_CERTS = 8
+
+#: Group of the unprivileged user frpc runs as inside the image. frpc.toml
+#: and frps-ca.pem are written root:frpc 0640 when the group exists (0600
+#: otherwise, e.g. in unit tests).
+FRPC_GROUP = "frpc"
+
+#: tls_mode values (Settings.tls_mode).
+TLS_VERIFIED = "verified"
+TLS_UNVERIFIED = "unverified"  # no CA known (server older than v2.2)
+TLS_DISABLED = "disabled"      # verify_server: false
 
 #: Exit codes of the ``render`` CLI. frpc/run starts frpc only on EXIT_OK.
 EXIT_OK = 0
@@ -125,6 +159,10 @@ class Paths:
     @property
     def pairing(self) -> Path:
         return self.data_dir / "frp-pairing.json"
+
+    @property
+    def frps_ca(self) -> Path:
+        return self.data_dir / "frps-ca.pem"
 
     @property
     def lock(self) -> Path:
@@ -260,6 +298,107 @@ def normalize_log_level(value: Any) -> Optional[str]:
     """Add-on log level -> frpc log level (trace|debug|info|warn|error)."""
     if isinstance(value, str):
         return LOG_LEVELS.get(value.strip().lower())
+    return None
+
+
+def normalize_bool(value: Any) -> Optional[bool]:
+    """A JSON boolean (Supervisor's ``bool``); "true"/"false" strings too."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    return None
+
+
+# -- server verification (contract v2.2) -------------------------------------
+
+_PEM_BLOCK_RE = re.compile(r"-----BEGIN ([A-Z0-9 ]{1,40})-----([^-]*)-----END ([A-Z0-9 ]{1,40})-----")
+_BASE64_RE = re.compile(r"[A-Za-z0-9+/]+={0,2}")
+
+
+def normalize_ca_pem(value: Any) -> Optional[str]:
+    """One or more X.509 **CA** certificates in PEM form, normalised.
+
+    Accepted: up to ``CA_MAX_CERTS`` ``CERTIFICATE`` blocks (at most
+    ``CA_PEM_MAX_CHARS`` characters, only whitespace around them) that
+    OpenSSL parses and recognises as CA certificates (``X509_check_ca``:
+    basicConstraints CA:TRUE, or a v1 self-signed root). Anything else -
+    other PEM block types such as private keys, junk between the blocks, a
+    leaf certificate, broken base64 or DER - yields None. The result is
+    re-encoded from the DER (64-column base64, ``\\n`` line ends, duplicates
+    removed), so the file written from it is canonical.
+    """
+    if not isinstance(value, str) or len(value) > CA_PEM_MAX_CHARS:
+        return None
+    ders: list = []
+    pos = 0
+    for match in _PEM_BLOCK_RE.finditer(value):
+        if value[pos:match.start()].strip():
+            return None
+        if match.group(1) != "CERTIFICATE" or match.group(3) != "CERTIFICATE":
+            return None
+        body = "".join(match.group(2).split())
+        if not _BASE64_RE.fullmatch(body):
+            return None
+        try:
+            der = base64.b64decode(body, validate=True)
+        except (binascii.Error, ValueError):
+            return None
+        if der not in ders:
+            ders.append(der)
+        pos = match.end()
+    if value[pos:].strip() or not ders or len(ders) > CA_MAX_CERTS:
+        return None
+    pem = "".join(ssl.DER_cert_to_PEM_cert(der) for der in ders)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    try:
+        ctx.load_verify_locations(cadata=pem)
+    except (ssl.SSLError, ValueError):
+        return None
+    stats = ctx.cert_store_stats()
+    if stats.get("x509") != len(ders) or stats.get("x509_ca") != len(ders):
+        return None
+    return pem
+
+
+def describe_ca(pem: Any) -> list:
+    """``[{"subject", "not_after", "expired"}]`` for a (valid) CA bundle, for
+    display; ``[]`` when it is unusable. Never raises."""
+    pem = normalize_ca_pem(pem)
+    if pem is None:
+        return []
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    out = []
+    try:
+        ctx.load_verify_locations(cadata=pem)
+        certs = ctx.get_ca_certs()
+    except (ssl.SSLError, ValueError):  # pragma: no cover - validated above
+        return []
+    now = time.time()
+    for cert in certs:
+        names = {key: value for rdn in cert.get("subject", ()) for key, value in rdn}
+        subject = names.get("commonName") or names.get("organizationName") or "?"
+        try:
+            expires = ssl.cert_time_to_seconds(cert.get("notAfter", ""))
+        except (ValueError, TypeError):
+            expires = None
+        out.append({
+            "subject": sanitize_text(subject, 80),
+            "not_after": (datetime.fromtimestamp(expires, timezone.utc).strftime("%Y-%m-%d")
+                          if expires is not None else ""),
+            "expired": expires is not None and expires < now,
+        })
+    return out
+
+
+# A masked account e-mail as sent by the dashboard ("g***@linumiq.com"). Only
+# characters that are harmless in a log line or the panel.
+_MASKED_EMAIL_RE = re.compile(r"[A-Za-z0-9.*_+~'-]{1,64}@[A-Za-z0-9.*-]{1,253}")
+
+
+def normalize_masked_email(value: Any) -> Optional[str]:
+    if isinstance(value, str) and _MASKED_EMAIL_RE.fullmatch(value.strip()):
+        return value.strip()
     return None
 
 
@@ -409,6 +548,7 @@ def sanitize_text(value: Any, limit: int = 200, secrets: Iterable[Any] = ()) -> 
 
 _OPTION_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "log_level": normalize_log_level,
+    "verify_server": normalize_bool,
     "app_base": normalize_base_url,
     "api_base": normalize_base_url,
     "server_addr": normalize_host,
@@ -445,8 +585,10 @@ def read_json(path: Path) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def atomic_write(path: Path, text: str, mode: int = 0o600) -> None:
-    """Write ``text`` to ``path`` atomically (temp file + rename), chmod mode."""
+def atomic_write(path: Path, text: str, mode: int = 0o600, gid: Optional[int] = None) -> None:
+    """Write ``text`` to ``path`` atomically (temp file + rename), chmod mode
+    (and chgrp ``gid`` when given). The temp file is created 0600, so the
+    content is never readable by others in between."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
     try:
@@ -454,7 +596,11 @@ def atomic_write(path: Path, text: str, mode: int = 0o600) -> None:
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
+        # chmod while the file is still root:root, then chgrp (no
+        # CAP_FSETID probe, which the AppArmor profile does not grant).
         os.chmod(tmp, mode)
+        if gid is not None:
+            os.chown(tmp, -1, gid)
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -482,6 +628,32 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def frpc_file_access() -> Tuple[int, Optional[int]]:
+    """``(mode, gid)`` for files frpc must read: 0640 root:frpc in the image
+    (frpc runs as the unprivileged ``frpc`` user), 0600 when that group does
+    not exist (unit tests, other environments)."""
+    try:
+        import grp  # noqa: PLC0415 - POSIX only
+
+        return 0o640, grp.getgrnam(FRPC_GROUP).gr_gid
+    except (ImportError, KeyError):
+        return 0o600, None
+
+
+def ensure_access(path: Path, mode: int, gid: Optional[int]) -> bool:
+    """chmod/chgrp an existing file if needed (e.g. a frpc.toml written 0600
+    by 2.1.x). Returns True if something was changed."""
+    st = path.stat()
+    changed = False
+    if (st.st_mode & 0o7777) != mode:
+        os.chmod(path, mode)
+        changed = True
+    if gid is not None and st.st_gid != gid:
+        os.chown(path, -1, gid)
+        changed = True
+    return changed
+
+
 # ---------------------------------------------------------------------------
 # Options
 # ---------------------------------------------------------------------------
@@ -489,6 +661,7 @@ def utc_now() -> str:
 #: What a valid value looks like, per option (shown in the panel banner).
 OPTION_HINTS = {
     "log_level": "one of trace, debug, info, notice, warning, error, fatal",
+    "verify_server": "true or false",
     "app_base": "an http(s) URL without user info, query or fragment",
     "api_base": "an http(s) URL without user info, query or fragment",
     "server_addr": "a host name (letters, digits, '-', dot-separated labels) or an IP address",
@@ -575,7 +748,14 @@ def apply_tunnel_response(
     ``server_port`` and ``domain_base`` are optional: the response is
     authoritative, so a key the server no longer sends (or sends with an
     invalid value) is removed from the state and the next precedence layer
-    applies. Returns ``(new_state, warnings)``; raises TunnelResponseError.
+    applies. ``account_email_masked`` (shown in the panel) likewise.
+
+    ``server_ca_pem`` / ``server_name`` (v2.2) replace the stored values when
+    they are present and valid, and are otherwise *kept*: a response without
+    a CA (server rollback) or with an invalid one never removes a pinned CA.
+    ``server_ca_note`` records why the stored CA was kept ("missing" /
+    "invalid") so the panel can warn. Returns ``(new_state, warnings)``;
+    raises TunnelResponseError.
     """
     if not isinstance(body, Mapping):
         raise TunnelResponseError("Backend returned a malformed tunnel response.")
@@ -600,6 +780,40 @@ def apply_tunnel_response(
             warnings.append(f"Ignored invalid server-provided {key}.")
             continue
         new[key] = norm
+
+    new.pop("server_ca_note", None)
+    raw_ca = body.get("server_ca_pem")
+    if _is_unset(raw_ca):
+        if new.get("server_ca_pem"):
+            new["server_ca_note"] = "missing"
+            warnings.append("The server sent no server_ca_pem; the last known frps CA stays pinned.")
+    else:
+        ca = normalize_ca_pem(raw_ca)
+        if ca is None:
+            new["server_ca_note"] = "invalid"
+            warnings.append(
+                "Ignored an invalid server-provided server_ca_pem"
+                + ("; the last known frps CA stays pinned." if new.get("server_ca_pem") else ".")
+            )
+        else:
+            new["server_ca_pem"] = ca
+    raw_name = body.get("server_name")
+    if not _is_unset(raw_name):
+        name = normalize_host(raw_name)
+        if name is None:
+            warnings.append("Ignored invalid server-provided server_name.")
+        else:
+            new["server_name"] = name
+
+    new.pop("account_email_masked", None)
+    raw_email = body.get("account_email_masked")
+    if not _is_unset(raw_email):
+        email = normalize_masked_email(raw_email)
+        if email is None:
+            warnings.append("Ignored invalid server-provided account_email_masked.")
+        else:
+            new["account_email_masked"] = email
+
     new["version"] = STATE_VERSION
     new["updated_at"] = utc_now()
     return new, warnings
@@ -705,6 +919,28 @@ class Settings:
     log_level: str
     #: key -> "option" | "server" | "default" | "server_addr"
     sources: Dict[str, str] = field(default_factory=dict)
+    #: verify_server option (default True).
+    verify_server: bool = True
+    #: Name the frps certificate must be valid for (server-provided
+    #: server_name, else the effective server_addr).
+    server_name: str = ""
+    #: Validated CA bundle from the state (None: none known).
+    ca_pem: Optional[str] = field(default=None, repr=False)
+
+    @property
+    def tls_mode(self) -> str:
+        """TLS_VERIFIED, TLS_UNVERIFIED (no CA known) or TLS_DISABLED."""
+        if not self.verify_server:
+            return TLS_DISABLED
+        return TLS_VERIFIED if self.ca_pem else TLS_UNVERIFIED
+
+    def describe_tls(self) -> str:
+        mode = self.tls_mode
+        if mode == TLS_VERIFIED:
+            return f"tls=verified (CA from server, serverName={self.server_name})"
+        if mode == TLS_DISABLED:
+            return "tls=on, frps certificate NOT verified (verify_server=false)"
+        return "tls=on, frps certificate NOT verified (the server provided no CA)"
 
     def describe(self) -> str:
         """One-line, secret-free summary for logs."""
@@ -713,7 +949,7 @@ class Settings:
             f"server={self.server_addr}:{self.server_port} "
             f"(addr from {src.get('server_addr')}, port from {src.get('server_port')}), "
             f"domain_base={self.domain_base} (from {src.get('domain_base')}), "
-            f"local={self.local_host}:{self.local_port}, tls=on"
+            f"local={self.local_host}:{self.local_port}, {self.describe_tls()}"
         )
 
 
@@ -740,6 +976,11 @@ def effective_settings(options: Mapping[str, Any], state: Mapping[str, Any]) -> 
     if sources["domain_base"] == "default" and derived:
         sources["domain_base"] = "server_addr"
 
+    verify_server = pick("verify_server", True)
+    # Re-validated on every use: the state file may be old or tampered with.
+    ca_pem = normalize_ca_pem(state.get("server_ca_pem")) if state.get("server_ca_pem") else None
+    server_name = normalize_host(state.get("server_name")) or server_addr
+
     return Settings(
         app_base=pick("app_base", DEFAULT_APP_BASE),
         api_base=pick("api_base", DEFAULT_API_BASE),
@@ -750,6 +991,9 @@ def effective_settings(options: Mapping[str, Any], state: Mapping[str, Any]) -> 
         local_port=pick("local_port", DEFAULT_LOCAL_PORT),
         log_level=pick("log_level", DEFAULT_LOG_LEVEL),
         sources=sources,
+        verify_server=verify_server,
+        server_name=server_name,
+        ca_pem=ca_pem,
     )
 
 
@@ -778,12 +1022,31 @@ def public_hostname(settings: Settings, subdomain: str) -> str:
     return f"{subdomain}.{settings.domain_base}"
 
 
-def render_frpc_toml(settings: Settings, subdomain: str, token: str) -> str:
-    """Render the frpc v0.65 TOML configuration."""
+def render_frpc_toml(
+    settings: Settings, subdomain: str, token: str, ca_file: Optional[str] = None
+) -> str:
+    """Render the frpc v0.65 TOML configuration.
+
+    ``ca_file`` (the path ``settings.ca_pem`` was written to) is required
+    when ``settings.tls_mode`` is TLS_VERIFIED.
+    """
     sub = normalize_subdomain(subdomain)
     tok = normalize_token(token)
     if sub is None or tok is None:
         raise ValueError("invalid subdomain or token")
+    if settings.tls_mode == TLS_VERIFIED:
+        if not ca_file or normalize_host(settings.server_name) is None:
+            raise ValueError("server verification needs a CA file and a valid server name")
+        tls_lines = [
+            "# Verify the frps certificate: it must chain to the CA provided by the",
+            "# LinumIQ server (pinned in the state file) and be valid for serverName.",
+            f"transport.tls.trustedCaFile = {toml_str(ca_file)}",
+            f"transport.tls.serverName = {toml_str(settings.server_name)}",
+        ]
+    elif settings.tls_mode == TLS_DISABLED:
+        tls_lines = ["# The frps certificate is NOT verified (add-on option verify_server: false)."]
+    else:
+        tls_lines = ["# The frps certificate is NOT verified (the server provided no CA)."]
     lines = [
         "# Generated by the FRP Tunnel add-on from /data/frp-state.json and the",
         "# add-on options. Re-rendered on every frpc (re)start: do not edit.",
@@ -793,6 +1056,7 @@ def render_frpc_toml(settings: Settings, subdomain: str, token: str) -> str:
         "",
         "# Encrypt the frpc <-> frps connection (control + proxied traffic).",
         "transport.tls.enable = true",
+        *tls_lines,
         "",
         "# Per-tunnel credential, validated by the frps auth plugin (metas.token).",
         "[metadatas]",
@@ -819,16 +1083,48 @@ class RenderResult:
     NOT_PAIRED = "not_paired"
 
 
+def ensure_searchable(directory: Path, gid: Optional[int]) -> bool:
+    """frpc (group ``gid``) must be able to reach the files it reads in
+    ``directory`` (/data). Supervisor creates the add-on's data directory
+    0755; should it not be searchable for frpc, ``o+x`` is added - search
+    only, no listing, and every file keeps its own mode (the state file stays
+    0600). Returns True if the mode was changed."""
+    if gid is None:
+        return False
+    st = directory.stat()
+    if st.st_mode & 0o001 or (st.st_gid == gid and st.st_mode & 0o010):
+        return False
+    os.chmod(directory, (st.st_mode & 0o7777) | 0o001)
+    LOG.warning("%s was not searchable for frpc; added o+x.", directory)
+    return True
+
+
+def _write_if_changed(path: Path, text: str, mode: int, gid: Optional[int]) -> bool:
+    """Atomically (re)write ``path`` unless it already holds ``text``; fix
+    its mode/group either way. Returns True if the content changed."""
+    try:
+        current = path.read_text(encoding="utf-8")
+    except OSError:
+        current = None
+    if current == text:
+        ensure_access(path, mode, gid)
+        return False
+    atomic_write(path, text, mode, gid)
+    return True
+
+
 def render_from_disk(
     paths: Optional[Paths] = None, options: Optional[Mapping[str, Any]] = None
 ) -> Tuple[str, Optional[Settings]]:
-    """(Re)write frpc.toml from options + state (options are read from
-    options.json unless given). Raises ValueError if the state is paired but
-    unusable.
+    """(Re)write frpc.toml (and frps-ca.pem) from options + state (options
+    are read from options.json unless given). Raises ValueError if the state
+    is paired but unusable.
 
     Without a valid pairing (state file missing, corrupt or incomplete) a
-    leftover frpc.toml is deleted, so its old token can never be used. The
-    caller should hold ``state_lock``.
+    leftover frpc.toml and frps-ca.pem are deleted, so the old token can
+    never be used. frps-ca.pem exists only while frpc.toml references it.
+    Returns RENDERED when either file changed (frpc must restart). The caller
+    should hold ``state_lock``.
     """
     paths = paths or default_paths()
     if options is None:
@@ -836,17 +1132,21 @@ def render_from_disk(
     state = load_state(paths)
     if not is_paired(state):
         remove_file(paths.frpc_toml)
+        remove_file(paths.frps_ca)
         return RenderResult.NOT_PAIRED, None
     settings = effective_settings(options, state)
-    text = render_frpc_toml(settings, state["subdomain"], state["token"])
-    try:
-        current = paths.frpc_toml.read_text(encoding="utf-8")
-    except OSError:
-        current = None
-    if current == text:
-        return RenderResult.UNCHANGED, settings
-    atomic_write(paths.frpc_toml, text)
-    return RenderResult.RENDERED, settings
+    mode, gid = frpc_file_access()
+    ensure_searchable(paths.data_dir, gid)
+    changed = False
+    if settings.tls_mode == TLS_VERIFIED:
+        assert settings.ca_pem is not None
+        changed = _write_if_changed(paths.frps_ca, settings.ca_pem, mode, gid)
+        text = render_frpc_toml(settings, state["subdomain"], state["token"], str(paths.frps_ca))
+    else:
+        changed = remove_file(paths.frps_ca)
+        text = render_frpc_toml(settings, state["subdomain"], state["token"])
+    changed = _write_if_changed(paths.frpc_toml, text, mode, gid) or changed
+    return (RenderResult.RENDERED if changed else RenderResult.UNCHANGED), settings
 
 
 # ---------------------------------------------------------------------------
@@ -875,6 +1175,10 @@ def _cli(argv: list) -> int:
         return EXIT_NOT_PAIRED
     assert settings is not None
     LOG.info("frpc.toml %s: %s", result, settings.describe())
+    if settings.tls_mode != TLS_VERIFIED:
+        LOG.warning("The frps server certificate is not verified (%s); see the add-on documentation.",
+                    "verify_server is false" if settings.tls_mode == TLS_DISABLED
+                    else "the LinumIQ server provided no CA")
     return EXIT_OK
 
 

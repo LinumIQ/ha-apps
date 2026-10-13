@@ -196,6 +196,12 @@ body {
   border: 1px solid var(--color-success);
 }
 
+.flash-warn {
+  background: var(--color-warn-soft);
+  color: var(--color-warn-text);
+  border: 1px solid var(--color-warn-border);
+}
+
 .flash ul {
   margin: var(--space-2) 0 0;
   padding-left: var(--space-5);

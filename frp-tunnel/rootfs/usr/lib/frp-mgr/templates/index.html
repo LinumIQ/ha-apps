@@ -44,6 +44,12 @@
       <div class="flash flash-ok" role="status">{{ flash_ok }}</div>
       {% endif %}
 
+      {% for message in tls_warnings %}
+      <div class="flash flash-warn" role="alert">
+        <strong>Tunnel server not fully verified:</strong>&nbsp;{{ message }}
+      </div>
+      {% endfor %}
+
       {% if not paired and frpc_status == "running" %}
       <div class="flash flash-error" role="alert">
         <strong>frpc is running although this device is not paired.</strong>
@@ -87,6 +93,13 @@
           <span class="pairing-code__label">Your pairing code</span>
           <span class="pairing-code__value">{{ user_code }}</span>
         </div>
+        <p class="pairing-hint">
+          Approve this code only on <code>{{ app_host }}</code>, signed in
+          to <strong>your own</strong> LinumIQ account, and only if you
+          started this pairing yourself here. Never approve a code that
+          someone else sent you: it would connect their device to your
+          account.
+        </p>
 
         {% if verification_uri_complete %}
         <p class="pairing-link">
@@ -194,6 +207,9 @@
           subdomain - your public URL will be
           <code>https://&lt;subdomain&gt;.{{ domain_base }}</code>.
         </p>
+        {% if account_email_masked %}
+        <p>Paired with <strong>{{ account_email_masked }}</strong>.</p>
+        {% endif %}
         <form method="post" action="./subdomain/change" class="form-inline">
           <div class="field">
             <label for="first-subdomain">Subdomain</label>
@@ -242,6 +258,17 @@
 
         <dl class="meta-list">
           <div class="meta-list__row">
+            <dt class="meta-list__label">Account</dt>
+            <dd class="meta-list__value">
+              {% if account_email_masked %}
+              Paired with <strong>{{ account_email_masked }}</strong>
+              {% else %}
+              <span class="status-warn">unknown</span> (the server does not
+              report it)
+              {% endif %}
+            </dd>
+          </div>
+          <div class="meta-list__row">
             <dt class="meta-list__label">Public URL</dt>
             <dd class="meta-list__value">
               <a href="{{ public_url }}" target="_blank" rel="noopener noreferrer">
@@ -260,7 +287,12 @@
           <div class="meta-list__row">
             <dt class="meta-list__label">Tunnel server</dt>
             <dd class="meta-list__value">
-              <code>{{ server_addr }}:{{ server_port }}</code> (TLS)
+              <code>{{ server_addr }}:{{ server_port }}</code>
+              {% if tls_verified %}
+              (TLS, certificate verified for <code>{{ server_name }}</code>{% for ca in server_ca %}{% if loop.first %}; CA {% else %}, {% endif %}{{ ca.subject }}{% if ca.not_after %} until {{ ca.not_after }}{% endif %}{% endfor %})
+              {% else %}
+              (TLS, <span class="status-warn">certificate not verified</span>)
+              {% endif %}
             </dd>
           </div>
           <div class="meta-list__row">

@@ -1,8 +1,24 @@
+---
 name: Builder
 
+# Security (audit M15): no default token permissions (each job asks for what
+# it needs), every action pinned by commit SHA, checkout without persisted
+# credentials, and expression values reach shell code only through `env:`.
+permissions: {}
+
 env:
-  BUILD_ARGS: "--test"
-  MONITORED_FILES: "build.yaml config.yaml Dockerfile rootfs"
+  MONITORED_FILES: "build.yaml config.yaml Dockerfile rootfs requirements.txt apparmor.txt"
+  # home-assistant/builder 2024.08.2, pinned by image digest. The deprecated
+  # home-assistant/builder *action* is only a wrapper around this image, and
+  # it cannot be pinned by commit SHA (it derives the image tag from its own
+  # checkout path), so the image is run directly.
+  BUILDER_IMAGE: "ghcr.io/home-assistant/amd64-builder:2024.08.2"
+  BUILDER_DIGEST: "sha256:f55223d2c3a5aaf7ddf097a6c3fbfbb0a4154ed1140072031590c6ec0de5c50e"
+  # Repository of the images. Always passed: without it (and without an
+  # `image:` key in config.yaml, e.g. frp-tunnel) the builder tags the image
+  # "/<arch>-addon-<name>:<version>", which docker rejects (this is what made
+  # every frp-tunnel build fail).
+  IMAGE_REPOSITORY: "ghcr.io/linumiq"
 
 on:
   push:
@@ -28,75 +44,103 @@ jobs:
   init:
     runs-on: ubuntu-latest
     name: Initialize builds
+    permissions:
+      contents: read
     outputs:
       changed_addons: ${{ steps.changed_addons.outputs.addons }}
       changed: ${{ steps.changed_addons.outputs.changed }}
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
-
-      - name: Get changed files
-        id: changed_files
-        if: github.event_name == 'push' || github.event_name == 'pull_request'
-        uses: tj-actions/changed-files@v47
+          persist-credentials: false
 
       - name: Find add-on directories
         id: addons
         run: |
           # An add-on directory is any top-level dir containing config.yaml or
           # config.json (currently caddy-mtls and frp-tunnel). Output as a
-          # space-separated list (compatible with the downstream loop and the
-          # build matrix).
+          # space-separated list.
           addons=()
           for cfg in */config.yaml */config.json; do
             [[ -e "${cfg}" ]] || continue
-            addons+=("${cfg%/*}")
+            dir="${cfg%/*}"
+            [[ "${dir}" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "::error::unexpected add-on dir ${dir}"; exit 1; }
+            addons+=("${dir}")
           done
           # De-duplicate (config.yaml and config.json could co-exist).
           mapfile -t addons < <(printf '%s\n' "${addons[@]}" | sort -u)
           echo "addons=${addons[*]}" >> "${GITHUB_OUTPUT}"
           echo "Discovered add-ons: ${addons[*]}"
 
+      # Changed files come from git itself (no third-party action).
       - name: Get changed add-ons
         id: changed_addons
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          ADDONS: ${{ steps.addons.outputs.addons }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
         run: |
-          declare -a changed_addons
-          # On release or workflow_dispatch we always (re)build every add-on.
-          if [[ "${{ github.event_name }}" == "release" ]] \
-             || [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            for addon in ${{ steps.addons.outputs.addons }}; do
-              changed_addons+=("\"${addon}\",");
-            done
+          read -r -a addons <<< "${ADDONS}"
+          read -r -a monitored <<< "${MONITORED_FILES}"
+          selected=()
+          if [[ "${EVENT_NAME}" == "release" || "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            # On release or workflow_dispatch every add-on is (re)built.
+            selected=("${addons[@]}")
           else
-            for addon in ${{ steps.addons.outputs.addons }}; do
-              if [[ "${{ steps.changed_files.outputs.all_changed_files }}" =~ $addon ]]; then
-                for file in ${{ env.MONITORED_FILES }}; do
-                  if [[ "${{ steps.changed_files.outputs.all_changed_files }}" =~ $addon/$file ]]; then
-                    if [[ ! "${changed_addons[@]}" =~ $addon ]]; then
-                      changed_addons+=("\"${addon}\",");
-                    fi
+            base="${PR_BASE}"
+            [[ "${EVENT_NAME}" == "push" ]] && base="${PUSH_BEFORE}"
+            if [[ ! "${base}" =~ ^[0-9a-f]{40}$ || "${base}" =~ ^0+$ ]] \
+              || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+              # New branch or unknown base: compare with the parent commit.
+              base="$(git rev-parse --verify --quiet "${HEAD_SHA}^" || true)"
+            fi
+            if [[ -n "${base}" ]]; then
+              mapfile -t changed < <(git diff --name-only "${base}" "${HEAD_SHA}")
+            else
+              mapfile -t changed < <(git ls-files)
+            fi
+            printf 'Changed files:\n'
+            printf '  %s\n' "${changed[@]}"
+            for addon in "${addons[@]}"; do
+              for file in "${changed[@]}"; do
+                hit=false
+                for watched in "${monitored[@]}"; do
+                  if [[ "${file}" == "${addon}/${watched}" || "${file}" == "${addon}/${watched}/"* ]]; then
+                    hit=true
                   fi
                 done
-              fi
+                if [[ "${hit}" == true ]]; then
+                  selected+=("${addon}")
+                  break
+                fi
+              done
             done
           fi
-          changed=$(echo ${changed_addons[@]} | rev | cut -c 2- | rev)
-          if [[ -n ${changed} ]]; then
-            echo "Changed add-ons: $changed"
-            echo "changed=true" >> $GITHUB_OUTPUT
-            echo "addons=[$changed]" >> $GITHUB_OUTPUT
+          if (( ${#selected[@]} > 0 )); then
+            json="$(printf '"%s",' "${selected[@]}")"
+            echo "Changed add-ons: ${selected[*]}"
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+            echo "addons=[${json%,}]" >> "${GITHUB_OUTPUT}"
           else
-            echo "No add-on had any monitored files changed (${{ env.MONITORED_FILES }})"
-            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "No add-on had any monitored files changed (${MONITORED_FILES})"
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
           fi
 
+  # Test build of every changed add-on (push / pull request / manual run).
+  # NOTE: do NOT add `docker/setup-buildx-action`: it switches buildx to the
+  # `docker-container` driver, which leaves build results only in the build
+  # cache, and the builder's subsequent `docker tag` fails with `No such image`.
   build:
     needs: init
     runs-on: ubuntu-latest
-    if: needs.init.outputs.changed == 'true'
+    if: needs.init.outputs.changed == 'true' && github.event_name != 'release'
     name: Build ${{ matrix.arch }} ${{ matrix.addon }} add-on
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -104,41 +148,71 @@ jobs:
         arch: ["aarch64", "amd64"]
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
-      # On a published GitHub release every add-on is pushed to
-      # ghcr.io/linumiq/{arch}-addon-<dir> (e.g. amd64-addon-frp-tunnel);
-      # otherwise it is only test-built. An add-on uses the published image
-      # only once its config.yaml sets `image:` (frp-tunnel does not yet, so
-      # Supervisor builds it locally from the Dockerfile).
-      - name: Check if add-on is published
-        id: publish
+      - name: Test-build ${{ matrix.addon }} (${{ matrix.arch }})
+        env:
+          ADDON: ${{ matrix.addon }}
+          ARCH: ${{ matrix.arch }}
         run: |
-          if [[ "${{ github.event_name }}" == "release" ]]; then
-            echo "args=--docker-hub ghcr.io/linumiq" >> $GITHUB_OUTPUT
-          else
-            echo "args=--test" >> $GITHUB_OUTPUT
-          fi
+          docker run --rm --privileged \
+            -v /var/run/docker.sock:/var/run/docker.sock:ro \
+            -v "${GITHUB_WORKSPACE}:/data" \
+            "${BUILDER_IMAGE}@${BUILDER_DIGEST}" \
+            --test \
+            --docker-hub "${IMAGE_REPOSITORY}" \
+            "--${ARCH}" \
+            --target "/data/${ADDON}" \
+            --image "{arch}-addon-${ADDON}" \
+            --addon
+
+  # On a published GitHub release every add-on is built and pushed to
+  # ghcr.io/linumiq/{arch}-addon-<dir> (e.g. amd64-addon-frp-tunnel). An add-on
+  # uses the published image only once its config.yaml sets `image:`
+  # (frp-tunnel does not yet, so Supervisor builds it from the Dockerfile).
+  publish:
+    needs: init
+    runs-on: ubuntu-latest
+    if: needs.init.outputs.changed == 'true' && github.event_name == 'release'
+    name: Publish ${{ matrix.arch }} ${{ matrix.addon }} add-on
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        addon: ${{ fromJson(needs.init.outputs.changed_addons) }}
+        arch: ["aarch64", "amd64"]
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Login to GitHub Container Registry
-        if: github.event_name == 'release'
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          REGISTRY_USER: ${{ github.repository_owner }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "${REGISTRY_TOKEN}" | docker login ghcr.io --username "${REGISTRY_USER}" --password-stdin
 
-      # NOTE: do NOT add `docker/setup-buildx-action` here. It switches
-      # buildx to the `docker-container` driver, which leaves build
-      # results only in the build cache. The home-assistant/builder
-      # action then fails its subsequent `docker tag` step with
-      # `No such image`. The builder manages its own buildx setup.
-      - name: Build ${{ matrix.addon }} add-on
-        uses: home-assistant/builder@2024.08.2
-        with:
-          args: |
-            ${{ steps.publish.outputs.args }} \
-            --${{ matrix.arch }} \
-            --target /data/${{ matrix.addon }} \
-            --image "{arch}-addon-${{ matrix.addon }}" \
+      - name: Build and push ${{ matrix.addon }} (${{ matrix.arch }})
+        env:
+          ADDON: ${{ matrix.addon }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          docker run --rm --privileged \
+            -v /var/run/docker.sock:/var/run/docker.sock:ro \
+            -v "${HOME}/.docker:/root/.docker" \
+            -v "${GITHUB_WORKSPACE}:/data" \
+            "${BUILDER_IMAGE}@${BUILDER_DIGEST}" \
+            --docker-hub "${IMAGE_REPOSITORY}" \
+            "--${ARCH}" \
+            --target "/data/${ADDON}" \
+            --image "{arch}-addon-${ADDON}" \
             --addon
+
+      - name: Logout from GitHub Container Registry
+        if: always()
+        run: docker logout ghcr.io

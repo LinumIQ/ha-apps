@@ -5,6 +5,99 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-10-13
+
+Security release (platform audit 2026-10-12: H4, M3, M4, add-on lows).
+
+### Breaking - what a 2.1.x user must know
+
+- **The tunnel server's certificate is verified** (new advanced option
+  `verify_server`, on by default). With a LinumIQ server that provides its
+  certificate authority (contract v2.2) nothing needs to be done - the CA is
+  pinned on the next start or **Refresh tunnel config**. If frpc then logs
+  `certificate verify failed` / `x509: ...`, see DOCS.md, Troubleshooting.
+  Only an explicit `verify_server: false` disables verification.
+- **Pairing data is excluded from Home Assistant backups** (`backup_exclude`):
+  the state file with the device and tunnel tokens, `frpc.toml`, the pinned CA
+  and a pairing in progress. A restored backup starts **unpaired** - pair
+  again and remove the old device in your LinumIQ account.
+- Requests that change state (pairing, refresh, subdomain change, unpair) must
+  be same-origin. Nothing changes in the Home Assistant UI; scripts that call
+  the panel must send `Sec-Fetch-Site: same-origin`.
+- `frpc.toml` is now `root:frpc` mode 640 (frpc runs as the unprivileged user
+  `frpc`); the unused `addon_config` folder mapping was removed.
+- Upgrading from 2.0.x: the notes of 2.1.0 below still apply - in particular
+  `log_level: warn` must be changed to `warning`.
+
+### Security
+
+- **frps is authenticated (H4).** The server-provided `server_ca_pem` is
+  accepted only if it consists of 1-8 PEM `CERTIFICATE` blocks that OpenSSL
+  parses as X.509 CA certificates (anything else - private keys, leaf
+  certificates, junk - is rejected), re-encoded, persisted in the state and
+  written to `/data/frps-ca.pem` (atomic, `root:frpc` 0640). `frpc.toml` pins
+  it with `transport.tls.trustedCaFile` and `transport.tls.serverName`
+  (`server_name`, else `server_addr`). A response without a CA or with an
+  invalid one never removes a pinned CA (no silent downgrade); the panel warns
+  instead. Without any CA (older servers) or with `verify_server: false` the
+  panel shows a permanent warning and the renderer logs one on every start.
+- **Ingress allow-list bypass fixed (M3).** The `/_health` exemption, which
+  compared Starlette's `request.url.path` (rebuilt from the `Host` header,
+  GHSA-86qp-5c8j-p5mr), is gone; a pure ASGI guard in front of every route
+  (static files and 404s included) decides from the TCP peer only, and uvicorn
+  runs with `--no-proxy-headers`. Regression tests send crafted `Host`
+  headers.
+- **Python dependencies without known vulnerabilities.** The panel now runs on
+  plain Starlette 1.7.0 (FastAPI and pydantic removed) with python-multipart
+  0.0.32, uvicorn 0.54.0 and Jinja2 3.1.6, installed from a hash-pinned
+  `requirements.txt` (`pip --require-hashes --only-binary=:all:`) into a
+  virtualenv instead of Alpine's py3 packages (Starlette 0.47.2: 5 advisories,
+  python-multipart 0.0.20: 7 advisories, incl. the Range-header DoS).
+- **CSRF protection for the panel.** Every POST must carry
+  `Sec-Fetch-Site: same-origin` or a matching `Origin`.
+- **Pairing codes stay out of URLs and logs (M4).** The code is no longer put
+  into the redirect URL (`?ok=Pairing code ready: ...`, which also ended up in
+  uvicorn's access log) nor into the add-on log; it is shown in the page body
+  only, with an anti-phishing hint. The status card shows the masked e-mail of
+  the paired account ("Paired with g\*\*\*@linumiq.com", from the server's
+  `account_email_masked`), so a device paired with a foreign account is
+  noticed.
+- **AppArmor least privilege.** No `file,` catch-all, no `sys_admin`,
+  `sys_ptrace`, `dac_override`, `dac_read_search` or `fsetid`; explicit rules
+  for s6-overlay, bashio, the Python virtualenv, frpc and `/data`; signals and
+  ptrace reads only within the add-on. Verified under enforcement (full E2E
+  run and a CI smoke test with zero denials).
+- **frpc runs unprivileged** (`s6-setuidgid frpc`); it cannot read the state
+  file with the device token.
+- `X-Ingress-Path` is validated before it is used in a redirect (no
+  scheme-relative or dot-segment paths).
+- File permissions of everything copied into the image are normalised (they
+  depended on the build checkout's umask).
+
+### Added
+
+- Advanced option `verify_server` (bool, default on).
+- Panel: TLS state of the tunnel server (verified for `<server_name>`, CA
+  subject and expiry, or a warning), the paired account, warnings when the
+  server stops sending its CA, sends an invalid one, or the pinned CA expired.
+- `GET /api/status`: `tls_mode`, `tls_verified`, `server_name`, `server_ca`,
+  `tls_warnings`, `account_email_masked`.
+- E2E harness: `E2E_FRPS_CA_FILE` (asserts the pinned CA, `trustedCaFile` /
+  `serverName`, a verified login and - `E2E_TLS_NEGATIVE` - that frpc refuses
+  a certificate for the wrong name), `E2E_FRPS_SERVER_NAME`,
+  `E2E_ACCOUNT_EMAIL_MASKED`, `E2E_CREATE_ARGS` (e.g. an AppArmor profile),
+  and checks for CSRF, the crafted-`Host` bypass, pairing-code hygiene and the
+  unprivileged frpc.
+- `tests/apparmor-smoke.sh`: boots the image confined by `apparmor.txt` and
+  fails on any denial (run in CI).
+
+### Changed
+
+- The panel's Python dependencies come from `requirements.txt` (hashes) in a
+  virtualenv at `/usr/lib/frp-mgr/.venv`; Python writes no bytecode at runtime.
+- Unit tests: `FRP_TESTS_REQUIRE_PANEL=1` replaces `FRP_TESTS_REQUIRE_FASTAPI`
+  (still accepted).
+
 ## [2.1.0] - 2026-10-12
 
 ### Breaking - what a 2.0.x user must adjust

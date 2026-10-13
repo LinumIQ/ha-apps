@@ -1,0 +1,4 @@
+# Not part of the image (the add-on build context is this directory).
+**/__pycache__
+**/*.pyc
+tests

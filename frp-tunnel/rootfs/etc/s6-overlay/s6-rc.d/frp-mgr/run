@@ -2,14 +2,20 @@
 # shellcheck shell=bash
 # ==============================================================================
 # Home Assistant Add-on: FRP Tunnel
-# Long-running frp-mgr FastAPI pairing panel served on the ingress port (8099).
+# Long-running frp-mgr pairing panel (Starlette) served on the ingress port (8099).
 #
 # The panel (and config.py) read the add-on options straight from
 # /data/options.json instead of bashio::config: bashio::config queries the
 # Supervisor API, which does not exist when the image runs outside Supervisor
 # (E2E tests) and would silently return empty values there.
+#
+# uvicorn runs from the panel's virtualenv (pinned, hash-checked
+# dependencies). --no-proxy-headers: the client address the ingress guard
+# checks is always the TCP peer, never a forwarded header.
 # ==============================================================================
 readonly OPTIONS_FILE="/data/options.json"
+readonly APP_DIR="/usr/lib/frp-mgr"
+readonly UVICORN="${APP_DIR}/.venv/bin/uvicorn"
 
 LOG_LEVEL="info"
 if [[ -r "${OPTIONS_FILE}" ]]; then
@@ -28,9 +34,11 @@ export FRP_MGR_LOG_LEVEL
 
 bashio::log.info "Starting frp-mgr pairing panel on port 8099..."
 
-cd /usr/lib/frp-mgr || bashio::exit.nok "frp-mgr application directory missing"
-exec uvicorn app:app \
+cd "${APP_DIR}" || bashio::exit.nok "frp-mgr application directory missing"
+exec "${UVICORN}" app:app \
+    --app-dir "${APP_DIR}" \
     --host 0.0.0.0 \
     --port 8099 \
     --no-server-header \
+    --no-proxy-headers \
     --log-level "${UVICORN_LOG_LEVEL}"

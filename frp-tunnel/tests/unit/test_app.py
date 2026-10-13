@@ -1,16 +1,19 @@
 """Unit tests for the pairing panel flows in frp-mgr/app.py.
 
-Needs FastAPI/Starlette (as installed in the add-on image); skipped otherwise
-(set FRP_TESTS_REQUIRE_FASTAPI=1 to turn the skip into a failure, as CI does).
-Backend calls and s6 are mocked. Run inside the built image against the
-installed panel code, e.g.:
+Needs the panel's dependencies (Starlette, Jinja2, python-multipart - as
+installed in the add-on image's virtualenv, or `pip install --require-hashes
+-r frp-tunnel/requirements.txt`); skipped otherwise. Set
+FRP_TESTS_REQUIRE_PANEL=1 (or the older FRP_TESTS_REQUIRE_FASTAPI=1) to turn
+the skip into a failure, as CI does. Backend calls and s6 are mocked. Run
+inside the built image against the installed panel code, e.g.:
 
     docker run --rm -v "$PWD/frp-tunnel/tests:/tests:ro" \
-        -e FRP_MGR_DIR=/usr/lib/frp-mgr -e FRP_TESTS_REQUIRE_FASTAPI=1 \
+        -e FRP_MGR_DIR=/usr/lib/frp-mgr -e FRP_TESTS_REQUIRE_PANEL=1 \
         --entrypoint python3 frp-tunnel-test -m unittest discover -s /tests/unit -v
 """
 from __future__ import annotations
 
+import asyncio
 import http.server
 import json
 import os
@@ -21,6 +24,7 @@ import threading
 import unittest
 from pathlib import Path
 from unittest import mock
+from urllib.parse import urlencode
 
 FRP_MGR = Path(
     os.environ.get("FRP_MGR_DIR")
@@ -29,20 +33,26 @@ FRP_MGR = Path(
 sys.path.insert(0, str(FRP_MGR))
 
 try:
-    import fastapi  # noqa: F401
+    import jinja2  # noqa: F401
+    import python_multipart  # noqa: F401
+    import starlette
     from starlette.requests import Request
-except ImportError:  # pragma: no cover - host without FastAPI
-    if os.environ.get("FRP_TESTS_REQUIRE_FASTAPI") == "1":
+except ImportError:  # pragma: no cover - host without the panel dependencies
+    if "1" in (os.environ.get("FRP_TESTS_REQUIRE_PANEL"), os.environ.get("FRP_TESTS_REQUIRE_FASTAPI")):
         raise
-    fastapi = None
+    starlette = None
+
+from tls_fixtures import CA1, CA2, EXPIRED_CA  # noqa: E402
 
 TOKEN = "c" * 64
 DEVICE_TOKEN = "DEVICE-TOKEN-SECRET-0123456789"
 DEVICE_CODE = "0123456789abcdef" * 4
+SAME_ORIGIN = [("sec-fetch-site", "same-origin")]
 
 
-def make_request() -> "Request":
-    return Request({"type": "http", "method": "POST", "path": "/", "headers": [], "query_string": b""})
+def make_request(headers=()) -> "Request":
+    raw = [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers]
+    return Request({"type": "http", "method": "POST", "path": "/", "headers": raw, "query_string": b""})
 
 
 def get_request(query: bytes = b"") -> "Request":
@@ -62,7 +72,32 @@ def device_code_response(**extra):
     return body
 
 
-@unittest.skipIf(fastapi is None, "FastAPI not installed (run inside the add-on image)")
+def asgi_call(app, method, path, headers=(), client=("127.0.0.1", 50123), body=b"", host="panel.test"):
+    """Drive the ASGI app like uvicorn would; returns (status, headers, body)."""
+    sent = []
+    raw_headers = [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers]
+    if host is not None and not any(k == b"host" for k, _ in raw_headers):
+        raw_headers.append((b"host", host.encode("latin-1")))
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": method,
+        "scheme": "http", "path": path, "raw_path": path.encode(), "query_string": b"",
+        "root_path": "", "headers": raw_headers, "client": client, "server": ("127.0.0.1", 8099),
+    }
+    messages = [{"type": "http.request", "body": body, "more_body": False}]
+
+    async def receive():
+        return messages.pop(0) if messages else {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(app(scope, receive, send))
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    payload = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+    return start["status"], {k.decode().lower(): v.decode() for k, v in start["headers"]}, payload
+
+
+@unittest.skipIf(starlette is None, "panel dependencies not installed (run inside the add-on image)")
 class PanelFlowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -112,7 +147,11 @@ class PanelFlowTests(unittest.TestCase):
         body = {"subdomain": "home", "token": TOKEN, "server_addr": "linumiq.net",
                 "server_port": 7001, "domain_base": "dev.linumiq.net"}
         body.update(extra)
-        return body
+        return {k: v for k, v in body.items() if v is not ...}
+
+    def _tunnel_v22(self, **extra):
+        return self._tunnel(**dict({"server_name": "frps.linumiq.net", "server_ca_pem": CA1,
+                                    "account_email_masked": "g***@linumiq.com"}, **extra))
 
     def _start_pairing(self, **extra):
         self.cfg.write_json(self.paths.pairing, dict({"device_code": DEVICE_CODE, "user_code": "ABCD-EFGH",
@@ -126,7 +165,7 @@ class PanelFlowTests(unittest.TestCase):
     def test_pair_start_stores_validated_values(self):
         self.backend[("POST", "/api/device/code")] = (200, device_code_response(extra="<x>"))
         resp = self.app.pair_start(make_request())
-        self.assertIn("ok=", resp.headers["location"])
+        self.assertEqual(resp.headers["location"], "/")
         stored = json.loads(self.paths.pairing.read_text())
         self.assertEqual(stored["user_code"], "ABCD-EF23")
         self.assertEqual(stored["interval"], 5)
@@ -159,6 +198,18 @@ class PanelFlowTests(unittest.TestCase):
                 for value in extra.values():
                     if isinstance(value, str) and len(value) > 4:
                         self.assertNotIn(value, ctx.exception.message)
+
+    def test_pairing_code_is_never_put_into_a_url_or_the_log(self):
+        self.backend[("POST", "/api/device/code")] = (200, device_code_response())
+        with self.assertLogs("frp-mgr", "INFO") as logs:
+            resp = self.app.pair_start(make_request([("X-Ingress-Path", "/api/hassio_ingress/abc")]))
+        self.assertEqual(resp.headers["location"], "/api/hassio_ingress/abc/")
+        self.assertNotIn("ABCD", " ".join(logs.output))
+        self.assertTrue(any("Pairing started" in line for line in logs.output))
+        # ... it is shown in the page body only, with the anti-phishing hint.
+        body = self.app.index(get_request()).body.decode()
+        self.assertIn("ABCD-EF23", body)
+        self.assertIn("Never approve a code that", body)
 
     def test_stored_unsafe_pairing_is_never_rendered(self):
         # A pairing file written by an older version / tampered with.
@@ -321,11 +372,12 @@ class PanelFlowTests(unittest.TestCase):
         self.assertEqual(self.app._validate_subdomain(" My-Home "), "my-home")
 
     def test_unpair_removes_everything(self):
-        self._paired()
+        self._paired(**self._tunnel_v22())
+        self.assertTrue(self.paths.frps_ca.exists())
         self.backend[("DELETE", "/api/device/tunnel")] = (200, {"ok": True})
         resp = self.app.unpair(make_request())
         self.assertIn("ok=", resp.headers["location"])
-        for path in (self.paths.state, self.paths.frpc_toml, self.paths.pairing):
+        for path in (self.paths.state, self.paths.frpc_toml, self.paths.pairing, self.paths.frps_ca):
             self.assertFalse(path.exists())
         self.assertEqual(self.calls[-1][:2], ("DELETE", "/api/device/tunnel"))
         self.assertEqual(self.calls[-1][3], DEVICE_TOKEN)
@@ -496,6 +548,172 @@ class PanelFlowTests(unittest.TestCase):
         self.assertEqual(status["public_url"], "https://home.dev.linumiq.net")
         self.assertEqual(status["sources"]["domain_base"], "server")
         self.assertTrue(status["tls"])
+
+    # -- server verification (H4) / account (M4) --------------------------------
+
+    def test_pairing_with_v22_server_pins_the_ca(self):
+        self._start_pairing()
+        self.backend[("POST", "/api/device/token")] = (200, {"device_token": DEVICE_TOKEN})
+        self.backend[("GET", "/api/device/tunnel")] = (200, self._tunnel_v22())
+        self.assertEqual(self.app.pair_poll()["status"], "paired")
+        self.assertEqual(self.paths.frps_ca.read_text(), CA1)
+        toml = self.paths.frpc_toml.read_text()
+        self.assertIn(f'transport.tls.trustedCaFile = "{self.paths.frps_ca}"', toml)
+        self.assertIn('transport.tls.serverName = "frps.linumiq.net"', toml)
+        status = self.app.api_status()
+        self.assertEqual((status["tls_mode"], status["tls_verified"]), ("verified", True))
+        self.assertEqual(status["server_name"], "frps.linumiq.net")
+        self.assertEqual(status["account_email_masked"], "g***@linumiq.com")
+        self.assertEqual(status["tls_warnings"], [])
+        self.assertNotIn("BEGIN CERTIFICATE", json.dumps(status))
+        body = self.app.index(get_request()).body.decode()
+        self.assertIn("Paired with <strong>g***@linumiq.com</strong>", body)
+        self.assertIn("certificate verified for <code>frps.linumiq.net</code>", body)
+        self.assertIn("Test frps CA 1 until 2125-12-31", body)
+        self.assertNotIn("flash-warn", body)
+
+    def test_old_server_without_ca_is_flagged(self):
+        self._paired()
+        status = self.app.api_status()
+        self.assertEqual((status["tls_mode"], status["account_email_masked"]), ("unverified", ""))
+        self.assertEqual(len(status["tls_warnings"]), 1)
+        body = self.app.index(get_request()).body.decode()
+        self.assertIn("flash-warn", body)
+        self.assertIn("certificate not verified", body)
+        self.assertIn("did not provide the certificate authority", body)
+        self.assertNotIn("trustedCaFile", self.paths.frpc_toml.read_text())
+
+    def test_refresh_keeps_ca_when_server_stops_sending_it(self):
+        self._paired(**self._tunnel_v22())
+        self.backend[("GET", "/api/device/tunnel")] = (
+            200, self._tunnel_v22(server_ca_pem=..., server_name=...))
+        resp = self.app.tunnel_refresh(make_request())
+        self.assertIn("up+to+date", resp.headers["location"])  # no downgrade, nothing to restart
+        self.app._restart_frpc.assert_not_called()
+        self.assertIn("trustedCaFile", self.paths.frpc_toml.read_text())
+        status = self.app.api_status()
+        self.assertEqual(status["tls_mode"], "verified")
+        self.assertTrue(any("no longer sends" in w for w in status["tls_warnings"]))
+        # An invalid CA neither replaces nor removes the pinned one.
+        self.backend[("GET", "/api/device/tunnel")] = (200, self._tunnel_v22(server_ca_pem="garbage"))
+        self.app.tunnel_refresh(make_request())
+        self.assertEqual(self.paths.frps_ca.read_text(), CA1)
+        self.assertTrue(any("invalid certificate authority" in w for w in self.app.api_status()["tls_warnings"]))
+        # A new valid CA (rotation) replaces it and restarts frpc.
+        self.backend[("GET", "/api/device/tunnel")] = (200, self._tunnel_v22(server_ca_pem=CA2 + CA1))
+        resp = self.app.tunnel_refresh(make_request())
+        self.assertIn("updated", resp.headers["location"])
+        self.app._restart_frpc.assert_called_once()
+        self.assertEqual(self.paths.frps_ca.read_text(), CA2 + CA1)
+        self.assertEqual(self.app.api_status()["tls_warnings"], [])
+
+    def test_verify_server_false_is_explicit_and_visible(self):
+        self._paired(**self._tunnel_v22())
+        with mock.patch.object(self.app, "OPTIONS", self.cfg.parse_options({"verify_server": False})):
+            self.backend[("GET", "/api/device/tunnel")] = (200, self._tunnel_v22())
+            self.app.tunnel_refresh(make_request())
+            self.assertNotIn("trustedCaFile", self.paths.frpc_toml.read_text())
+            self.assertFalse(self.paths.frps_ca.exists())
+            status = self.app.api_status()
+            self.assertEqual(status["tls_mode"], "disabled")
+            self.assertTrue(any("verify_server" in w for w in status["tls_warnings"]))
+
+    def test_expired_ca_is_warned_about(self):
+        self._paired(**self._tunnel_v22(server_ca_pem=EXPIRED_CA))
+        self.assertTrue(any("expired" in w for w in self.app.api_status()["tls_warnings"]))
+
+    # -- ingress guard / CSRF (ASGI level, as uvicorn drives the app) ----------
+
+    def test_health_has_no_ingress_exemption(self):
+        self.assertEqual(asgi_call(self.app.app, "GET", "/_health")[:1], (200,))
+        status, _, body = asgi_call(self.app.app, "GET", "/_health", client=("10.1.2.3", 4000))
+        self.assertEqual((status, body), (403, b"Forbidden: frp-mgr is only reachable via Home Assistant ingress."))
+
+    def test_crafted_host_header_cannot_bypass_the_ingress_guard(self):
+        # GHSA-86qp-5c8j-p5mr: Starlette rebuilt request.url from Host, so
+        # "Host: x/_health?" made request.url.path == "/_health" for POST /unpair.
+        self._paired()
+        self.backend[("DELETE", "/api/device/tunnel")] = (200, {"ok": True})
+        for host in ("x/_health?a=", "x/_health#", "x/static/style.css?", "127.0.0.1"):
+            for client in (("10.1.2.3", 4000), ("172.30.32.3", 1), ("", 0), None):
+                with self.subTest(host=host, client=client):
+                    status, _, _ = asgi_call(self.app.app, "POST", "/unpair", SAME_ORIGIN,
+                                             client=client, host=host)
+                    self.assertEqual(status, 403)
+        self.assertTrue(self.paths.state.exists())
+        self.assertEqual(self.calls, [])
+        # Static files are behind the guard too.
+        self.assertEqual(asgi_call(self.app.app, "GET", "/static/style.css", client=("10.1.2.3", 1))[0], 403)
+        self.assertEqual(asgi_call(self.app.app, "GET", "/static/style.css")[0], 200)
+
+    def test_post_requires_same_origin(self):
+        self._paired()
+        self.backend[("GET", "/api/device/tunnel")] = (200, self._tunnel())
+        cases = [
+            ([], 403),
+            ([("Sec-Fetch-Site", "cross-site")], 403),
+            ([("Sec-Fetch-Site", "same-site")], 403),
+            ([("Sec-Fetch-Site", "none")], 403),
+            ([("Sec-Fetch-Site", "cross-site"), ("Origin", "http://panel.test")], 403),
+            ([("Origin", "null")], 403),
+            ([("Origin", "https://evil.example")], 403),
+            ([("Origin", "http://panel.test.evil.example")], 403),
+            ([("Origin", "javascript:x")], 403),
+            ([("Sec-Fetch-Site", "same-origin")], 303),
+            ([("Sec-Fetch-Site", "Same-Origin")], 303),
+            ([("Origin", "http://panel.test")], 303),       # browsers without Fetch Metadata
+            ([("Origin", "https://PANEL.test")], 303),
+        ]
+        for headers, expected in cases:
+            with self.subTest(headers=headers):
+                status, resp_headers, _ = asgi_call(self.app.app, "POST", "/tunnel/refresh", headers)
+                self.assertEqual(status, expected)
+                if expected == 303:
+                    self.assertIn("ok=", resp_headers["location"])
+        # Every state-changing route is covered (not only /tunnel/refresh).
+        for path in ("/pair/start", "/pair/poll", "/subdomain/change", "/unpair"):
+            with self.subTest(path=path):
+                self.assertEqual(asgi_call(self.app.app, "POST", path)[0], 403)
+        self.assertTrue(self.paths.state.exists())
+        # Reads need no Fetch Metadata.
+        status, _, body = asgi_call(self.app.app, "GET", "/api/status")
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["paired"])
+
+    def test_poll_and_form_endpoints_over_asgi(self):
+        self._start_pairing()
+        self.backend[("POST", "/api/device/token")] = (400, {"error": "authorization_pending"})
+        status, headers, body = asgi_call(self.app.app, "POST", "/pair/poll", SAME_ORIGIN)
+        self.assertEqual((status, json.loads(body)), (200, {"status": "pending"}))
+        self.assertTrue(headers["content-type"].startswith("application/json"))
+        self.paths.pairing.unlink()
+        self._paired()
+        self.backend[("POST", "/api/device/tunnel")] = (200, self._tunnel(subdomain="newhome", token="d" * 64))
+        form = urlencode({"subdomain": "NewHome"}).encode()
+        status, headers, _ = asgi_call(
+            self.app.app, "POST", "/subdomain/change",
+            SAME_ORIGIN + [("Content-Type", "application/x-www-form-urlencoded"),
+                           ("X-Ingress-Path", "/api/hassio_ingress/tok-EN_1")], body=form)
+        self.assertEqual(status, 303)
+        self.assertTrue(headers["location"].startswith("/api/hassio_ingress/tok-EN_1/?ok="))
+        self.assertEqual(self.calls[-1][2], {"subdomain": "newhome"})
+        # A missing field is a normal validation error, not a crash.
+        status, headers, _ = asgi_call(self.app.app, "POST", "/subdomain/change", SAME_ORIGIN)
+        self.assertEqual(status, 303)
+        self.assertIn("error=Subdomain+is+required", headers["location"])
+
+    def test_invalid_ingress_path_is_never_used_for_redirects(self):
+        for prefix in ("//evil.example", "https://evil.example", "/a/../b", "/x\\y", "/x y", "/a//b"):
+            with self.subTest(prefix=prefix):
+                resp = self.app._redirect_home(make_request([("X-Ingress-Path", prefix)]), ok="x")
+                self.assertEqual(resp.headers["location"], "/?ok=x")
+        resp = self.app._redirect_home(make_request([("X-Ingress-Path", "/api/hassio_ingress/abc/")]))
+        self.assertEqual(resp.headers["location"], "/api/hassio_ingress/abc/")
+
+    def test_doubled_leading_slash_is_collapsed(self):
+        status, _, body = asgi_call(self.app.app, "GET", "//api/status")
+        self.assertEqual(status, 200)
+        self.assertIn(b'"paired"', body)
 
     def test_ingress_allow_list(self):
         nets = self.app._parse_allowed_clients("172.30.32.2, 127.0.0.1,10.89.0.0/24,bogus")

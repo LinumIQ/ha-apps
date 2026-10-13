@@ -2,22 +2,28 @@
 FRP Tunnel - device pairing management web UI.
 
 Runs on the Home Assistant ingress port (8099), only reachable via the
-Supervisor's ingress proxy at 172.30.32.2. Provides a browser-based
-device-authorization pairing flow so users never touch tokens or
-subdomains in the add-on configuration.
+Supervisor's ingress proxy at 172.30.32.2 (IngressGuard: client IP from the
+TCP peer, never from headers; every POST must also be same-origin - CSRF).
+Provides a browser-based device-authorization pairing flow so users never
+touch tokens or subdomains in the add-on configuration.
+
+Plain Starlette (no FastAPI/pydantic); the Python dependencies are pinned
+with hashes in requirements.txt and installed into a virtualenv in the image.
 
 Pairing flow:
   1. User clicks "Start pairing" -> POST /api/device/code at app_base. Every
      value of the response is validated (config.parse_pairing_response)
      before it is stored or rendered: a malformed or foreign link, user code,
      device code or interval rejects the pairing.
-  2. Panel shows the user_code + a link to verification_uri_complete.
+  2. Panel shows the user_code (in the page body only - never in a URL or a
+     log line) + a link to verification_uri_complete.
   3. User opens the link in a browser, signs in, approves the device.
   4. Panel polls /api/device/token until approved and stores the device
      token immediately (it is minted exactly once).
   5. Panel fetches GET /api/device/tunnel ({subdomain, token, server_addr,
-     server_port[, domain_base]}), persists it in /data/frp-state.json,
-     renders /data/frpc.toml and restarts frpc.
+     server_port, domain_base, server_name, server_ca_pem,
+     account_email_masked}), persists it in /data/frp-state.json, renders
+     /data/frpc.toml (+ /data/frps-ca.pem, pinned) and restarts frpc.
 
 frpc.toml is also re-rendered from the persisted state on every frpc
 (re)start (see config.py and the frpc s6 service), so "Refresh tunnel
@@ -37,6 +43,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 from contextlib import asynccontextmanager, contextmanager
@@ -47,11 +54,15 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, build_opener
 from urllib.request import Request as URLRequest
 
-from fastapi import FastAPI, Form, Request, status
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-from starlette.middleware.base import BaseHTTPMiddleware
+from starlette import status
+from starlette.applications import Starlette
+from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import Headers
+from starlette.requests import Request
+from starlette.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
+from starlette.routing import Mount, Route
+from starlette.staticfiles import StaticFiles
+from starlette.templating import Jinja2Templates
 
 import config as cfg
 
@@ -450,33 +461,81 @@ def _client_allowed(host: str) -> bool:
     return any(addr in net for net in ALLOWED_CLIENT_NETS)
 
 
-class IngressOnlyMiddleware(BaseHTTPMiddleware):
-    """Reject any request not coming from the Supervisor ingress proxy.
+#: Methods that never change state (no CSRF check).
+SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
-    Also collapses repeated leading slashes in the request path. Home
-    Assistant's ingress proxy can forward requests with a doubled slash
-    (e.g. ``GET //`` for the iframe root) which would otherwise miss our
-    routes and return 404.
+
+def _same_origin(headers: Headers) -> bool:
+    """CSRF check for state-changing requests.
+
+    Browsers send ``Sec-Fetch-Site`` (a forbidden header page scripts cannot
+    set) on every request; when it is present it must be ``same-origin``
+    (HA ingress keeps the panel on the Home Assistant origin). Browsers
+    without Fetch Metadata still send ``Origin`` on a POST: it must then
+    name the requested host. A request with neither (or ``Origin: null``)
+    is refused.
+    """
+    site = headers.get("sec-fetch-site")
+    if site is not None:
+        return site.strip().lower() == "same-origin"
+    origin = (headers.get("origin") or "").strip()
+    host = (headers.get("host") or "").strip().lower()
+    if not origin or origin == "null" or not host:
+        return False
+    try:
+        parts = urlsplit(origin)
+    except ValueError:
+        return False
+    return parts.scheme in ("http", "https") and parts.netloc.lower() == host
+
+
+class IngressGuard:
+    """Pure ASGI middleware in front of everything (incl. static files).
+
+    1. Only clients in ``ALLOWED_INGRESS_IPS`` (the Supervisor ingress proxy
+       + loopback) are served - decided from the TCP peer in ``scope``, never
+       from ``Host``/``X-Forwarded-*`` headers, and with no path exemptions
+       (Starlette rebuilds ``request.url`` from the ``Host`` header, so a
+       path check on it can be fooled: GHSA-86qp-5c8j-p5mr).
+    2. Every state-changing request must be same-origin (``_same_origin``).
+    3. Repeated leading slashes are collapsed: Home Assistant's ingress
+       proxy can forward ``GET //`` for the iframe root.
     """
 
-    async def dispatch(self, request: Request, call_next):
-        # /_health is allowed from anywhere so the s6 healthcheck works.
-        if request.url.path == "/_health":
-            return await call_next(request)
-        client_host = request.client.host if request.client else ""
-        if not _client_allowed(client_host):
-            LOG.warning("Rejecting request from %s for %s", cfg.sanitize_text(client_host, 64),
-                        cfg.sanitize_text(request.url.path, 120))
-            return PlainTextResponse(
-                "Forbidden: frp-mgr is only reachable via Home Assistant ingress.",
-                status_code=status.HTTP_403_FORBIDDEN,
-            )
-        path = request.scope.get("path", "")
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)  # lifespan
+            return
+        client = scope.get("client") or ("", 0)
+        path = scope.get("path", "")
+        if not _client_allowed(str(client[0] or "")):
+            LOG.warning("Rejecting request from %s for %s", cfg.sanitize_text(client[0], 64),
+                        cfg.sanitize_text(path, 120))
+            await self._deny(scope, receive, send,
+                             "Forbidden: frp-mgr is only reachable via Home Assistant ingress.")
+            return
+        if scope["type"] != "http":
+            await self._deny(scope, receive, send, "Forbidden.")
+            return
+        if scope.get("method", "GET") not in SAFE_METHODS and not _same_origin(Headers(scope=scope)):
+            LOG.warning("Rejecting cross-site %s %s (Sec-Fetch-Site/Origin missing or foreign).",
+                        cfg.sanitize_text(scope.get("method"), 10), cfg.sanitize_text(path, 120))
+            await self._deny(scope, receive, send, "Forbidden: cross-site request.")
+            return
         if path.startswith("//"):
             new_path = "/" + path.lstrip("/")
-            request.scope["path"] = new_path
-            request.scope["raw_path"] = new_path.encode("ascii")
-        return await call_next(request)
+            scope = dict(scope, path=new_path, raw_path=new_path.encode("utf-8"))
+        await self.app(scope, receive, send)
+
+    @staticmethod
+    async def _deny(scope, receive, send, text: str) -> None:
+        if scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        await PlainTextResponse(text, status_code=status.HTTP_403_FORBIDDEN)(scope, receive, send)
 
 
 # ---------------------------------------------------------------------------
@@ -484,7 +543,7 @@ class IngressOnlyMiddleware(BaseHTTPMiddleware):
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
-async def _lifespan(_app: FastAPI):
+async def _lifespan(_app: Starlette):
     LOG.info(
         "frp-mgr starting: app_base=%s (from %s), %s",
         APP_BASE,
@@ -495,28 +554,30 @@ async def _lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(
-    title="FRP Tunnel - Pairing Panel",
-    docs_url=None,
-    redoc_url=None,
-    openapi_url=None,
-    lifespan=_lifespan,
-)
-app.add_middleware(IngressOnlyMiddleware)
-
-if (HERE / "static").is_dir():
-    app.mount("/static", StaticFiles(directory=str(HERE / "static")), name="static")
-
-
-@app.exception_handler(FlashError)
-async def _flash_error_handler(request: Request, exc: FlashError) -> RedirectResponse:
+async def _flash_error_handler(request: Request, exc: Exception) -> Response:
     """Convert a FlashError into a 303 redirect with a banner."""
+    assert isinstance(exc, FlashError)
     return _redirect_home(request, error=exc.message)
 
 
-@app.exception_handler(BackendUnavailable)
-async def _backend_error_handler(request: Request, exc: BackendUnavailable) -> RedirectResponse:
+async def _backend_error_handler(request: Request, exc: Exception) -> Response:
     return _redirect_home(request, error=cfg.sanitize_text(exc, 300))
+
+
+# What Supervisor sends as X-Ingress-Path: /api/hassio_ingress/<token>.
+# Anything else (e.g. "//evil.example" - a scheme-relative URL - or dot
+# segments) is ignored.
+_INGRESS_PATH_RE = re.compile(r"(?:/(?!\.\.?(?:/|$))[A-Za-z0-9._~-]+)+")
+
+
+def _ingress_prefix(request: Request) -> str:
+    raw = request.headers.get("X-Ingress-Path", "").rstrip("/")
+    if not raw:
+        return ""
+    if _INGRESS_PATH_RE.fullmatch(raw):
+        return raw
+    LOG.warning("Ignoring an invalid X-Ingress-Path header.")
+    return ""
 
 
 def _redirect_home(
@@ -526,7 +587,7 @@ def _redirect_home(
     ok: Optional[str] = None,
 ) -> RedirectResponse:
     """Redirect back to the dashboard, staying inside the ingress iframe."""
-    ingress_prefix = request.headers.get("X-Ingress-Path", "").rstrip("/")
+    ingress_prefix = _ingress_prefix(request)
     params: Dict[str, str] = {}
     if error:
         params["error"] = cfg.sanitize_text(error, 300)
@@ -534,6 +595,43 @@ def _redirect_home(
         params["ok"] = cfg.sanitize_text(ok, 300)
     qs = "?" + urlencode(params) if params else ""
     return RedirectResponse(url=f"{ingress_prefix}/{qs}", status_code=status.HTTP_303_SEE_OTHER)
+
+
+def _tls_warnings(settings: cfg.Settings, state: Dict[str, Any], ca: list) -> list:
+    """User-facing warnings about the frps server verification."""
+    warnings = []
+    mode = settings.tls_mode
+    if mode == cfg.TLS_UNVERIFIED:
+        warnings.append(
+            "The LinumIQ server did not provide the certificate authority of the tunnel "
+            "server, so frpc cannot verify the server it connects to: the connection is "
+            "encrypted but not protected against an active man in the middle. Click "
+            "'Refresh tunnel config' after the server has been updated."
+        )
+    elif mode == cfg.TLS_DISABLED:
+        warnings.append(
+            "Server certificate verification is turned off (add-on option verify_server: "
+            "false). The connection is encrypted but the tunnel server is not authenticated."
+        )
+    note = state.get("server_ca_note")
+    if note == "missing" and mode == cfg.TLS_VERIFIED:
+        warnings.append(
+            "The LinumIQ server no longer sends the tunnel server's certificate authority. "
+            "The add-on keeps verifying against the last known one; if frpc cannot connect "
+            "('certificate verify failed'), see the add-on documentation."
+        )
+    elif note == "invalid":
+        warnings.append(
+            "The LinumIQ server sent an invalid certificate authority for the tunnel server; "
+            "it was ignored"
+            + (" and the last known one stays pinned." if mode == cfg.TLS_VERIFIED else ".")
+        )
+    if mode == cfg.TLS_VERIFIED and any(entry["expired"] for entry in ca):
+        warnings.append(
+            "The pinned certificate authority of the tunnel server has expired; frpc will "
+            "fail to connect. Click 'Refresh tunnel config' to fetch the current one."
+        )
+    return warnings
 
 
 def _view_model() -> Dict[str, Any]:
@@ -545,6 +643,9 @@ def _view_model() -> Dict[str, Any]:
     settings = _settings(state)
     subdomain = state.get("subdomain", "") if paired else ""
     public_host = cfg.public_hostname(settings, subdomain) if subdomain else ""
+    verified = settings.tls_mode == cfg.TLS_VERIFIED
+    ca = cfg.describe_ca(settings.ca_pem) if verified else []
+    has_device = bool(state.get("device_token"))
     return {
         "paired": paired,
         "approved_no_tunnel": bool(state.get("device_token")) and not paired,
@@ -563,6 +664,14 @@ def _view_model() -> Dict[str, Any]:
         "domain_base": settings.domain_base,
         "sources": dict(settings.sources),
         "tls": True,
+        "tls_mode": settings.tls_mode,
+        "tls_verified": verified,
+        "server_name": settings.server_name if verified else "",
+        "server_ca": ca,
+        "tls_warnings": _tls_warnings(settings, state, ca) if paired else [],
+        "account_email_masked": (
+            cfg.normalize_masked_email(state.get("account_email_masked")) or "" if has_device else ""
+        ),
         "local_host": settings.local_host,
         "local_port": settings.local_port,
         "app_base": settings.app_base,
@@ -575,13 +684,7 @@ def _view_model() -> Dict[str, Any]:
 # Routes - read-only
 # ---------------------------------------------------------------------------
 
-@app.get("/_health", response_class=PlainTextResponse)
-async def health() -> str:
-    return "ok"
-
-
-@app.get("/", response_class=HTMLResponse)
-def index(request: Request) -> Any:
+def index(request: Request) -> Response:
     ctx = _view_model()
     # Query parameters are attacker-controllable text: sanitised + escaped.
     ctx["flash_error"] = cfg.sanitize_text(request.query_params.get("error") or "", 300) or None
@@ -589,7 +692,6 @@ def index(request: Request) -> Any:
     return templates.TemplateResponse(request, "index.html", ctx)
 
 
-@app.get("/api/status")
 def api_status() -> Dict[str, Any]:
     """Machine-readable panel state (used by the E2E harness). No secrets."""
     return _view_model()
@@ -599,13 +701,14 @@ def api_status() -> Dict[str, Any]:
 # Routes - pairing flow
 # ---------------------------------------------------------------------------
 
-@app.post("/pair/start")
-def pair_start(request: Request):
+def pair_start(request: Request) -> Response:
     """Initiate device authorization: call /api/device/code, show user_code.
 
     The response is untrusted input that ends up in the ingress page: it is
     validated completely (cfg.parse_pairing_response) or the pairing is
-    rejected.
+    rejected. The user code is shown in the page body only: it is a
+    short-lived approval credential and must not end up in a URL (browser
+    history, access log) or the add-on log.
     """
     with _locked():
         if cfg.is_paired(_state()):
@@ -628,11 +731,10 @@ def pair_start(request: Request):
             ) from None
 
         cfg.write_json(PATHS.pairing, dict(pairing, created_at=cfg.utc_now()))
-    LOG.info("Pairing started (user_code %s).", pairing["user_code"])
-    return _redirect_home(request, ok=f"Pairing code ready: {pairing['user_code']}")
+    LOG.info("Pairing started; the pairing code is shown in the panel.")
+    return _redirect_home(request)
 
 
-@app.post("/pair/poll")
 def pair_poll() -> Dict[str, Any]:
     """Poll the token endpoint. Called via fetch() from the pairing page.
 
@@ -708,8 +810,7 @@ def pair_poll() -> Dict[str, Any]:
 # Routes - tunnel management
 # ---------------------------------------------------------------------------
 
-@app.post("/tunnel/refresh")
-def tunnel_refresh(request: Request):
+def tunnel_refresh(request: Request) -> Response:
     """Re-fetch the tunnel config (subdomain, token, server values) from the
     backend, re-render frpc.toml and restart frpc if anything changed."""
     with _locked():
@@ -724,8 +825,7 @@ def tunnel_refresh(request: Request):
     raise FlashError(message)
 
 
-@app.post("/subdomain/change")
-def subdomain_change(request: Request, subdomain: str = Form(...)):
+def subdomain_change(request: Request, subdomain: str) -> Response:
     """Claim or change the tunnel subdomain (the backend rotates the token)."""
     subdomain = _validate_subdomain(subdomain)
     with _locked():
@@ -766,17 +866,16 @@ def subdomain_change(request: Request, subdomain: str = Form(...)):
 # Routes - unpair
 # ---------------------------------------------------------------------------
 
-@app.post("/unpair")
-def unpair(request: Request):
+def unpair(request: Request) -> Response:
     """Stop the tunnel, remove all pairing state, revoke the device token.
 
     Order matters (all under the state lock, which the frpc service's
     renderer also takes): 1. the state file goes first, so any render from
     now on answers "not paired"; 2. frpc is taken down and awaited; 3. only
-    then frpc.toml (the old token) is removed and the service brought back up
-    into its wait loop; 4. the device token (kept in memory) is revoked
-    server-side. A failed revocation is reported - local data is gone either
-    way.
+    then frpc.toml (the old token) and the pinned frps CA are removed and the
+    service brought back up into its wait loop; 4. the device token (kept in
+    memory) is revoked server-side. A failed revocation is reported - local
+    data is gone either way.
     """
     with _locked():
         device_token = _state().get("device_token")
@@ -789,10 +888,11 @@ def unpair(request: Request):
         _clear_pairing()
 
         stopped = _stop_frpc()
-        try:
-            cfg.remove_file(PATHS.frpc_toml)
-        except OSError as exc:
-            LOG.error("Unpair: cannot remove frpc.toml: %s", cfg.sanitize_text(exc))
+        for leftover in (PATHS.frpc_toml, PATHS.frps_ca):
+            try:
+                cfg.remove_file(leftover)
+            except OSError as exc:
+                LOG.error("Unpair: cannot remove %s: %s", leftover.name, cfg.sanitize_text(exc))
         _start_frpc_service()
         if not stopped:
             LOG.warning("Unpair: frpc did not confirm it stopped; it restarts without a pairing.")
@@ -828,3 +928,56 @@ def _revoke_device_token(device_token: str) -> Optional[str]:
         LOG.info("Backend no longer accepts this device token (already revoked).")
         return None
     return f"HTTP {code}: {_error_text(body)}"
+
+
+# ---------------------------------------------------------------------------
+# ASGI application
+# ---------------------------------------------------------------------------
+# The route functions above are plain (sync) functions - easy to unit-test
+# with a Request object. Starlette runs sync endpoints in its thread pool;
+# the thin endpoints below adapt them (JSON bodies, form parsing).
+
+#: Limits for the only form the panel accepts (subdomain change).
+_FORM_LIMITS = {"max_files": 0, "max_fields": 4, "max_part_size": 1024}
+
+
+async def _health_endpoint(_request: Request) -> Response:
+    return PlainTextResponse("ok")
+
+
+def _status_endpoint(_request: Request) -> Response:
+    return JSONResponse(api_status())
+
+
+def _poll_endpoint(_request: Request) -> Response:
+    return JSONResponse(pair_poll())
+
+
+async def _subdomain_endpoint(request: Request) -> Response:
+    async with request.form(**_FORM_LIMITS) as form:
+        value = form.get("subdomain")
+    return await run_in_threadpool(subdomain_change, request, value if isinstance(value, str) else "")
+
+
+_ROUTES = [
+    Route("/_health", _health_endpoint, methods=["GET"]),
+    Route("/", index, methods=["GET"]),
+    Route("/api/status", _status_endpoint, methods=["GET"]),
+    Route("/pair/start", pair_start, methods=["POST"]),
+    Route("/pair/poll", _poll_endpoint, methods=["POST"]),
+    Route("/tunnel/refresh", tunnel_refresh, methods=["POST"]),
+    Route("/subdomain/change", _subdomain_endpoint, methods=["POST"]),
+    Route("/unpair", unpair, methods=["POST"]),
+]
+if (HERE / "static").is_dir():
+    _ROUTES.append(Mount("/static", StaticFiles(directory=str(HERE / "static")), name="static"))
+
+_starlette = Starlette(
+    routes=_ROUTES,
+    lifespan=_lifespan,
+    exception_handlers={FlashError: _flash_error_handler, BackendUnavailable: _backend_error_handler},
+)
+
+#: What uvicorn serves (``uvicorn app:app``): every request passes the
+#: IngressGuard first, including static files and 404s.
+app = IngressGuard(_starlette)

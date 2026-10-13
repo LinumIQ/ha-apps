@@ -32,13 +32,18 @@ the device from the same panel at any time.
 - The panel polls `POST /api/device/token` with the device code until
   the backend returns a long-lived `device_token` (stored immediately).
 - The panel then fetches the tunnel configuration (`GET /api/device/tunnel`
-  with the device token): `subdomain`, the per-tunnel frp `token`, and the
-  server settings `server_addr`, `server_port` and `domain_base`.
+  with the device token): `subdomain`, the per-tunnel frp `token`, the
+  server settings `server_addr`, `server_port` and `domain_base`, the
+  `server_name` and certificate authority (`server_ca_pem`) of the tunnel
+  server, and your account's masked e-mail address (`account_email_masked`).
 - Everything is validated and persisted in `/data/frp-state.json`; the panel
-  renders `/data/frpc.toml` and restarts `frpc`.
-- `frpc` connects to the remote `frps` server over TLS, authenticates with
+  renders `/data/frpc.toml` (and `/data/frps-ca.pem`) and restarts `frpc`.
+- `frpc` connects to the remote `frps` server over TLS, **verifies its
+  certificate** against the pinned certificate authority, authenticates with
   the per-tunnel token, and registers the HTTP proxy for
   `<subdomain>.<domain_base>`.
+- The panel shows which account the add-on is paired with ("Paired with
+  g\*\*\*@example.com"): if that is not your account, unpair immediately.
 
 ### Where the tunnel settings come from
 
@@ -81,15 +86,41 @@ changed). The panel also does this once in the background whenever the add-on
 starts. Use it after renaming your subdomain in the LinumIQ dashboard: the
 rename rotates the tunnel token.
 
-### Transport encryption (TLS)
+### Transport encryption and server verification (TLS)
 
 The generated configuration sets `transport.tls.enable = true`, so the control
 connection to frps and all proxied traffic between the add-on and the LinumIQ
-server are TLS-encrypted (frps accepts TLS clients by default; frpc 0.50+ also
-defaults to TLS, the setting makes it explicit). frpc does not verify the frps
-certificate in this mode, so it protects against passive eavesdropping, not
-an active man in the middle. Your browser's connection to
-`https://<subdomain>.linumiq.net` always uses a publicly trusted certificate.
+server are TLS-encrypted.
+
+Since 2.2.0 frpc also **verifies the tunnel server** (`verify_server`, on by
+default). The LinumIQ server sends the certificate authority (CA) that signed
+the frps certificate and the name the certificate is issued for
+(`server_ca_pem`, `server_name`) over the authenticated HTTPS device API. The
+add-on accepts only X.509 CA certificates (no private keys, no leaf
+certificates, nothing else in the PEM), stores the CA in the state file,
+writes it to `/data/frps-ca.pem` and pins it in `frpc.toml`
+(`transport.tls.trustedCaFile`, `transport.tls.serverName`). frpc then only
+talks to an frps whose certificate chains to that CA and is valid for that
+name - an attacker on the network path can no longer impersonate the server,
+read the tunnel token or the proxied Home Assistant traffic.
+
+- **The CA is never silently dropped.** If a later response does not contain
+  a CA (for example after a server rollback) or contains an invalid one, the
+  add-on keeps the last known CA and the panel shows a yellow warning. A new
+  valid CA from the server (rotation) replaces the old one and restarts frpc.
+- **Older servers** (before contract v2.2) send no CA. The connection is then
+  encrypted but not verified, and the panel says so in a yellow banner; the
+  next **Refresh tunnel config** after the server update pins the CA.
+- **`verify_server: false`** (advanced option) turns verification off
+  explicitly - only for troubleshooting or a development frps without that
+  CA. The panel shows a permanent warning while it is off.
+- An explicit `server_addr` override does not change the certificate name:
+  frpc still expects the server-provided `server_name`.
+
+The panel's "Tunnel server" row shows the state: *TLS, certificate verified for
+`<server_name>`; CA `<subject>` until `<date>`* or *TLS, certificate not
+verified*. Your browser's connection to `https://<subdomain>.linumiq.net`
+always uses a publicly trusted certificate.
 
 ## Generated `frpc.toml`
 
@@ -104,6 +135,10 @@ loginFailExit = false
 
 # Encrypt the frpc <-> frps connection (control + proxied traffic).
 transport.tls.enable = true
+# Verify the frps certificate: it must chain to the CA provided by the
+# LinumIQ server (pinned in the state file) and be valid for serverName.
+transport.tls.trustedCaFile = "/data/frps-ca.pem"
+transport.tls.serverName = "<server_name from the LinumIQ server>"
 
 # Per-tunnel credential, validated by the frps auth plugin (metas.token).
 [metadatas]
@@ -121,8 +156,10 @@ localIP = "homeassistant"
 localPort = 8123
 ```
 
-The file and the state file are owned by the add-on and chmod 600. Tokens are
-never written to the log and never returned by the panel.
+frpc runs as the unprivileged system user `frpc`: `frpc.toml` and
+`frps-ca.pem` are `root:frpc` mode 640 (frpc can read, not change them); the
+state file with the device token is `root` mode 600 and unreadable for frpc.
+Tokens are never written to the log and never returned by the panel.
 
 ## Configuration Options
 
@@ -141,6 +178,7 @@ provides `server_addr`, `server_port` and `domain_base`.
 
 | Option        | Type   | Default                   | Description |
 | ------------- | ------ | ------------------------- | ----------- |
+| `verify_server` | bool | `true` (when unset)       | Verify the frps certificate against the CA provided by the LinumIQ server. Only an explicit `false` disables it (see [Transport encryption and server verification](#transport-encryption-and-server-verification-tls)). |
 | `app_base`    | URL    | `https://app.linumiq.net` | Web app for browser pairing and the device API. |
 | `api_base`    | URL    | `https://api.linumiq.net` | Backend (Supabase) API base URL. |
 | `server_addr` | host   | server value, else `linumiq.net` | frps control host name or IP. |
@@ -210,7 +248,45 @@ Pairing then happens at `https://app-dev.linumiq.net/activate` and the tunnel
 is published at `https://<subdomain>.dev.linumiq.net`. After switching between
 environments, unpair and pair again: device tokens are per environment.
 
+## Backups and restore
+
+Home Assistant backups of this add-on do **not** contain the pairing data
+(`backup_exclude` in `config.yaml`): the device token and tunnel token
+(`frp-state.json`), `frpc.toml`, the pinned CA (`frps-ca.pem`) and a pairing
+in progress are left out, so a backup file never carries credentials for your
+tunnel. The add-on options are still backed up.
+
+After restoring a backup (or restoring onto a new machine) the add-on starts
+**unpaired**: open the panel and pair again. The device token of the old
+installation is not revoked by the restore - remove the old device in your
+LinumIQ account (or click **Unpair** on the old installation before you
+retire it).
+
 ## Security notes
+
+- **Ingress only.** The panel answers only the Supervisor's ingress proxy
+  (172.30.32.2) and loopback, decided from the TCP peer address - never from
+  `Host`, `X-Forwarded-*` or the request path (2.1.x exempted `/_health`,
+  which a crafted `Host` header could abuse to reach every endpoint from
+  another container: Starlette GHSA-86qp-5c8j-p5mr). Static files and unknown
+  paths are behind the same check.
+- **CSRF.** Every state-changing request (pairing, refresh, subdomain change,
+  unpair) must be same-origin: `Sec-Fetch-Site: same-origin`, or - for
+  browsers without Fetch Metadata - an `Origin` that names the requested host.
+  Home Assistant ingress keeps the panel on your Home Assistant origin, so
+  nothing changes for you; another web site can no longer make your browser
+  unpair or re-pair the add-on. Scripts that drive the panel (e.g. the E2E
+  harness) must send `Sec-Fetch-Site: same-origin`.
+- **Pairing codes.** The pairing code is a short-lived approval credential:
+  it is shown only in the panel page - never in a URL (browser history,
+  access logs) or the add-on log. Approve a code only on `app.linumiq.net`
+  (your `app_base`), signed in to your own account, and only if you started
+  that pairing yourself; never approve a code someone else sent you. The
+  panel shows the masked e-mail of the account the device is paired with.
+- **Least privilege.** frpc runs as an unprivileged user; the AppArmor
+  profile (`apparmor.txt`) allows only the files, programs, capabilities
+  (`chown`, `fowner`, `kill`, `setgid`, `setuid`) and signals the add-on
+  needs; no host folders are mapped.
 
 - **Untrusted pairing data.** Everything the backend returns from
   `POST /api/device/code` is validated before it is stored or shown in the
@@ -242,7 +318,11 @@ environments, unpair and pair again: device tokens are per environment.
   the device is not paired.
 - **Supply chain.** The `frpc` binary is downloaded from the official
   fatedier/frp release and verified against a SHA-256 pinned per
-  architecture in the `Dockerfile`; the build fails on a mismatch.
+  architecture in the `Dockerfile`; the build fails on a mismatch. The panel's
+  Python dependencies (Starlette, uvicorn, Jinja2, python-multipart and their
+  dependencies - no FastAPI/pydantic since 2.2.0) are pinned with hashes in
+  `requirements.txt` and installed with `pip --require-hashes
+  --only-binary=:all:` into a virtualenv; pip itself is not part of the image.
 
 ## Troubleshooting
 
@@ -261,6 +341,32 @@ environments, unpair and pair again: device tokens are per environment.
 - **Public URL returns 502**: Home Assistant Core is not reachable at
   `local_host:local_port` from inside the add-on container. `homeassistant`
   works on the Supervisor network; for other setups set the advanced override.
+- **"certificate verify failed", "x509: certificate signed by unknown
+  authority" or "x509: certificate is valid for ..., not ..." in the log**:
+  frpc refused the tunnel server because its certificate does not match the
+  pinned CA / `server_name`. Most often the LinumIQ server has rotated its
+  certificate authority: click **Refresh tunnel config** to fetch the current
+  one. If the panel also shows *"The LinumIQ server no longer sends the tunnel
+  server's certificate authority"*, the server side is being changed - wait
+  and refresh again, or contact support. If you set `server_addr` to a
+  different (e.g. development) frps, its certificate must still be issued by
+  the CA of the server you paired with; for a development frps without it set
+  `verify_server: false` temporarily. Never turn verification off because of
+  this error on a production installation without knowing why it happened -
+  it is exactly what an attacker in your network would cause.
+- **Yellow "Tunnel server not fully verified" banner**: the server provided no
+  CA (older server), verification is switched off (`verify_server: false`), or
+  the pinned CA has expired - the banner says which. Click **Refresh tunnel
+  config** once the server provides a (new) CA.
+- **"Paired with" shows an e-mail address that is not yours**: the device was
+  approved by another account (for example after you approved a code someone
+  sent you). Click **Unpair** immediately and pair again.
+- **Add-on unpaired after restoring a backup**: expected - pairing data is not
+  included in backups. Pair again (see [Backups and restore](#backups-and-restore)).
+- **"Forbidden: cross-site request"**: a POST to the panel did not come from
+  the panel page itself (missing `Sec-Fetch-Site: same-origin` / matching
+  `Origin`). Open the panel through Home Assistant (sidebar or the add-on's
+  *Open Web UI*); scripts must send `Sec-Fetch-Site: same-origin`.
 - **frpc keeps reconnecting / "login to the server failed"**: check
   connectivity to the frps endpoint shown in the panel ("Tunnel server") and
   in the log line `frpc.toml rendered: server=...`. If the token was rotated
@@ -298,9 +404,19 @@ environments, unpair and pair again: device tokens are per environment.
 LinumIQ stack, pairs it through the panel's HTTP endpoints and checks the
 whole path up to the public URL. See [tests/e2e/README.md](tests/e2e/README.md).
 Unit tests: `python3 -m unittest discover -s frp-tunnel/tests/unit` (the
-FastAPI panel tests are skipped without FastAPI); CI also builds the amd64
-image and runs all of them inside it against the installed code (see the
-tests README for the command).
+panel tests are skipped unless the dependencies from `requirements.txt` are
+installed); CI runs them with the pinned dependencies on the host and inside
+the freshly built amd64 image against the installed code, and boots the image
+under the AppArmor profile (`tests/apparmor-smoke.sh`, fails on any denial).
+See the tests README for the commands.
+
+## Maintainers: Python dependencies
+
+`requirements.in` lists the panel's direct dependencies (with the security
+minimums); `requirements.txt` is generated from it with hashes by
+`pip-compile` in the image's Python version - the command is in the header of
+`requirements.in`. The image build fails if a downloaded wheel does not match
+its hash.
 
 ## Maintainers: publishing to GHCR
 

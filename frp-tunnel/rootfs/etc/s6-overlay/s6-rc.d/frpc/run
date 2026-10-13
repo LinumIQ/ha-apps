@@ -21,11 +21,17 @@
 #          after every pairing, so nothing is missed.
 #   other  (render error, lock timeout) - frpc is not started from the
 #          previous file; retried every 10 seconds.
+#
+# frpc itself runs as the unprivileged system user `frpc` (s6-setuidgid). It
+# can read frpc.toml and the pinned frps CA (root:frpc 0640, written by the
+# renderer) but not the state file with the device token (root 0600).
 # ==============================================================================
 readonly CONFIG_FILE="/data/frpc.toml"
 readonly STATE_FILE="/data/frp-state.json"
 readonly RENDERER="/usr/lib/frp-mgr/config.py"
+readonly PYTHON="/usr/lib/frp-mgr/.venv/bin/python3"
 readonly OPTIONS_FILE="/data/options.json"
+readonly FRPC_USER="frpc"
 
 # Same log-level mapping as the panel (affects the renderer's own messages;
 # frpc's level is written into frpc.toml).
@@ -44,7 +50,7 @@ last_rc=""
 while true; do
     rc=0
     if [[ -s "${STATE_FILE}" ]]; then
-        python3 "${RENDERER}" render || rc=$?
+        "${PYTHON}" "${RENDERER}" render || rc=$?
     else
         rc=3
     fi
@@ -52,8 +58,8 @@ while true; do
         0)
             # Rendered (or already up to date) from a valid pairing.
             if [[ -s "${CONFIG_FILE}" ]]; then
-                bashio::log.info "Starting frpc..."
-                exec /usr/bin/frpc -c "${CONFIG_FILE}"
+                bashio::log.info "Starting frpc (as user ${FRPC_USER})..."
+                exec s6-setuidgid "${FRPC_USER}" /usr/bin/frpc -c "${CONFIG_FILE}"
             fi
             bashio::log.error "Renderer succeeded but ${CONFIG_FILE} is missing."
             ;;

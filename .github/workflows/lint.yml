@@ -1,4 +1,10 @@
+---
 name: Lint
+
+# Security (audit M15): no default token permissions (each job gets read-only
+# contents), every action pinned by commit SHA, checkout without persisted
+# credentials, and expression values reach shell code only through `env:`.
+permissions: {}
 
 on:
   push:
@@ -13,25 +19,36 @@ jobs:
   hadolint:
     name: Hadolint (${{ matrix.addon }})
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         addon: ["caddy-mtls", "frp-tunnel"]
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
+      # Kept at v3.1.0 (hadolint 2.12): hadolint 2.15 (action v3.5.0) newly
+      # flags caddy-mtls' shell-form HEALTHCHECK (DL3025) - bump the action
+      # together with that change.
       - name: Run Hadolint
-        uses: hadolint/hadolint-action@v3.1.0
+        uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
         with:
           dockerfile: ${{ matrix.addon }}/Dockerfile
 
   shellcheck:
     name: Shellcheck
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       # Scans every shell script of both add-ons: *.sh (helper libraries,
       # frp-tunnel/tests/e2e/run.sh) and - via additional_files - the s6
@@ -39,7 +56,7 @@ jobs:
       # and use the `with-contenv bashio` / `execlineb` shebangs, so the
       # action's own shebang detection skips them.
       - name: Run Shellcheck
-        uses: ludeeus/action-shellcheck@2.0.0
+        uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38 # 2.0.0
         env:
           # SC1008: bashio / execlineb shebangs are not recognised (-s bash
           #         parses every file as bash)
@@ -48,52 +65,63 @@ jobs:
           # SC2016: jq programs intentionally use single quotes
           SHELLCHECK_OPTS: -e SC1008,SC1083,SC1091,SC2016 -s bash
         with:
+          version: v0.11.0
           ignore_paths: ".git"
           additional_files: "run finish"
 
   yamllint:
     name: YAMLLint
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Run YAMLLint
-        uses: frenck/action-yamllint@v1.5.0
+        uses: frenck/action-yamllint@34b4bbcaeabedcfefad6adea8c5bbc42af0e2d47 # v1.5.0
+        with:
+          strict: true
 
   addon-config:
     name: Add-on configuration (${{ matrix.addon }})
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         addon: ["caddy-mtls", "frp-tunnel"]
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Run Home Assistant Add-on Lint
-        uses: frenck/action-addon-linter@v2
+        uses: frenck/action-addon-linter@b9cfd1bc62ba60d2c4fc96317b5f7ada5923f4a7 # v2.21.1
         with:
           path: "./${{ matrix.addon }}"
 
   frp-tunnel-python:
     name: FRP Tunnel Python (compile + unit tests)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
+      # Same CPython minor version as the add-on image (Alpine 3.23: 3.12).
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
 
-      # The FastAPI flow tests (test_app.py) are skipped here because the
-      # panel's dependencies come from Alpine packages inside the image (the
-      # frp-tunnel-image job runs them there); the pure configuration logic,
-      # validators, precedence rules and the E2E harness's TOTP
-      # implementation are covered.
       - name: Compile
         run: >-
           python -m py_compile
@@ -101,18 +129,32 @@ jobs:
           frp-tunnel/rootfs/usr/lib/frp-mgr/config.py
           frp-tunnel/tests/e2e/approve.py
 
+      # The panel's pinned, hash-checked dependencies (the same
+      # requirements.txt the image installs), so the panel flow tests run
+      # here too (FRP_TESTS_REQUIRE_PANEL=1: a missing dependency fails).
+      - name: Install the panel dependencies
+        run: >-
+          python -m pip install --disable-pip-version-check --no-cache-dir
+          --require-hashes --only-binary=:all: -r frp-tunnel/requirements.txt
+
       - name: Unit tests
+        env:
+          FRP_TESTS_REQUIRE_PANEL: "1"
         run: python -m unittest discover -s frp-tunnel/tests/unit -v
 
   frp-tunnel-image:
-    name: FRP Tunnel image (amd64 build + all unit tests inside)
+    name: FRP Tunnel image (amd64 build, unit tests inside, AppArmor smoke test)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       # Same build as Supervisor / the E2E harness; also verifies the pinned
-      # frp tarball checksum.
+      # frp tarball checksum and the hashes of the Python dependencies.
       - name: Build the amd64 image
         run: >-
           docker build
@@ -121,17 +163,20 @@ jobs:
           -t frp-tunnel-test
           frp-tunnel
 
-      # Runs every unit test (incl. the FastAPI panel flows in test_app.py)
-      # with the image's Python packages against the INSTALLED panel code
-      # (FRP_MGR_DIR); FRP_TESTS_REQUIRE_FASTAPI=1 makes a missing FastAPI a
-      # failure instead of a skip.
+      # Runs every unit test (incl. the panel flows in test_app.py) with the
+      # image's virtualenv against the INSTALLED panel code (FRP_MGR_DIR).
       - name: Unit tests inside the image
         run: >-
           docker run --rm
           -v "${GITHUB_WORKSPACE}/frp-tunnel/tests:/tests:ro"
           -e FRP_MGR_DIR=/usr/lib/frp-mgr
-          -e FRP_TESTS_REQUIRE_FASTAPI=1
-          -e PYTHONDONTWRITEBYTECODE=1
+          -e FRP_TESTS_REQUIRE_PANEL=1
           --entrypoint python3
           frp-tunnel-test
           -m unittest discover -s /tests/unit -v
+
+      # Loads apparmor.txt (enforce mode) and boots the image under it:
+      # s6-overlay, bashio, the panel and the frpc wait loop must start
+      # without a single AppArmor denial.
+      - name: AppArmor smoke test
+        run: frp-tunnel/tests/apparmor-smoke.sh frp-tunnel-test frp-tunnel/apparmor.txt

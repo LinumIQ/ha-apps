@@ -8,6 +8,15 @@ configuration:
       Verbosity of the add-on's log, including frpc's own output
       (trace, debug, info, notice, warning, error, fatal).
 
+  verify_server:
+    name: Verify Tunnel Server (advanced)
+    description: >-
+      Verify the frps server certificate against the certificate authority
+      provided by the LinumIQ server (default: on when unset). Only set this
+      to false for troubleshooting or a development frps without that CA:
+      the tunnel is then encrypted but not protected against a man in the
+      middle.
+
   # -------------------------------------------------------------------
   # Advanced / development overrides. Leave empty in production: an
   # override only applies when it is explicitly set.
