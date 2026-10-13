@@ -48,8 +48,15 @@ ARG BUILD_VERSION
 #   - libcap:  setcap on the Caddy binary
 #   - python3 + py3-pip: cert manager FastAPI app and expiry monitor
 #   - py3-fastapi, py3-uvicorn, py3-jinja2: avoid pip-compiling at build time
+#   - libcrypto3 + libssl3: the base image pins them to the versions current
+#     at its release (apk world `libcrypto3=<ver>`); naming them here replaces
+#     that pin, so they are upgraded together with `openssl`, which always
+#     requires the exactly matching libraries from the current repository
+#     (otherwise: "unable to select packages ... breaks: openssl").
 # hadolint ignore=DL3018
 RUN apk add --no-cache \
+        libcrypto3 \
+        libssl3 \
         openssl \
         libcap \
         python3 \
