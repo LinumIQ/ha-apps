@@ -9,7 +9,7 @@ ARG BUILD_FROM=ghcr.io/hassio-addons/base:20.1.0
 # forces buildx into the docker-container driver, which does not load the
 # resulting image into the local Docker daemon and thus breaks the HA
 # builder's subsequent `docker tag` step.
-FROM golang:1.25.1-alpine AS caddy-builder
+FROM golang:1.27.2-alpine AS caddy-builder
 
 ARG CADDY_VERSION=v2.10.2
 ARG XCADDY_VERSION=v0.4.4
