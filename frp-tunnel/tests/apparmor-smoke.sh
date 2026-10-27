@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# FRP Tunnel add-on - AppArmor smoke test (CI and local; needs sudo, a kernel
-# with AppArmor enabled and docker).
+# FRP Tunnel add-on - AppArmor smoke test (CI and local; needs sudo or root,
+# a kernel with AppArmor enabled and docker).
 #
 # usage: apparmor-smoke.sh <image> <apparmor.txt>
 #
@@ -15,6 +15,14 @@
 # (it fails to connect - nothing listens - which is expected) with its log
 # watcher, unpair and a clean `docker stop`. Fails on any AppArmor denial for
 # the profile.
+#
+# Denials are read from the kernel log (dmesg) AND - where auditd runs, e.g.
+# on a server, and the kernel log stays silent - from /var/log/audit/audit.log
+# (only lines written after the start). Before the test, a deliberately
+# denied write in a throw-away container proves that a denial is actually
+# seen; the test refuses to run (exit 2) when it is not. The profile is
+# loaded without the parser's cache (-K), checked by name, and unloaded again
+# on exit when it was not loaded before.
 # Env: DOCKER (default docker).
 # ==============================================================================
 # Helper functions are called indirectly (check, wait_for, trap).
@@ -30,6 +38,12 @@ SUP_CTR="${CTR}-supervisor"
 SUP_TOKEN="smoke-supervisor-token-0123456789"
 WORK="$(mktemp -d)"
 FAILED=0
+SUDO=()
+(( EUID == 0 )) || SUDO=(sudo)
+UNLOAD=false
+AUDIT_LOG=/var/log/audit/audit.log
+AUDIT_OFFSET=""
+DMESG_OK=false
 
 log() { printf '[aa-smoke] %s\n' "$*" >&2; }
 ok() { printf 'PASS  %s\n' "$1"; }
@@ -40,7 +54,10 @@ check() { # check <name> <command...>
     if "$@"; then ok "${name}"; else bad "${name}"; fi
 }
 cleanup() {
-    "${DOCKER}" rm -f "${CTR}" "${SUP_CTR}" >/dev/null 2>&1 || true
+    "${DOCKER}" rm -f "${CTR}" "${SUP_CTR}" "${CTR}-probe" >/dev/null 2>&1 || true
+    if [[ "${UNLOAD}" == true ]]; then
+        "${SUDO[@]}" apparmor_parser -R -K "${PROFILE_FILE}" >/dev/null 2>&1 || true
+    fi
     rm -rf "${WORK}"
 }
 trap cleanup EXIT
@@ -50,7 +67,18 @@ if [[ "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null)" != Y ]]; then
     log "AppArmor is not enabled in this kernel"
     exit 2
 fi
-denials() { sudo dmesg | grep -F 'apparmor="DENIED"' | grep -F "profile=\"${PROFILE}" || true; }
+# Denials of this profile (and its children), from every readable source.
+# Not counted: runc's term/kill signals at `docker stop` (peer="runc"), which
+# Ubuntu's runc profile triggers for any confined container.
+denials() {
+    {
+        if [[ "${DMESG_OK}" == true ]]; then "${SUDO[@]}" dmesg 2>/dev/null || true; fi
+        if [[ -n "${AUDIT_OFFSET}" ]]; then
+            "${SUDO[@]}" tail -n "+$((AUDIT_OFFSET + 1))" "${AUDIT_LOG}" 2>/dev/null || true
+        fi
+    } | grep -F 'apparmor="DENIED"' | grep -E "profile=\"${PROFILE}(\"|//)" \
+        | grep -v -E 'operation="signal".*peer="runc"' | sort -u || true
+}
 cexec() { "${DOCKER}" exec "${CTR}" "$@"; }
 wait_for() {
     local timeout="$1" deadline
@@ -62,8 +90,42 @@ wait_for() {
     done
 }
 
-sudo apparmor_parser -r -W "${PROFILE_FILE}"
+# Denial sources: the kernel log, and the audit log from its current end.
+"${SUDO[@]}" dmesg >/dev/null 2>&1 && DMESG_OK=true
+if "${SUDO[@]}" test -r "${AUDIT_LOG}"; then
+    AUDIT_OFFSET="$("${SUDO[@]}" wc -l "${AUDIT_LOG}" | awk '{print $1}')"
+fi
+if [[ "${DMESG_OK}" != true && -z "${AUDIT_OFFSET}" ]]; then
+    log "neither dmesg nor ${AUDIT_LOG} is readable: AppArmor denials cannot be detected"
+    exit 2
+fi
+SOURCES=""
+if [[ "${DMESG_OK}" == true ]]; then SOURCES="dmesg"; fi
+if [[ -n "${AUDIT_OFFSET}" ]]; then SOURCES="${SOURCES:+${SOURCES} + }${AUDIT_LOG}"; fi
+
+if ! "${SUDO[@]}" grep -q "^${PROFILE} (" /sys/kernel/security/apparmor/profiles 2>/dev/null; then
+    UNLOAD=true
+fi
+# -K: no profile cache. The cache is keyed by the file's basename, and every
+# add-on's profile is called apparmor.txt - with the cache, a host that has
+# cached another add-on's apparmor.txt silently loads THAT profile instead.
+"${SUDO[@]}" apparmor_parser -r -K "${PROFILE_FILE}"
+if ! "${SUDO[@]}" grep -qx "${PROFILE} (enforce)" /sys/kernel/security/apparmor/profiles; then
+    log "profile ${PROFILE} is not loaded in enforce mode after apparmor_parser"
+    exit 2
+fi
 log "profile ${PROFILE} loaded ($(apparmor_parser -V | head -n 1))"
+
+# Prove that a denial of this profile is seen on this host: a write below
+# /etc/s6-overlay (read-only in the profile) in a throw-away container.
+"${DOCKER}" run --rm --name "${CTR}-probe" --security-opt "apparmor=${PROFILE}" \
+    --entrypoint /bin/sh "${IMAGE}" -c 'echo x > /etc/s6-overlay/aa-smoke-probe' >/dev/null 2>&1 || true
+probe_seen() { denials | grep -F 'aa-smoke-probe' >/dev/null; }
+if ! wait_for 10 probe_seen; then
+    log "a deliberate AppArmor denial was not seen (sources: ${SOURCES}): denials cannot be detected here"
+    exit 2
+fi
+log "denial detection works (deliberate probe seen; sources: ${SOURCES})"
 denials >"${WORK}/before"
 
 # Options as Supervisor would write them; app_base points at a closed local
@@ -131,7 +193,7 @@ check "panel healthy under ${PROFILE}" wait_for 60 health
 # Read from the host: the profile itself does not allow reading AppArmor labels.
 pid1="$("${DOCKER}" inspect -f '{{.State.Pid}}' "${CTR}")"
 check "PID 1 confined by ${PROFILE} (enforce)" \
-    test "$(sudo cat "/proc/${pid1}/attr/current" 2>/dev/null)" == "${PROFILE} (enforce)"
+    test "$("${SUDO[@]}" cat "/proc/${pid1}/attr/current" 2>/dev/null)" == "${PROFILE} (enforce)"
 check "frpc service waits while unpaired" wait_for 30 logs_contain "Not paired yet"
 code="$(http_code POST /pair/start -H 'Sec-Fetch-Site: same-origin')"
 check "same-origin POST handled (backend unreachable -> 303, got ${code})" test "${code}" == 303

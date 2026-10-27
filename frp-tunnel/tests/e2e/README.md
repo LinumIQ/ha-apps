@@ -67,7 +67,7 @@ never silently run against production.
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
 | `DOCKER` | `docker` | Container CLI (`podman` works). |
-| `E2E_CREATE_ARGS` | - | Extra arguments for `$DOCKER create` of the add-on container (word-split), e.g. `--security-opt apparmor=frp_tunnel` after `sudo apparmor_parser -r -W frp-tunnel/apparmor.txt`, to run the whole flow confined by the add-on's AppArmor profile (then check `dmesg \| grep DENIED`). |
+| `E2E_CREATE_ARGS` | - | Extra arguments for `$DOCKER create` of the add-on container (word-split), e.g. `--security-opt apparmor=frp_tunnel` after `sudo apparmor_parser -r -W frp-tunnel/apparmor.txt`, to run the whole flow confined by the add-on's AppArmor profile (then check `dmesg \| grep DENIED` and - where auditd runs, e.g. on a server, where denials only reach the audit log - `/var/log/audit/audit.log`). |
 | `ADDON_IMAGE` | - | Use this image; otherwise build `frp-tunnel-e2e` with `$DOCKER build --build-arg BUILD_FROM=ghcr.io/hassio-addons/base:21.0.10 --build-arg BUILD_ARCH=<amd64\|aarch64> -t frp-tunnel-e2e frp-tunnel/`. |
 | `NETWORK` | default bridge | Docker network to attach the add-on container to (must reach `LOCAL_HOST`). |
 | `E2E_PIN_SERVER` | `1` | `1`: also write `server_addr`/`server_port`/`domain_base` overrides (= `SERVER_*`/`DOMAIN_BASE`) into `options.json`. `0`: leave them unset so the **server-provided** values drive `frpc.toml` (also verifies the dashboard's `FRP_SERVER_*`/`TUNNEL_DOMAIN_BASE`). Running both is recommended. |

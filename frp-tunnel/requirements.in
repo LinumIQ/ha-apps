@@ -7,11 +7,14 @@
 # changing a pin (podman works the same way):
 #
 #   docker run --rm -v "$PWD/frp-tunnel:/w" -w /w --entrypoint sh \
-#       ghcr.io/hassio-addons/base:21.0.10 -c 'apk add --no-cache python3 >/dev/null &&
+#       ghcr.io/hassio-addons/base:21.0.10 -c 'unset PIP_EXTRA_INDEX_URL &&
+#       apk add --no-cache python3 >/dev/null &&
 #       python3 -m venv /tmp/v && /tmp/v/bin/pip -q install pip-tools==7.6.2 &&
 #       /tmp/v/bin/pip-compile -q --generate-hashes --allow-unsafe --strip-extras
 #       --no-emit-index-url -o requirements.txt requirements.in'
 #
+# (The base image sets PIP_EXTRA_INDEX_URL to Home Assistant's wheel index;
+# it is unset here and in the Dockerfile, so only PyPI is consulted.)
 # pip-compile --generate-hashes lists the hashes of ALL release files of a
 # pinned version, so the lock also covers aarch64 (e.g. markupsafe's
 # cp314 musllinux x86_64 and aarch64 wheels).

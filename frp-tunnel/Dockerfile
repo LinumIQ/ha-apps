@@ -25,7 +25,9 @@ ARG FRP_SHA256_ARM64=8edf590b0c396fa42f9c147121a76af83cfc2002b08f5aef0ea1008c434
 #     `frpc` system user it runs as;
 #   - python3 + a virtualenv with the panel's dependencies, installed by pip
 #     from requirements.txt with --require-hashes (wheels only, no compiler;
-#     pip itself is removed again in the same layer).
+#     pip itself is removed again in the same layer). PIP_EXTRA_INDEX_URL
+#     (set by the base image to Home Assistant's wheel index) is unset: only
+#     PyPI is consulted, exactly as when requirements.txt was generated.
 # hadolint ignore=DL3003
 RUN set -eux; \
     case "${BUILD_ARCH}" in \
@@ -49,6 +51,7 @@ COPY requirements.txt /tmp/frp-mgr-requirements.txt
 
 # hadolint ignore=DL3018
 RUN set -eux; \
+    unset PIP_EXTRA_INDEX_URL; \
     apk add --no-cache python3; \
     python3 -m venv /usr/lib/frp-mgr/.venv; \
     /usr/lib/frp-mgr/.venv/bin/pip install --no-cache-dir --disable-pip-version-check \
