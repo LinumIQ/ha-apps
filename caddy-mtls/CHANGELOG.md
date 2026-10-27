@@ -5,6 +5,171 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-10-27
+
+Dependency refresh (base image, Python, Caddy and its DNS modules), new
+default host ports, the upstream port taken from Home Assistant Core, and
+fixes for DNS-01 challenges and for client certificate changes that did not
+reach the running proxy (review 2026-10-27: H1, H2).
+
+### Breaking - what a 1.2.x user must know
+
+- **New default host ports: 8080 (HTTP) and 8443 (HTTPS) instead of 80 and
+  443.** Since Home Assistant 2026.8, new Home Assistant OS installations
+  serve Home Assistant itself on ports 80 and 443, so an add-on cannot
+  publish those ports there. Caddy still listens on 80/443 inside the add-on;
+  the Caddyfile and the HTTP-to-HTTPS redirect are unchanged. **Installations
+  that never customised the add-on's Network settings get the new host ports
+  on update** - either set the host ports explicitly in the add-on's
+  **Network** settings (`80/tcp` -> 80, `443/tcp` -> 443) *before* updating,
+  or change the router's port forwarding afterwards (external TCP 80 -> host
+  port 8080, external TCP 443 -> host port 8443). In the LAN the proxy is
+  then `https://<domain>:8443`. The add-on log shows the published host
+  ports on every start.
+- **Hetzner DNS: a different API token.** The Hetzner DNS module moves to v2
+  (Hetzner Console zones, Hetzner Cloud API); v1 used the deprecated DNS
+  Console API. With `acme_dns_provider: hetzner`, replace `dns_api_token`
+  by a Hetzner Cloud API token (Read & Write) of the project that holds the
+  zone - see DOCS.md, Hetzner DNS Setup.
+
+### Fixed
+
+- **DNS-01 challenges never got the API token** (review 2026-10-27 H2).
+  `init-caddy` exported
+  `DNS_API_TOKEN` only in its own (oneshot) process, which does not reach the
+  long-running Caddy service: Caddy started with an empty token - with
+  Cloudflare it refused to start (`provision dns.providers.cloudflare: API
+  token '' appears invalid`, reproduced with the 1.2.7 service script), with
+  Route53 / Hetzner it had no credentials. The Caddy service now exports the
+  credentials itself (`lib/dns-provider.sh`, shared with `init-caddy`); the
+  Caddyfile still holds only `{env.*}` placeholders.
+- **Route53 never validated** (review 2026-10-27 H2). The module (v1.6)
+  accepts no positional
+  argument, so the rendered `dns route53 {env.DNS_API_TOKEN}` failed with
+  `wrong argument count`. `dns_api_token` (`ACCESS_KEY_ID:SECRET_ACCESS_KEY`)
+  is now split at the first colon into `access_key_id` / `secret_access_key`;
+  a token without a colon stops the start with a clear message.
+- **Client changes take effect immediately (security; review 2026-10-27
+  H1).** After adding,
+  revoking or regenerating a client the panel ran `caddy reload`, which
+  Caddy skipped (`config is unchanged`: the Caddyfile never changes, only the
+  files in `/data/certs/active`). New clients were refused and **revoked or
+  superseded certificates were still accepted until the add-on restarted**.
+  The reload is now forced (`caddy reload --force`); the smoke test proves it
+  with mTLS handshakes before and after each change and with Caddy's log
+  (`stopped previous server`, never `config is unchanged`). This applies to
+  "Regenerate CA" as well.
+- **DNS tokens stay out of the log.** The output of the start-up `caddy
+  validate` is printed with the DNS credentials replaced by `<redacted>`: the
+  Cloudflare module quotes a token it considers malformed in its error
+  message.
+- **Default upstream on new Home Assistant OS installations.** With
+  `upstream_host: homeassistant` the add-on used port 8123, but new
+  installations (2026.8+) serve Core on port 80 (502 Bad Gateway). See
+  Changed: `upstream_port`.
+- `init-caddy` no longer aborts when `hostname -i` fails (no container
+  network; bashio enables `pipefail`) - relevant for tests only.
+
+### Security
+
+- **Python dependencies without known vulnerabilities**, from a hash-pinned
+  `requirements.txt` (`pip --require-hashes --only-binary=:all:`) in a
+  virtualenv (`/usr/lib/cert-mgr/.venv`) instead of Alpine's py3 packages:
+  FastAPI 0.162.0, Starlette 1.10.0, uvicorn 0.54.0, python-multipart 0.0.32,
+  Jinja2 3.1.6. The Alpine 3.23 packages (Starlette 0.47.2, python-multipart
+  0.0.20) were affected by GHSA-86qp-5c8j-p5mr (`request.url.path` rebuilt
+  from the `Host` header - the panel's `/_health` exemption of the ingress
+  allow-list relies on it: with `Host: x/_health?` anything on the hassio
+  network could download `.p12` bundles, create clients or wipe the CA;
+  review 2026-10-27 M1, reproduced with 0.47.2), GHSA-7f5h-v6xp-fcq8 (Range
+  header DoS) and further Starlette / python-multipart advisories; Alpine
+  3.24 still ships `py3-starlette` 1.1.0, below the 1.3.1 minimum. Starlette
+  1.10.0 closes the `Host` trick: the smoke test sends it to a panel that
+  does not allow the caller and gets 403. (The guard itself is unchanged.)
+- Caddy 2.11.7 (2.11.6 fixed GHSA-6365-7ppr-5r92, 2.11.7 fixed 2.11.6's
+  stream regressions).
+- The DNS provider modules are pinned to release tags (they were unpinned:
+  every build compiled whatever was newest); Go's checksum database verifies
+  them, and the build fails unless Caddy reports the pinned version and
+  lists all three modules.
+- Revoked client certificates are refused at once (see Fixed).
+
+### Changed
+
+| Component                  | 1.2.7                                   | 2.0.0                                                        |
+| -------------------------- | --------------------------------------- | ------------------------------------------------------------ |
+| Base image                 | `ghcr.io/hassio-addons/base:20.1.0`     | `ghcr.io/hassio-addons/base:21.0.10`                         |
+| Alpine                     | 3.23.4                                  | 3.24.3                                                       |
+| Python                     | 3.12.15 (Alpine packages)               | 3.14.8 (virtualenv)                                          |
+| OpenSSL                    | 3.5.9                                   | 3.5.9                                                        |
+| Caddy                      | v2.10.2                                 | v2.11.7                                                      |
+| xcaddy                     | v0.4.4                                  | v0.4.7                                                       |
+| Go (Caddy build stage)     | `golang:1.25.1-alpine`                  | `golang:1.27.3-alpine3.24` (pinned by index digest)          |
+| `caddy-dns/cloudflare`     | unpinned (newest at build time)         | v0.2.4 (libdns/cloudflare v0.2.2)                            |
+| `caddy-dns/route53`        | unpinned (newest at build time)         | v1.6.2 (libdns/route53 v1.6.2)                               |
+| `caddy-dns/hetzner`        | unpinned v1 line (v1.0.0, DNS Console)  | `hetzner/v2` v2.0.1 (libdns/hetzner v2.0.1, Cloud API)       |
+| libdns                     | v1.x                                    | v1.1.1                                                       |
+| FastAPI                    | 0.121.2                                 | 0.162.0                                                      |
+| Starlette                  | 0.47.2                                  | 1.10.0                                                       |
+| pydantic / pydantic-core   | 2.12.3 / 2.41.4                         | 2.14.1 / 2.50.1                                              |
+| uvicorn                    | 0.38.0                                  | 0.54.0                                                       |
+| python-multipart           | 0.0.20                                  | 0.0.32                                                       |
+| Jinja2                     | 3.1.6                                   | 3.1.6                                                        |
+| s6-overlay (base image)    | 3.2.2.0                                 | 3.2.3.2                                                      |
+| Default host ports         | 80, 443                                 | 8080, 8443                                                   |
+| Default `upstream_port`    | 8123                                    | unset: Home Assistant Core's port (Supervisor), else 8123    |
+
+(1.2.7's Python package versions are those of Alpine 3.23, which a 1.2.7
+build gets.)
+
+- **`upstream_port` is optional and has no default.** With
+  `upstream_host: homeassistant` and no `upstream_port`, the add-on proxies
+  to Home Assistant Core's own port as reported by the Supervisor API (80 on
+  new Home Assistant OS installations, 8123 on older ones; 8123 when the API
+  is unavailable) and logs the resolved upstream. Options saved before 2.0.0
+  may contain `upstream_port: 8123`, which is still honoured. Any other
+  `upstream_host` requires `upstream_port` (the start stops with a message).
+- `domain` must be a bare host name: a value with a scheme, port or path
+  (e.g. `home.example.com:8443`) stops the start with a message - it would
+  make Caddy listen on an unpublished container port.
+- The s6 `user` bundle moved from `/etc/s6-overlay/s6-rc.d/user` to
+  `/etc/s6-overlay/user-bundles.d/user` (s6-overlay 3.2.3.2 in base 21.x
+  rewrites a bundle left in `s6-rc.d` at every start); the build fails on a
+  base image without `user-bundles.d` (base < 21).
+- The panel (uvicorn) and the expiry monitor run with the virtualenv's
+  interpreter; pip is removed from it, the code is precompiled and Python
+  writes no bytecode at runtime. FastAPI 0.162 adds `opentelemetry-api` as a
+  dependency (inactive unless configured).
+- `init-caddy` logs the published host ports and a port-forwarding hint on
+  every start (from the Supervisor API; warnings when `80/tcp` or `443/tcp`
+  is disabled; silent outside Supervisor).
+- `HEALTHCHECK` in exec form (hadolint 2.15, DL3025); same probes.
+- The libcrypto3/libssl3 lines stay: with base 21.0.10 they are a no-op
+  today (the base image pins 3.5.9-r0, the current repository version), but
+  keep the build working once Alpine ships a newer OpenSSL than the base
+  image was built with.
+- File permissions of everything copied into the image are normalised (they
+  depended on the build checkout's umask).
+- Test-only environment variable `ACME_CA_URL` (replaces the ACME
+  directories of Let's Encrypt / ZeroSSL; Supervisor never sets it) - see
+  DOCS.md, Running outside Home Assistant.
+
+### Added
+
+- `tests/smoke.sh <image>`: boots the image outside Supervisor without any
+  network (panel, certificates and modes, `state.json`, Caddyfile and admin
+  API, CRL over plain HTTP and the redirect, mTLS handshakes before and after
+  client add / revoke / regenerate, the `.p12` download, the ingress
+  allow-list, `mtls_enabled: false`, one start per DNS provider, log
+  hygiene).
+- `tests/apparmor-smoke.sh <image> <apparmor.txt>`: boots the image confined
+  by the profile in enforce mode, adds and revokes a client, and fails on any
+  AppArmor denial (kernel log and audit log).
+- `requirements.in` / `requirements.txt` (hashes, generated with
+  `pip-compile` on CPython 3.14) and a `.dockerignore`.
+- DOCS.md: ports section, "Running outside Home Assistant (tests)",
+  "Maintainers: Python dependencies".
+
 ## [1.2.7] - 2026-05-02
 
 ### Changed
