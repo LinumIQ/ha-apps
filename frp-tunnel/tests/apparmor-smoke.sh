@@ -9,7 +9,9 @@
 # (like Supervisor does) and exercises every code path that touches files,
 # processes or the network without a LinumIQ backend: s6-overlay start-up,
 # bashio, the panel (health, status, a same-origin POST), the renderer writing
-# frpc.toml + the pinned frps CA (root:frpc 0640), frpc started as user frpc
+# frpc.toml + the pinned frps CA (root:frpc 0640) and reading Home Assistant's
+# port from a fake Supervisor API (a second, unconfined container reachable
+# as `supervisor`), frpc started as user frpc
 # (it fails to connect - nothing listens - which is expected) with its log
 # watcher, unpair and a clean `docker stop`. Fails on any AppArmor denial for
 # the profile.
@@ -24,6 +26,8 @@ PROFILE_FILE="${2:?usage: apparmor-smoke.sh <image> <apparmor.txt>}"
 DOCKER="${DOCKER:-docker}"
 PROFILE="$(sed -n 's/^profile \([A-Za-z0-9_-]*\) .*/\1/p' "${PROFILE_FILE}" | head -n 1)"
 CTR="frp-tunnel-aa-smoke-$$"
+SUP_CTR="${CTR}-supervisor"
+SUP_TOKEN="smoke-supervisor-token-0123456789"
 WORK="$(mktemp -d)"
 FAILED=0
 
@@ -36,7 +40,7 @@ check() { # check <name> <command...>
     if "$@"; then ok "${name}"; else bad "${name}"; fi
 }
 cleanup() {
-    "${DOCKER}" rm -f "${CTR}" >/dev/null 2>&1 || true
+    "${DOCKER}" rm -f "${CTR}" "${SUP_CTR}" >/dev/null 2>&1 || true
     rm -rf "${WORK}"
 }
 trap cleanup EXIT
@@ -86,7 +90,30 @@ json.dump({"version": 2, "device_token": "smoke-device-token-0123456789", "subdo
           open(sys.argv[2], "w"))
 PY
 
+# Fake Supervisor API (unconfined, same image's Python): /core/info answers
+# Home Assistant's port 80 - only with the add-on's bearer token.
+"${DOCKER}" run -d --name "${SUP_CTR}" -e "FAKE_TOKEN=${SUP_TOKEN}" \
+    --entrypoint /usr/lib/frp-mgr/.venv/bin/python3 "${IMAGE}" -c '
+import http.server, json, os
+TOKEN = os.environ["FAKE_TOKEN"]
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        ok = self.path == "/core/info" and self.headers.get("Authorization") == "Bearer " + TOKEN
+        body = json.dumps({"result": "ok", "data": {"port": 80}} if ok else {"result": "error"}).encode()
+        self.send_response(200 if ok else 401 if self.path == "/core/info" else 404)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args):
+        pass
+http.server.ThreadingHTTPServer(("0.0.0.0", 80), Handler).serve_forever()
+' >/dev/null
+sup_ip="$("${DOCKER}" inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${SUP_CTR}")"
+[[ -n "${sup_ip}" ]] || { log "fake Supervisor has no IP address"; exit 2; }
+
 "${DOCKER}" create --name "${CTR}" --security-opt "apparmor=${PROFILE}" \
+    --add-host "supervisor:${sup_ip}" -e "SUPERVISOR_TOKEN=${SUP_TOKEN}" \
     -e ALLOWED_INGRESS_IPS=127.0.0.1 -e TZ=Europe/Vienna "${IMAGE}" >/dev/null
 copy_into "${WORK}/data" /data
 copy_into "${WORK}/tmp" /tmp
@@ -125,6 +152,20 @@ check "frpc.toml + frps-ca.pem are 640 root:frpc" \
 # 127.0.0.1:7000 is closed: frpc must get as far as connecting (config, CA
 # file and DNS-free address all readable as user frpc).
 check "frpc read its config and tried to connect" wait_for 30 logs_contain "connection refused"
+# local_port is not set: the renderer took Home Assistant's port from the
+# (fake) Supervisor API, and so does the panel.
+check "renderer: local_port from the Supervisor API (localPort = 80)" \
+    cexec grep -qx 'localPort = 80' /data/frpc.toml
+renderer_logged_origin() {
+    "${DOCKER}" logs "${CTR}" 2>&1 | grep -F "(frpc-render) frpc.toml" \
+        | grep -F "local=homeassistant:80 (port from supervisor)" >/dev/null
+}
+check "renderer logged the port's origin" renderer_logged_origin
+panel_port() {
+    [[ "$(cexec sh -c "curl -fsS http://127.0.0.1:8099/api/status | jq -r '\"\\(.local_port) \\(.sources.local_port)\"'" 2>/dev/null)" == "80 supervisor" ]]
+}
+# (the panel caches the lookup; a failed one is retried after 60 s)
+check "panel: local_port 80 from the Supervisor API" wait_for 70 panel_port
 # The log watcher (coprocess of the frpc service) records it for the panel.
 watcher_saw_it() {
     [[ "$(cexec jq -r '"\(.state) \(.network_failures)"' /run/frp-mgr/frpc-status.json 2>/dev/null)" == "failed "[1-9]* ]]

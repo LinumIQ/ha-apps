@@ -311,6 +311,7 @@
             <dt class="meta-list__label">Forwarding</dt>
             <dd class="meta-list__value">
               {{ local_host or "homeassistant" }}:{{ local_port or "8123" }}
+              {%- if sources and sources.local_port == "supervisor" %} (Home Assistant's port, reported by the Supervisor){% endif %}
             </dd>
           </div>
           <div class="meta-list__row">

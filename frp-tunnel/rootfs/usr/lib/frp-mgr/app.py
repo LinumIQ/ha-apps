@@ -313,11 +313,35 @@ def _state() -> Dict[str, Any]:
     return cfg.load_state(PATHS)
 
 
+#: Home Assistant's port from the Supervisor API (local_port while neither
+#: local_port nor another local_host is set), cached: the status page polls.
+#: A failed lookup is retried sooner than a successful one is refreshed.
+HA_PORT_TTL = 300.0
+HA_PORT_RETRY = 60.0
+_HA_PORT_LOCK = threading.Lock()
+_HA_PORT_CACHE: Dict[str, Any] = {"port": None, "expires": 0.0}
+
+
+def _ha_port() -> Optional[int]:
+    """Home Assistant's port as the Supervisor reports it (cached), None
+    when the local_port option / another local_host is set or the API is
+    unavailable (outside Supervisor: no token, no call)."""
+    if not cfg.wants_supervisor_port(OPTIONS):
+        return None
+    with _HA_PORT_LOCK:
+        now = time.monotonic()
+        if now >= _HA_PORT_CACHE["expires"]:
+            port = cfg.supervisor_core_port()
+            _HA_PORT_CACHE.update(port=port, expires=now + (HA_PORT_TTL if port else HA_PORT_RETRY))
+        return _HA_PORT_CACHE["port"]
+
+
 def _settings(state: Optional[Dict[str, Any]] = None) -> cfg.Settings:
     """Effective settings as the renderer computes them (incl. the fallback
-    to the last valid CA in /data/frps-ca.pem)."""
+    to the last valid CA in /data/frps-ca.pem and Home Assistant's port
+    from the Supervisor)."""
     return cfg.effective_settings(OPTIONS, _state() if state is None else state,
-                                  cfg.read_ca_file(PATHS))
+                                  cfg.read_ca_file(PATHS), _ha_port())
 
 
 def _pairing() -> Dict[str, Any]:
@@ -350,7 +374,7 @@ def _render_and_restart(force_restart: bool = False) -> str:
     restarted into its run script, which refuses to start it (fail closed).
     """
     try:
-        result, settings = cfg.render_from_disk(PATHS, OPTIONS)
+        result, settings = cfg.render_from_disk(PATHS, OPTIONS, _ha_port())
     except cfg.CAUnusableError as exc:
         LOG.error("%s.", cfg.sanitize_text(exc))
         _restart_frpc()

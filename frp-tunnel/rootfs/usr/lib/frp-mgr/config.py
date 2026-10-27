@@ -22,8 +22,17 @@ Where each frpc setting comes from (highest precedence first):
    servers that do not return ``domain_base`` working) and finally to
    ``linumiq.net``.
 
-``app_base``, ``api_base``, ``local_host``, ``local_port``, ``log_level`` and
+``app_base``, ``api_base``, ``local_host``, ``log_level`` and
 ``verify_server`` are never server-provided: option, then default.
+
+``local_port``: option, then - while ``local_host`` is the default
+``homeassistant`` - **Home Assistant's own port as the Supervisor reports it**
+(``GET http://supervisor/core/info`` -> ``data.port``; new Home Assistant OS
+installations serve Home Assistant on port 80 since 2026.8, existing ones
+keep 8123 or whatever was configured), then the default ``8123`` (no
+Supervisor: E2E harness, unit tests; API unavailable). The callers look the
+port up (``resolve_supervisor_port``) and pass it to ``effective_settings``,
+which stays free of I/O.
 
 Server verification (contract v2.2): the server also sends ``server_name``
 (the host name in the frps certificate) and ``server_ca_pem`` (the private CA
@@ -59,6 +68,7 @@ import base64
 import binascii
 import fcntl
 import hashlib
+import http.client
 import ipaddress
 import json
 import logging
@@ -73,7 +83,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, Mapping, Optional, Tuple
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, ProxyHandler, build_opener
+from urllib.request import Request as URLRequest
 
 LOG = logging.getLogger("frp-mgr.config")
 
@@ -89,6 +102,15 @@ DEFAULT_DOMAIN_BASE = "linumiq.net"
 DEFAULT_LOCAL_HOST = "homeassistant"
 DEFAULT_LOCAL_PORT = 8123
 DEFAULT_LOG_LEVEL = "info"
+
+#: Home Assistant Core's port from the Supervisor API (needs ``hassio_api``;
+#: the ``default`` role may read ``/core/info``). Used for ``local_port``
+#: while neither ``local_port`` nor another ``local_host`` is set.
+SUPERVISOR_CORE_INFO_URL = "http://supervisor/core/info"
+SUPERVISOR_API_TIMEOUT = 5.0
+SUPERVISOR_MAX_RESPONSE_BYTES = 64 * 1024
+#: Settings.sources value of a local_port taken from the Supervisor.
+SOURCE_SUPERVISOR = "supervisor"
 
 #: Add-on ``log_level`` values (the base image's bashio levels; ``warn`` is
 #: accepted for configs written by <= 2.0.x) mapped to frpc log levels.
@@ -1096,6 +1118,86 @@ def state_lock(paths: Paths, timeout: Optional[float] = None) -> Iterator[None]:
 
 
 # ---------------------------------------------------------------------------
+# Home Assistant's port (Supervisor API)
+# ---------------------------------------------------------------------------
+
+#: What a Supervisor token looks like (hex in practice); anything else is not
+#: put into a header (urllib would echo an invalid value in its error).
+_SUPERVISOR_TOKEN_RE = re.compile(r"[A-Za-z0-9._~+/=-]{8,512}")
+
+
+class _RefuseRedirects(HTTPRedirectHandler):
+    """The Supervisor API never redirects; never replay its token elsewhere."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        raise HTTPError(req.full_url, code, "redirect refused", headers, fp)
+
+
+def wants_supervisor_port(options: Mapping[str, Any]) -> bool:
+    """True when ``local_port`` follows Home Assistant's own port: the
+    ``local_port`` option is not set and ``local_host`` is the default
+    ``homeassistant`` (``options`` as returned by ``parse_options``)."""
+    return "local_port" not in options and options.get("local_host", DEFAULT_LOCAL_HOST) == DEFAULT_LOCAL_HOST
+
+
+def supervisor_core_port(
+    token: Optional[str] = None,
+    url: str = SUPERVISOR_CORE_INFO_URL,
+    timeout: float = SUPERVISOR_API_TIMEOUT,
+) -> Optional[int]:
+    """Home Assistant Core's HTTP port as the Supervisor reports it
+    (``GET /core/info``, ``{"result": "ok", "data": {"port": ...}}``).
+
+    ``token`` defaults to ``$SUPERVISOR_TOKEN``. Returns None - and the
+    caller uses the default 8123 - without a token (running outside
+    Supervisor), when the API cannot be reached (``timeout`` seconds) or
+    answers anything but a valid port. No proxy, no redirects, at most
+    ``SUPERVISOR_MAX_RESPONSE_BYTES`` read. Never raises; never logs the
+    token.
+    """
+    if token is None:
+        token = os.environ.get("SUPERVISOR_TOKEN", "")
+    if not token:
+        LOG.debug("No SUPERVISOR_TOKEN (not running under Supervisor): local_port %d.", DEFAULT_LOCAL_PORT)
+        return None
+    if not _SUPERVISOR_TOKEN_RE.fullmatch(token):
+        LOG.warning("SUPERVISOR_TOKEN has an unexpected format; Home Assistant's port is not looked up "
+                    "(local_port %d).", DEFAULT_LOCAL_PORT)
+        return None
+    opener = build_opener(ProxyHandler({}), _RefuseRedirects())
+    req = URLRequest(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+    try:
+        with opener.open(req, timeout=timeout) as resp:  # noqa: S310 - fixed http URL
+            payload = resp.read(SUPERVISOR_MAX_RESPONSE_BYTES + 1)
+        if len(payload) > SUPERVISOR_MAX_RESPONSE_BYTES:
+            problem = "oversized answer"
+        else:
+            body = json.loads(payload.decode("utf-8"))
+            data = body.get("data") if isinstance(body, dict) and body.get("result") == "ok" else None
+            port = normalize_port(data.get("port")) if isinstance(data, dict) else None
+            if port is not None:
+                return port
+            problem = "the answer has no valid data.port"
+    except HTTPError as exc:
+        exc.close()
+        problem = f"HTTP {exc.code}"
+    except (URLError, OSError, http.client.HTTPException) as exc:
+        problem = sanitize_text(getattr(exc, "reason", exc), 120, (token,)) or type(exc).__name__
+    except ValueError:  # JSON / UTF-8
+        problem = "the answer is not JSON"
+    LOG.warning("Cannot read Home Assistant's port from the Supervisor API (%s); using local_port %d. "
+                "Set the local_port option if Home Assistant listens on another port.",
+                problem, DEFAULT_LOCAL_PORT)
+    return None
+
+
+def resolve_supervisor_port(options: Mapping[str, Any], **kwargs: Any) -> Optional[int]:
+    """``supervisor_core_port(**kwargs)`` when ``local_port`` follows Home
+    Assistant's port (``wants_supervisor_port``), else None (no API call)."""
+    return supervisor_core_port(**kwargs) if wants_supervisor_port(options) else None
+
+
+# ---------------------------------------------------------------------------
 # Effective settings (precedence)
 # ---------------------------------------------------------------------------
 
@@ -1109,7 +1211,7 @@ class Settings:
     local_host: str
     local_port: int
     log_level: str
-    #: key -> "option" | "server" | "default" | "server_addr"
+    #: key -> "option" | "server" | "default" | "server_addr" | "supervisor"
     sources: Dict[str, str] = field(default_factory=dict)
     #: verify_server option (default True).
     verify_server: bool = True
@@ -1151,18 +1253,25 @@ class Settings:
             f"server={self.server_addr}:{self.server_port} "
             f"(addr from {src.get('server_addr')}, port from {src.get('server_port')}), "
             f"domain_base={self.domain_base} (from {src.get('domain_base')}), "
-            f"local={self.local_host}:{self.local_port}, {self.describe_tls()}"
+            f"local={self.local_host}:{self.local_port} (port from {src.get('local_port')}), "
+            f"{self.describe_tls()}"
         )
 
 
 def effective_settings(
-    options: Mapping[str, Any], state: Mapping[str, Any], fallback_ca_pem: Optional[str] = None
+    options: Mapping[str, Any],
+    state: Mapping[str, Any],
+    fallback_ca_pem: Optional[str] = None,
+    ha_port: Optional[int] = None,
 ) -> Settings:
     """Apply option > server > default precedence (see module docstring).
 
     ``fallback_ca_pem`` is the CA frpc was last given (``read_ca_file``): it
     is pinned instead when the state's CA no longer passes validation, so
     such a state never downgrades frpc to an unverified connection.
+    ``ha_port`` is Home Assistant's port from the Supervisor
+    (``resolve_supervisor_port``): ``local_port`` unless that option is set
+    or ``local_host`` is not ``homeassistant``.
     """
     sources: Dict[str, str] = {}
 
@@ -1198,14 +1307,22 @@ def effective_settings(
         ca_problem = CA_SERVER_INVALID
     server_name = normalize_host(state.get("server_name")) or server_addr
 
+    local_host = pick("local_host", DEFAULT_LOCAL_HOST)
+    supervisor_port = None if isinstance(ha_port, bool) else normalize_port(ha_port)
+    if "local_port" not in options and local_host == DEFAULT_LOCAL_HOST and supervisor_port is not None:
+        sources["local_port"] = SOURCE_SUPERVISOR
+        local_port = supervisor_port
+    else:
+        local_port = pick("local_port", DEFAULT_LOCAL_PORT)
+
     return Settings(
         app_base=pick("app_base", DEFAULT_APP_BASE),
         api_base=pick("api_base", DEFAULT_API_BASE),
         server_addr=server_addr,
         server_port=server_port,
         domain_base=domain_base,
-        local_host=pick("local_host", DEFAULT_LOCAL_HOST),
-        local_port=pick("local_port", DEFAULT_LOCAL_PORT),
+        local_host=local_host,
+        local_port=local_port,
         log_level=pick("log_level", DEFAULT_LOG_LEVEL),
         sources=sources,
         verify_server=verify_server,
@@ -1367,11 +1484,14 @@ def _write_if_changed(path: Path, text: str, mode: int, gid: Optional[int]) -> b
 
 
 def render_from_disk(
-    paths: Optional[Paths] = None, options: Optional[Mapping[str, Any]] = None
+    paths: Optional[Paths] = None,
+    options: Optional[Mapping[str, Any]] = None,
+    ha_port: Optional[int] = None,
 ) -> Tuple[str, Optional[Settings]]:
     """(Re)write frpc.toml (and frps-ca.pem) from options + state (options
-    are read from options.json unless given). Raises ValueError if the state
-    is paired but unusable.
+    are read from options.json unless given; ``ha_port`` is Home
+    Assistant's port from the Supervisor, see ``effective_settings``).
+    Raises ValueError if the state is paired but unusable.
 
     Without a valid pairing (state file missing, corrupt or incomplete) a
     leftover frpc.toml and frps-ca.pem are deleted, so the old token can
@@ -1391,7 +1511,7 @@ def render_from_disk(
         remove_file(paths.frpc_toml)
         remove_file(paths.frps_ca)
         return RenderResult.NOT_PAIRED, None
-    settings = effective_settings(options, state, read_ca_file(paths))
+    settings = effective_settings(options, state, read_ca_file(paths), ha_port)
     if settings.tls_mode == TLS_BLOCKED:
         remove_file(paths.frpc_toml)
         remove_file(paths.frps_ca)
@@ -1431,9 +1551,12 @@ def _cli(argv: list) -> int:
         print("usage: config.py render", file=sys.stderr)
         return EXIT_ERROR
     paths = default_paths()
+    options = load_options(paths)
+    # Looked up before the state lock is taken (up to SUPERVISOR_API_TIMEOUT).
+    ha_port = resolve_supervisor_port(options)
     try:
         with state_lock(paths, timeout=CLI_LOCK_TIMEOUT):
-            result, settings = render_from_disk(paths)
+            result, settings = render_from_disk(paths, options, ha_port)
     except CAUnusableError as exc:
         LOG.error("%s. Click 'Refresh tunnel config' in the panel.", sanitize_text(exc))
         return EXIT_CA_BLOCKED

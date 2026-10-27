@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import http.server
 import json
 import os
 import ssl
 import stat
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path, PurePosixPath
 from unittest import mock
@@ -661,6 +664,144 @@ class PrecedenceTests(unittest.TestCase):
         self.assertEqual(s.tls_mode, cfg.TLS_DISABLED)
 
 
+class SupervisorPortTests(unittest.TestCase):
+    """local_port: option > Home Assistant's port from the Supervisor (while
+    local_host is homeassistant) > 8123."""
+
+    SUPERVISOR_TOKEN = "0123456789abcdef" * 4
+
+    def test_supervisor_port_is_used_when_nothing_is_set(self):
+        s = cfg.effective_settings({}, {}, ha_port=80)
+        self.assertEqual((s.local_host, s.local_port), ("homeassistant", 80))
+        self.assertEqual(s.sources["local_port"], cfg.SOURCE_SUPERVISOR)
+        self.assertIn("local=homeassistant:80 (port from supervisor)", s.describe())
+        # local_host explicitly set to the default still means Home Assistant.
+        s = cfg.effective_settings(cfg.parse_options({"local_host": "HomeAssistant"}), {}, ha_port=80)
+        self.assertEqual((s.local_port, s.sources["local_port"]), (80, cfg.SOURCE_SUPERVISOR))
+
+    def test_an_explicit_option_wins(self):
+        opts = cfg.parse_options({"local_port": 8124})
+        self.assertFalse(cfg.wants_supervisor_port(opts))
+        s = cfg.effective_settings(opts, {}, ha_port=80)
+        self.assertEqual((s.local_port, s.sources["local_port"]), (8124, "option"))
+        # Another local_host: Home Assistant's port says nothing about it.
+        opts = cfg.parse_options({"local_host": "whoami"})
+        self.assertFalse(cfg.wants_supervisor_port(opts))
+        s = cfg.effective_settings(opts, {}, ha_port=80)
+        self.assertEqual((s.local_host, s.local_port, s.sources["local_port"]), ("whoami", 8123, "default"))
+        # An invalid local_port option is ignored -> the Supervisor value applies.
+        opts = cfg.parse_options({"local_port": "99999"})
+        self.assertTrue(cfg.wants_supervisor_port(opts))
+        self.assertEqual(cfg.effective_settings(opts, {}, ha_port=80).local_port, 80)
+
+    def test_fallback_to_8123(self):
+        for ha_port in (None, 0, 65536, -1, True, "eighty", 80.5):
+            with self.subTest(ha_port=ha_port):
+                s = cfg.effective_settings({}, {}, ha_port=ha_port)
+                self.assertEqual((s.local_port, s.sources["local_port"]), (8123, "default"))
+                self.assertIn("(port from default)", s.describe())
+
+    def test_no_token_means_no_request(self):
+        with mock.patch.dict(os.environ), mock.patch.object(cfg, "build_opener") as opener:
+            os.environ.pop("SUPERVISOR_TOKEN", None)
+            self.assertIsNone(cfg.supervisor_core_port())
+            self.assertIsNone(cfg.supervisor_core_port(token=""))
+            with self.assertLogs("frp-mgr.config", "WARNING"):
+                self.assertIsNone(cfg.supervisor_core_port(token="bad token\r\nX: y"))
+            opener.assert_not_called()
+        # Nothing is looked up when the option decides.
+        with mock.patch.object(cfg, "supervisor_core_port") as lookup:
+            self.assertIsNone(cfg.resolve_supervisor_port(cfg.parse_options({"local_port": 81})))
+            self.assertIsNone(cfg.resolve_supervisor_port(cfg.parse_options({"local_host": "10.0.0.2"})))
+            lookup.assert_not_called()
+            lookup.return_value = 80
+            self.assertEqual(cfg.resolve_supervisor_port({}), 80)
+
+    def _supervisor(self, answers):
+        """A fake Supervisor API: path -> (status, body bytes) or a callable."""
+        hits = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                hits.append((self.path, self.headers.get("Authorization")))
+                answer = answers[self.path]
+                if callable(answer):
+                    answer = answer()
+                code, body, *headers = answer
+                self.send_response(code)
+                for name, value in headers:
+                    self.send_header(name, value)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.daemon_threads = True
+        server.handle_error = lambda *args: None  # the client gave up (timeout test)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_port}", hits
+
+    def test_lookup_against_a_fake_supervisor(self):
+        def ok(port):
+            return (200, json.dumps({"result": "ok", "data": {"version": "2026.10.1", "port": port}}).encode())
+
+        base, hits = self._supervisor({
+            "/core/info": ok(80),
+            "/string": ok("8080"),
+            "/zero": ok(0),
+            "/huge": ok(70000),
+            "/bool": ok(True),
+            "/null": ok(None),
+            "/error": (200, b'{"result": "error", "message": "x", "data": {"port": 80}}'),
+            "/no-data": (200, b'{"result": "ok"}'),
+            "/list": (200, b'[80]'),
+            "/text": (200, b"port 80"),
+            "/forbidden": (403, b'{"result": "error", "message": "forbidden"}'),
+            "/redirect": (302, b"", ("Location", "/core/info")),
+            "/big": (200, b'{"result": "ok", "data": {"port": 80, "x": "' + b"y" * (70 * 1024) + b'"}}'),
+            "/slow": lambda: (time.sleep(1.5), ok(80))[1],
+        })
+        token = self.SUPERVISOR_TOKEN
+        self.assertEqual(cfg.supervisor_core_port(token=token, url=f"{base}/core/info"), 80)
+        self.assertEqual(hits[-1], ("/core/info", f"Bearer {token}"))
+        self.assertEqual(cfg.supervisor_core_port(token=token, url=f"{base}/string"), 8080)
+        # The token is read from the environment by default.
+        with mock.patch.dict(os.environ, {"SUPERVISOR_TOKEN": token}):
+            self.assertEqual(cfg.resolve_supervisor_port({}, url=f"{base}/core/info"), 80)
+        for path in ("/zero", "/huge", "/bool", "/null", "/error", "/no-data", "/list", "/text",
+                     "/forbidden", "/redirect", "/big", "/slow"):
+            with self.subTest(path=path):
+                with self.assertLogs("frp-mgr.config", "WARNING") as logs:
+                    self.assertIsNone(cfg.supervisor_core_port(token=token, url=f"{base}{path}", timeout=0.5))
+                self.assertIn("using local_port 8123", logs.output[-1])
+                self.assertNotIn(token, " ".join(logs.output))
+        # The redirect was not followed (no second hit on /core/info).
+        self.assertEqual(sum(1 for path, _ in hits if path == "/core/info"), 2)
+        # Nothing listens: the same fallback.
+        with self.assertLogs("frp-mgr.config", "WARNING") as logs:
+            self.assertIsNone(cfg.supervisor_core_port(token=token, url="http://127.0.0.1:9/core/info",
+                                                       timeout=0.5))
+        self.assertNotIn(token, " ".join(logs.output))
+
+    def test_render_uses_the_supervisor_port(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = cfg.Paths(Path(tmp))
+            paths.state.write_text(json.dumps({"device_token": "dt", "subdomain": "home", "token": TOKEN}))
+            result, settings = cfg.render_from_disk(paths, {}, ha_port=80)
+            self.assertEqual(result, cfg.RenderResult.RENDERED)
+            self.assertIn("localPort = 80", paths.frpc_toml.read_text().splitlines())
+            result, _ = cfg.render_from_disk(paths, {}, ha_port=None)  # API gone -> 8123
+            self.assertEqual(result, cfg.RenderResult.RENDERED)
+            self.assertIn("localPort = 8123", paths.frpc_toml.read_text().splitlines())
+            cfg.render_from_disk(paths, cfg.parse_options({"local_port": 8124}), ha_port=80)
+            self.assertIn("localPort = 8124", paths.frpc_toml.read_text().splitlines())
+
+
 class RenderTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -1101,6 +1242,7 @@ class CliTests(unittest.TestCase):
         import subprocess
         with tempfile.TemporaryDirectory() as tmp:
             env = dict(os.environ, FRP_DATA_DIR=tmp)
+            env.pop("SUPERVISOR_TOKEN", None)  # outside Supervisor: no API lookup
             run = lambda: subprocess.run(  # noqa: E731
                 [sys.executable, str(FRP_MGR / "config.py"), "render"],
                 env=env, capture_output=True, text=True, check=False)
@@ -1115,6 +1257,7 @@ class CliTests(unittest.TestCase):
             self.assertNotIn(TOKEN, proc.stderr)
             self.assertNotIn(device_token, proc.stderr)
             self.assertIn("domain_base=dev.linumiq.net (from server)", proc.stderr)
+            self.assertIn("local=homeassistant:8123 (port from default)", proc.stderr)
             self.assertEqual(run().returncode, cfg.EXIT_OK)  # unchanged
             self.assertIn("frps server certificate is not verified", proc.stderr)  # pre-2.2 server
             Path(tmp, "frp-state.json").write_text(json.dumps(

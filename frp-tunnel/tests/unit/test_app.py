@@ -139,10 +139,13 @@ class PanelFlowTests(unittest.TestCase):
             mock.patch.object(self.app, "ALLOWED_CLIENT_NETS",
                               self.app._parse_allowed_clients(self.app.DEFAULT_ALLOWED_INGRESS_IPS)),
             mock.patch.dict(self.app._AUTO_REFRESH_STATUS, clear=True),
+            mock.patch.dict(self.app._HA_PORT_CACHE, {"port": None, "expires": 0.0}),
+            mock.patch.dict(os.environ),
         ]
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
+        os.environ.pop("SUPERVISOR_TOKEN", None)  # outside Supervisor (restored by patch.dict)
         self.addCleanup(self._tmp.cleanup)
 
     def _fake_http(self, method, url, body=None, bearer=None, timeout=15):
@@ -587,6 +590,37 @@ class PanelFlowTests(unittest.TestCase):
         self.assertEqual(status["public_url"], "https://home.dev.linumiq.net")
         self.assertEqual(status["sources"]["domain_base"], "server")
         self.assertTrue(status["tls"])
+
+    def test_local_port_follows_home_assistant_port_from_the_supervisor(self):
+        self._paired()
+        self.assertEqual(self.app.api_status()["local_port"], 8123)  # no token: default, no request
+        self.app._HA_PORT_CACHE.update(port=None, expires=0.0)
+        with mock.patch.object(self.cfg, "supervisor_core_port", return_value=80) as lookup:
+            status = self.app.api_status()
+            self.assertEqual((status["local_host"], status["local_port"]), ("homeassistant", 80))
+            self.assertEqual(status["sources"]["local_port"], "supervisor")
+            body = self.app.index(get_request()).body.decode()
+            self.assertIn("homeassistant:80", body)
+            self.assertIn("reported by the Supervisor", body)
+            self.app._render_and_restart()
+            self.assertIn("localPort = 80", self.paths.frpc_toml.read_text().splitlines())
+            self.assertEqual(lookup.call_count, 1)  # cached (the status page polls)
+        # The API is unavailable: 8123, and the lookup is retried later.
+        self.app._HA_PORT_CACHE.update(port=None, expires=0.0)
+        with mock.patch.object(self.cfg, "supervisor_core_port", return_value=None) as lookup:
+            status = self.app.api_status()
+            self.assertEqual((status["local_port"], status["sources"]["local_port"]), (8123, "default"))
+            self.assertNotIn("reported by the Supervisor", self.app.index(get_request()).body.decode())
+            self.assertEqual(lookup.call_count, 1)
+            self.assertLessEqual(self.app._HA_PORT_CACHE["expires"] - self.app.time.monotonic(),
+                                 self.app.HA_PORT_RETRY)
+        # An explicit local_port option wins and nothing is looked up.
+        self.app._HA_PORT_CACHE.update(port=None, expires=0.0)
+        with mock.patch.object(self.app, "OPTIONS", self.cfg.parse_options({"local_port": 8124})), \
+                mock.patch.object(self.cfg, "supervisor_core_port", return_value=80) as lookup:
+            status = self.app.api_status()
+            self.assertEqual((status["local_port"], status["sources"]["local_port"]), (8124, "option"))
+            lookup.assert_not_called()
 
     # -- server verification (H4) / account (M4) --------------------------------
 

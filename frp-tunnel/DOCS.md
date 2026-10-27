@@ -76,6 +76,31 @@ option; the add-on intentionally implements *explicit option > server value >
 default* instead, which is identical for every installation that leaves the
 options unset.)
 
+### Which port of Home Assistant the tunnel forwards to
+
+The tunnel forwards to Home Assistant itself (`local_host` `homeassistant`).
+Since Home Assistant 2026.8 a **new** Home Assistant OS installation serves
+Home Assistant on port **80**; existing installations keep their port (8123
+or whatever is set under **Settings > System > Network**). The add-on
+therefore asks the Supervisor for Home Assistant's port
+(`GET http://supervisor/core/info`, which needs the read-only Supervisor API
+access the add-on declares with `hassio_api`) and uses, in order:
+
+1. the `local_port` **option**, if you set it;
+2. **Home Assistant's port as the Supervisor reports it** - only while
+   `local_host` is `homeassistant` (another `local_host` is a different
+   service, whose port the Supervisor does not know);
+3. the default **8123** - when the Supervisor API is not available (a
+   warning is logged; outside Supervisor, e.g. in the E2E harness, no request
+   is made at all).
+
+The renderer asks on every frpc (re)start, the panel at most every 5 minutes
+(every minute while the API is unavailable). The log shows the result, e.g.
+`local=homeassistant:80 (port from supervisor)`; the panel's *Forwarding* row
+adds "Home Assistant's port, reported by the Supervisor". After changing Home
+Assistant's port, restart the add-on (or click **Refresh tunnel config**
+after a few minutes).
+
 ### Re-rendering and refresh
 
 `/data/frpc.toml` is regenerated from the state file and the options every
@@ -198,7 +223,7 @@ name = "<your subdomain>"
 type = "http"
 customDomains = ["<your subdomain>.linumiq.net"]
 localIP = "homeassistant"
-localPort = 8123
+localPort = 8123  # Home Assistant's port from the Supervisor (80 on new installations)
 ```
 
 frpc runs as the unprivileged system user `frpc`: `frpc.toml` and
@@ -238,7 +263,7 @@ provides `server_addr`, `server_port` and `domain_base`.
 | `server_port` | port   | server value, else `7000` | frps control port. |
 | `domain_base` | domain | server value, else `server_addr` | Public domain suffix for the tunnel host (`<subdomain>.<domain_base>`). |
 | `local_host`  | host   | `homeassistant`           | Local service host name or IP. |
-| `local_port`  | port   | `8123`                    | Local service port. |
+| `local_port`  | port   | Home Assistant's port from the Supervisor (80 on new installations since 2026.8), else `8123` | Local service port. Set it only if the tunnel must forward elsewhere; see [Which port of Home Assistant the tunnel forwards to](#which-port-of-home-assistant-the-tunnel-forwards-to). |
 
 An override is only applied when it is set to a non-empty value; clear the
 field to go back to the server-provided value.
@@ -404,8 +429,18 @@ retire it).
   recovers automatically. If the device was approved but the tunnel could not
   be fetched, click **Refresh**.
 - **Public URL returns 502**: Home Assistant Core is not reachable at
-  `local_host:local_port` from inside the add-on container. `homeassistant`
-  works on the Supervisor network; for other setups set the advanced override.
+  `local_host:local_port` from inside the add-on container. The panel's
+  *Forwarding* row and the log (`local=...:<port> (port from ...)`) show what
+  the tunnel uses. `homeassistant` works on the Supervisor network. The port
+  is Home Assistant's own port as the Supervisor reports it (80 on new Home
+  Assistant OS installations since 2026.8, otherwise usually 8123); if the
+  log says `Cannot read Home Assistant's port from the Supervisor API ...;
+  using local_port 8123` while Home Assistant listens elsewhere, or if a
+  `local_port` option is set to an old value, set `local_port` to Home
+  Assistant's port (**Settings > System > Network**) or clear the option.
+  For other setups set the advanced overrides. If Home Assistant itself
+  serves HTTPS (an `ssl_certificate` in its configuration), the tunnel
+  cannot forward to it (frpc forwards plain HTTP).
 - **"certificate verify failed", "x509: certificate signed by unknown
   authority" or "x509: certificate is valid for ..., not ..." in the log**:
   frpc refused the tunnel server because its certificate does not match the

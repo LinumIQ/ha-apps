@@ -3,7 +3,7 @@
 # https://developers.home-assistant.io/docs/add-ons/configuration/
 
 name: "FRP Tunnel"
-version: "2.2.1"
+version: "2.3.0"
 slug: "frp_tunnel"
 description: >-
   Exposes Home Assistant over a persistent reverse tunnel to a remote
@@ -23,6 +23,13 @@ startup: services
 
 # Outbound-only client; no port mappings needed. No host folders are mapped:
 # everything the add-on keeps lives in its private /data.
+
+# Supervisor API, role "default" (read-only */info endpoints): the add-on
+# reads Home Assistant's own port from /core/info and forwards the tunnel to
+# it (new Home Assistant OS installations serve Home Assistant on port 80
+# since 2026.8, existing ones keep their port). Only used while neither
+# local_port nor another local_host is set.
+hassio_api: true
 
 # Pairing secrets are not put into Home Assistant backups (patterns are
 # matched against the end of each file's path inside the add-on's /data).

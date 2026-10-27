@@ -5,13 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.2.1] - 2026-10-27
+## [2.3.0] - 2026-10-27
 
-Dependency update; no configuration change and no re-pairing needed.
+The tunnel follows Home Assistant's own port (port 80 on new Home Assistant
+OS installations since 2026.8), plus a dependency update. No re-pairing
+needed.
 
 ### Changed
 
-| Component | 2.2.0 | 2.2.1 |
+- **`local_port` follows Home Assistant's port.** Home Assistant 2026.8
+  serves Home Assistant on port 80 on *new* Home Assistant OS installations
+  (existing ones keep their port, configurable under Settings > System >
+  Network); the built-in 8123 made the tunnel answer 502 there. While the
+  `local_port` option is not set and `local_host` is the default
+  `homeassistant`, the add-on now asks the Supervisor for Home Assistant's
+  port (`GET http://supervisor/core/info`, `data.port`) - in the renderer on
+  every frpc start and in the panel (cached for 5 minutes, 1 minute after a
+  failure). Precedence: `local_port` option > Supervisor value > 8123 (when
+  the API is unavailable; a warning is logged). The log names the origin
+  (`local=homeassistant:80 (port from supervisor)`), and so does the panel's
+  *Forwarding* row. Installations that set `local_port` explicitly are
+  unchanged.
+- The add-on declares **`hassio_api: true`** (role `default`: read-only
+  `*/info` endpoints of the Supervisor API) - needed for `/core/info`. The
+  token is sent only to `http://supervisor` (no proxy, no redirects, answer
+  size-limited) and never logged; frpc still runs without it.
+
+Dependencies:
+
+| Component | 2.2.0 | 2.3.0 |
 | --- | --- | --- |
 | Base image `ghcr.io/hassio-addons/base` | 20.1.0 | 21.0.10 |
 | Alpine | 3.23.4 | 3.24.3 |

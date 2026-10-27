@@ -65,4 +65,8 @@ configuration:
   local_port:
     name: Local Port (advanced)
     description: >-
-      TCP port of the local service. Default is 8123 for Home Assistant.
+      TCP port of the local service. Leave empty for Home Assistant: the
+      add-on then uses Home Assistant's own port as the Supervisor reports
+      it (80 on new Home Assistant OS installations since 2026.8, usually
+      8123 on older ones) and falls back to 8123 if the Supervisor cannot be
+      asked. When set, this value is always used.
