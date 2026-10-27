@@ -38,8 +38,12 @@ export DOMAIN \
        CA_COUNTRY CA_STATE CA_LOCALITY CA_ORGANIZATION CA_COMMON_NAME \
        CLIENT_CERT_PASSWORD
 
-cd /usr/lib/cert-mgr || exit 1
-exec uvicorn app:app \
+# uvicorn runs from the panel's virtualenv (pinned, hash-checked
+# dependencies, see requirements.in).
+readonly APP_DIR="/usr/lib/cert-mgr"
+cd "${APP_DIR}" || exit 1
+exec "${APP_DIR}/.venv/bin/uvicorn" app:app \
+    --app-dir "${APP_DIR}" \
     --host 0.0.0.0 \
     --port 8099 \
     --log-level "${UVICORN_LOG_LEVEL}"

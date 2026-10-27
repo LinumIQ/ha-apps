@@ -3,7 +3,7 @@
 # https://developers.home-assistant.io/docs/add-ons/configuration/
 
 name: "Caddy mTLS Proxy"
-version: "1.2.7"
+version: "2.0.0"
 slug: "caddy_mtls"
 description: >-
   Caddy reverse proxy with mutual TLS (mTLS) client certificate authentication
@@ -22,14 +22,19 @@ arch:
 init: false
 startup: services
 
-# Port configuration
+# Port configuration. Caddy listens on 80/443 inside the container. The
+# default HOST ports are 8080/8443: since Home Assistant 2026.8, new Home
+# Assistant OS installations serve Home Assistant itself on 80/443, so an
+# add-on cannot publish those there. Users forward external 80/443 from the
+# router to these host ports (or change them in the add-on's Network
+# settings, e.g. back to 80/443 where those are free).
 ports:
-  "80/tcp": 80
-  "443/tcp": 443
+  "80/tcp": 8080
+  "443/tcp": 8443
 
 ports_description:
-  "80/tcp": "HTTP port for Let's Encrypt HTTP-01 ACME challenge"
-  "443/tcp": "HTTPS port with mTLS authentication"
+  "80/tcp": "HTTP (Let's Encrypt HTTP-01, CRL, redirect to HTTPS). Router: forward external TCP 80 to this port."
+  "443/tcp": "HTTPS with mTLS client certificates. Router: forward external TCP 443 to this port."
 
 # Ingress configuration for the certificate management web UI (FastAPI app
 # served by the cert-mgr s6 service on port 8099 inside the container).
@@ -50,12 +55,14 @@ map:
   - ssl:rw
   - addon_config:rw
 
-# Add-on options with defaults
+# Add-on options with defaults. upstream_port has no default (since 2.0.0):
+# with upstream_host "homeassistant", init-caddy uses Home Assistant Core's
+# own port from the Supervisor API (80 on new Home Assistant OS installations
+# since 2026.8, 8123 on older ones).
 options:
   domain: ""
   email: ""
   upstream_host: "homeassistant"
-  upstream_port: 8123
   mtls_enabled: true
   ca_country: "AT"
   ca_state: "Styria"
@@ -80,7 +87,7 @@ schema:
   domain: str
   email: email
   upstream_host: str
-  upstream_port: port
+  upstream_port: port?
   mtls_enabled: bool
   ca_country: str
   ca_state: str

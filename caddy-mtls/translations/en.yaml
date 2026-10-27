@@ -5,7 +5,8 @@ configuration:
   domain:
     name: Domain
     description: >-
-      The domain name for your Home Assistant instance (e.g., home.example.com).
+      The domain name for your Home Assistant instance (e.g., home.example.com),
+      without a port: the public ports stay 80 and 443.
       This domain must point to your Home Assistant's public IP address.
       Let's Encrypt will automatically obtain and renew SSL certificates for this domain.
 
@@ -25,7 +26,10 @@ configuration:
     name: Upstream Port
     description: >-
       The port of the backend service.
-      Default is 8123 for Home Assistant.
+      Leave empty with upstream host 'homeassistant' to use Home Assistant
+      Core's own port as reported by the Supervisor (80 on new Home Assistant
+      OS installations since 2026.8, 8123 on older ones).
+      Required for any other upstream host.
 
   mtls_enabled:
     name: Enable mTLS
@@ -80,8 +84,11 @@ configuration:
     description: >-
       DNS provider for DNS-01 ACME challenge.
       Use this when port 80 is not available for HTTP-01 challenge.
-      Supported providers: Cloudflare, Route53 (AWS), Hetzner.
-      Set to 'none' to use standard HTTP-01 challenge (requires port 80).
+      Supported providers: Cloudflare, Route53 (AWS), Hetzner (Hetzner Console).
+      Set to 'none' to use the standard HTTP-01 challenge: it requires
+      external TCP port 80 forwarded to this add-on's HTTP host port
+      (8080 by default; HTTPS: external 443 to host port 8443 - see the
+      add-on's Network settings).
 
   dns_api_token:
     name: DNS API Token
@@ -90,9 +97,13 @@ configuration:
 
       For Cloudflare: Create an API token with Zone:Read and DNS:Edit permissions.
       For Route53: Use AWS access key format 'ACCESS_KEY_ID:SECRET_ACCESS_KEY'.
-      For Hetzner: Create an API token in the Hetzner DNS Console.
+      For Hetzner: Create a Hetzner Cloud API token (Read & Write) in the
+      Hetzner Console project that holds the DNS zone (tokens of the old
+      DNS Console no longer work).
 
-      Leave empty if using HTTP-01 challenge (acme_dns_provider = none).
+      Leave empty if using HTTP-01 challenge (acme_dns_provider = none),
+      which needs external TCP port 80 forwarded to this add-on's HTTP host
+      port (8080 by default).
 
   log_level:
     name: Log Level
