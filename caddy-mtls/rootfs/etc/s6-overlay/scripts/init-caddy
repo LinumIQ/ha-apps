@@ -11,6 +11,8 @@ set -e
 source /etc/s6-overlay/scripts/lib/cert-helpers.sh
 # shellcheck source=rootfs/etc/s6-overlay/scripts/lib/state.sh
 source /etc/s6-overlay/scripts/lib/state.sh
+# shellcheck source=rootfs/etc/s6-overlay/scripts/lib/dns-provider.sh
+source /etc/s6-overlay/scripts/lib/dns-provider.sh
 
 ###############################################################################
 # Paths (also referenced by the Caddyfile)
@@ -30,7 +32,9 @@ bashio::log.info "Reading configuration..."
 DOMAIN="$(bashio::config 'domain')"
 EMAIL="$(bashio::config 'email')"
 UPSTREAM_HOST="$(bashio::config 'upstream_host')"
+# Optional since 2.0.0 (resolved below); bashio prints "null" when unset.
 UPSTREAM_PORT="$(bashio::config 'upstream_port')"
+[[ "${UPSTREAM_PORT}" == "null" ]] && UPSTREAM_PORT=""
 MTLS_ENABLED="$(bashio::config 'mtls_enabled')"
 
 CA_COUNTRY="$(bashio::config 'ca_country')"
@@ -43,6 +47,8 @@ CLIENT_CERT_PASSWORD="$(bashio::config 'client_cert_password')"
 
 ACME_DNS_PROVIDER="$(bashio::config 'acme_dns_provider')"
 DNS_API_TOKEN="$(bashio::config 'dns_api_token')"
+# Optional (password?): bashio prints "null" when the key is missing.
+[[ "${DNS_API_TOKEN}" == "null" ]] && DNS_API_TOKEN=""
 LOG_LEVEL="$(bashio::config 'log_level' 'info')"
 
 # Required by the helper functions and the cert-mgr / cert-monitor services.
@@ -57,6 +63,18 @@ if bashio::var.is_empty "${DOMAIN}"; then
     bashio::exit.nok "Option 'domain' is required (e.g. home.example.com)."
 fi
 
+# A bare host name only: a port (e.g. home.example.com:8443) would make Caddy
+# listen on an unpublished container port and clash with the plain-HTTP CRL
+# site. The public ports stay 80/443 - the router forwards them to the host
+# ports in the add-on's Network settings.
+if [[ "${DOMAIN}" == *[:/]* ]]; then
+    bashio::exit.nok "Option 'domain' must be a host name without scheme, port or path (e.g. home.example.com); the router forwards the public ports 80/443 to the add-on's host ports."
+fi
+DOMAIN_RE='^[A-Za-z0-9*]([A-Za-z0-9.*_-]*[A-Za-z0-9])?$'
+if [[ ! "${DOMAIN}" =~ ${DOMAIN_RE} ]]; then
+    bashio::exit.nok "Option 'domain' is not a valid host name: '${DOMAIN}'."
+fi
+
 if bashio::var.is_empty "${EMAIL}"; then
     bashio::exit.nok "Option 'email' is required for Let's Encrypt registration."
 fi
@@ -68,6 +86,51 @@ esac
 
 if [[ "${ACME_DNS_PROVIDER}" != "none" ]] && bashio::var.is_empty "${DNS_API_TOKEN}"; then
     bashio::exit.nok "DNS API token is required when acme_dns_provider is '${ACME_DNS_PROVIDER}'."
+fi
+
+# Upstream port. Unset (the default since 2.0.0) with the default upstream
+# `homeassistant`: Home Assistant Core's own port from the Supervisor API -
+# new Home Assistant OS installations (2026.8+) serve Core on port 80, older
+# ones on 8123. Without the API (outside Supervisor) 8123 is assumed.
+UPSTREAM_PORT_SOURCE="option upstream_port"
+if bashio::var.is_empty "${UPSTREAM_PORT}"; then
+    if [[ "${UPSTREAM_HOST}" != "homeassistant" ]]; then
+        bashio::exit.nok "Option 'upstream_port' is required when upstream_host is not 'homeassistant'."
+    fi
+    UPSTREAM_PORT=""
+    if [[ -n "${SUPERVISOR_TOKEN:-}" ]] || bashio::cache.exists 'core.info'; then
+        UPSTREAM_PORT="$(bashio::core.port)" || UPSTREAM_PORT=""
+    fi
+    if [[ "${UPSTREAM_PORT}" =~ ^[0-9]+$ ]] && (( UPSTREAM_PORT >= 1 && UPSTREAM_PORT <= 65535 )); then
+        UPSTREAM_PORT_SOURCE="Home Assistant Core's port from the Supervisor API"
+    else
+        UPSTREAM_PORT=8123
+        UPSTREAM_PORT_SOURCE="Core's port unknown (no Supervisor API) - default 8123"
+        bashio::log.warning "Could not read Home Assistant Core's port from the Supervisor API; proxying to homeassistant:8123. Set 'upstream_port' if Core uses another port."
+    fi
+fi
+
+# Exported for `caddy validate` below; the caddy service exports the same
+# variables itself (see lib/dns-provider.sh).
+if ! dns_provider_export "${ACME_DNS_PROVIDER}" "${DNS_API_TOKEN}"; then
+    if [[ "${ACME_DNS_PROVIDER}" == "route53" ]]; then
+        bashio::exit.nok "For route53, dns_api_token must be ACCESS_KEY_ID:SECRET_ACCESS_KEY."
+    fi
+    bashio::exit.nok "Invalid dns_api_token for acme_dns_provider '${ACME_DNS_PROVIDER}'."
+fi
+
+# Test-only override (Supervisor offers no way to set an add-on's environment,
+# so it is never set there): ACME_CA_URL replaces the ACME directories of
+# Let's Encrypt / ZeroSSL, e.g. with a local test CA or an unreachable
+# sinkhole (tests/smoke.sh). It is set as the global `acme_ca` and, with a
+# DNS provider, also as the site's `ca` (see below).
+ACME_CA_URL="${ACME_CA_URL:-}"
+ACME_CA_URL_RE='^https?://[A-Za-z0-9._~:/?=&%-]+$'
+if [[ -n "${ACME_CA_URL}" ]]; then
+    if [[ ! "${ACME_CA_URL}" =~ ${ACME_CA_URL_RE} ]]; then
+        bashio::exit.nok "ACME_CA_URL is not a plain http(s) URL."
+    fi
+    bashio::log.warning "ACME_CA_URL is set: certificates are requested from ${ACME_CA_URL} only (test override)."
 fi
 
 if bashio::var.true "${MTLS_ENABLED}" && bashio::var.is_empty "${CLIENT_CERT_PASSWORD}"; then
@@ -151,12 +214,17 @@ esac
 
 TLS_DIRECTIVES=""
 if [[ "${ACME_DNS_PROVIDER}" != "none" ]]; then
-    # Pass the secret via environment variable referenced through Caddy's
-    # {env.X} placeholder so that the token never lands in the on-disk
+    # The secret is passed via environment variables referenced through
+    # Caddy's {env.X} placeholders, so it never lands in the on-disk
     # Caddyfile and cannot break the Caddyfile syntax.
-    export DNS_API_TOKEN
-    TLS_DIRECTIVES="${TLS_DIRECTIVES}        dns ${ACME_DNS_PROVIDER} {env.DNS_API_TOKEN}
+    TLS_DIRECTIVES="${TLS_DIRECTIVES}$(dns_provider_directive "${ACME_DNS_PROVIDER}" "        ")
 "
+    # A site-level ACME issuer (created by `dns`) keeps Caddy's default
+    # ZeroSSL fallback unless the CA is set on the site itself.
+    if [[ -n "${ACME_CA_URL}" ]]; then
+        TLS_DIRECTIVES="${TLS_DIRECTIVES}        ca ${ACME_CA_URL}
+"
+    fi
 fi
 
 if bashio::var.true "${MTLS_ENABLED}"; then
@@ -176,6 +244,10 @@ fi
 # directives to put inside; otherwise omit it entirely so Caddy falls back
 # to fully automatic HTTPS (HTTP-01 / TLS-ALPN challenges).
 TLS_BLOCK=""
+ACME_CA_OPTION=""
+if [[ -n "${ACME_CA_URL}" ]]; then
+    ACME_CA_OPTION=$'\n'"    acme_ca ${ACME_CA_URL}"
+fi
 if [[ -n "${TLS_DIRECTIVES}" ]]; then
     TLS_BLOCK="tls {
 ${TLS_DIRECTIVES}    }"
@@ -213,7 +285,7 @@ cat > "${CADDYFILE}" <<CADDYFILE
 # Caddy mTLS Proxy - generated by init-caddy on every start. Do not edit.
 
 {
-    email ${EMAIL}
+    email ${EMAIL}${ACME_CA_OPTION}
 
     storage file_system {
         root ${CADDY_DATA}
@@ -247,7 +319,12 @@ ${CRL_SITE}
 CADDYFILE
 
 bashio::log.info "Validating generated Caddyfile..."
-if ! /usr/bin/caddy validate --config "${CADDYFILE}" --adapter caddyfile; then
+# The output is scrubbed of the DNS credentials: e.g. the Cloudflare module
+# quotes a token it considers malformed in its error message.
+VALIDATE_RC=0
+/usr/bin/caddy validate --config "${CADDYFILE}" --adapter caddyfile 2>&1 \
+    | dns_provider_redact "${DNS_API_TOKEN}" || VALIDATE_RC=$?
+if (( VALIDATE_RC != 0 )); then
     bashio::exit.nok "Generated Caddyfile failed validation"
 fi
 
@@ -287,10 +364,45 @@ fi
 ###############################################################################
 bashio::log.info "Init complete:"
 bashio::log.info "  Domain:      ${DOMAIN}"
-bashio::log.info "  Upstream:    ${UPSTREAM_HOST}:${UPSTREAM_PORT}"
+bashio::log.info "  Upstream:    ${UPSTREAM_HOST}:${UPSTREAM_PORT} (${UPSTREAM_PORT_SOURCE})"
 bashio::log.info "  mTLS:        ${MTLS_ENABLED}"
 bashio::log.info "  ACME DNS:    ${ACME_DNS_PROVIDER}"
 bashio::log.info "  Log level:   ${LOG_LEVEL} (caddy=${CADDY_LOG_LEVEL})"
+
+###############################################################################
+# Published host ports. Caddy listens on 80/443 inside the container; the
+# host ports are set in the add-on's Network settings (defaults 8080/8443
+# since 2.0.0: new Home Assistant OS installations (2026.8+) serve Home
+# Assistant itself on 80/443). Informational only - never fails the start,
+# and silent outside Supervisor (no API token and no cached add-on info).
+###############################################################################
+log_host_ports() {
+    local http_port https_port
+    if [[ -z "${SUPERVISOR_TOKEN:-}" ]] && ! bashio::cache.exists 'addons.self.info'; then
+        bashio::log.info "  Host ports:  unknown (no Supervisor API)"
+        return 0
+    fi
+    http_port="$(bashio::app.port 80/tcp)" || return 0
+    https_port="$(bashio::app.port 443/tcp)" || return 0
+    [[ "${http_port}" =~ ^[0-9]+$ ]] || http_port=""
+    [[ "${https_port}" =~ ^[0-9]+$ ]] || https_port=""
+
+    bashio::log.info "  Host ports:  80/tcp -> ${http_port:-disabled}, 443/tcp -> ${https_port:-disabled}"
+    if [[ -n "${http_port}" && -n "${https_port}" ]]; then
+        bashio::log.info "  Router:      forward external TCP 80 -> <this host>:${http_port} and TCP 443 -> <this host>:${https_port}"
+    fi
+    if [[ -z "${https_port}" ]]; then
+        bashio::log.warning "Container port 443/tcp is not published on the host: the proxy is unreachable. Set a host port in the add-on's Network settings."
+    fi
+    if [[ -z "${http_port}" ]]; then
+        if [[ "${ACME_DNS_PROVIDER}" == "none" ]]; then
+            bashio::log.warning "Container port 80/tcp is not published on the host: Let's Encrypt's HTTP-01 challenge, the HTTP->HTTPS redirect and the CRL URL cannot work. Publish it or use acme_dns_provider."
+        else
+            bashio::log.warning "Container port 80/tcp is not published on the host: the HTTP->HTTPS redirect and the CRL URL (http://${DOMAIN}/mTLS-CA.crl) are unreachable."
+        fi
+    fi
+}
+log_host_ports || true
 
 ###############################################################################
 # Reverse-proxy reminder for Home Assistant Core.
@@ -300,7 +412,9 @@ bashio::log.info "  Log level:   ${LOG_LEVEL} (caddy=${CADDY_LOG_LEVEL})"
 # user can also whitelist a single address if they prefer it over the whole
 # Supervisor docker subnet.
 ###############################################################################
-ADDON_IP="$(hostname -i 2>/dev/null | awk '{print $1}')"
+# (`|| true`: bashio enables pipefail, and `hostname -i` fails when the
+# container has no network, e.g. in tests/smoke.sh.)
+ADDON_IP="$(hostname -i 2>/dev/null | awk '{print $1}')" || true
 [[ -z "${ADDON_IP}" ]] && ADDON_IP="<this add-on's container IP>"
 
 bashio::log.notice "------------------------------------------------------------"

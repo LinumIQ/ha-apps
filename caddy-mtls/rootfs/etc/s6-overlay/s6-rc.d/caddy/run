@@ -3,7 +3,24 @@
 # Home Assistant Add-on: Caddy mTLS Proxy
 # Long-running Caddy server. The Caddyfile is rendered by the init-caddy
 # oneshot before this service is started.
+#
+# The DNS-01 credentials are exported here (lib/dns-provider.sh): the
+# Caddyfile only references them through {env.*} placeholders, which Caddy
+# resolves in this process - on the initial load and on every `caddy reload`
+# by cert-mgr. The init-caddy oneshot's own exports do not reach this service.
 # ==============================================================================
+
+# shellcheck source=rootfs/etc/s6-overlay/scripts/lib/dns-provider.sh
+source /etc/s6-overlay/scripts/lib/dns-provider.sh
+
+ACME_DNS_PROVIDER="$(bashio::config 'acme_dns_provider' 'none')"
+if [[ "${ACME_DNS_PROVIDER}" != "none" ]]; then
+    DNS_TOKEN="$(bashio::config 'dns_api_token')"
+    [[ "${DNS_TOKEN}" == "null" ]] && DNS_TOKEN=""
+    dns_provider_export "${ACME_DNS_PROVIDER}" "${DNS_TOKEN}" \
+        || bashio::exit.nok "Invalid dns_api_token for acme_dns_provider '${ACME_DNS_PROVIDER}'."
+    unset DNS_TOKEN
+fi
 
 bashio::log.info "Starting Caddy server..."
 exec /usr/bin/caddy run --config /etc/caddy/Caddyfile --adapter caddyfile

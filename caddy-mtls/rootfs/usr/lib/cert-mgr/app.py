@@ -118,6 +118,12 @@ def _caddy_reload() -> tuple[bool, str]:
 
     Uses the `caddy` CLI which knows how to convert the Caddyfile to JSON
     and POST it to /load on the admin endpoint.
+
+    ``--force`` is required: client changes never change the Caddyfile (the
+    leaf verifier only names the ``active/`` folder, whose files Caddy reads
+    when the config is loaded), and Caddy skips an unchanged config ("config
+    is unchanged") - without it, added clients were refused and revoked ones
+    still accepted until the add-on restarted.
     """
     if not CADDYFILE.exists():
         return False, f"Caddyfile not found at {CADDYFILE}"
@@ -125,6 +131,7 @@ def _caddy_reload() -> tuple[bool, str]:
         [
             CADDY_BIN,
             "reload",
+            "--force",
             "--config",
             str(CADDYFILE),
             "--adapter",

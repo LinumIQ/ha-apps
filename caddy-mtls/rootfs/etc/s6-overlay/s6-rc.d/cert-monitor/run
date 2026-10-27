@@ -27,5 +27,8 @@ export CERT_EXPIRY_WARN_DAYS="${THRESHOLDS}"
 export STATE_FILE="/data/state.json"
 export SUPERVISOR_URL="http://supervisor"
 
-cd /usr/lib/cert-mgr || exit 1
-exec python3 monitor.py
+# monitor.py uses the standard library only; it runs with the panel's
+# virtualenv interpreter anyway, so the add-on has exactly one Python.
+readonly APP_DIR="/usr/lib/cert-mgr"
+cd "${APP_DIR}" || exit 1
+exec "${APP_DIR}/.venv/bin/python3" monitor.py

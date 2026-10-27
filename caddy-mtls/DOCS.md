@@ -18,15 +18,51 @@ This add-on provides a Caddy reverse proxy with mutual TLS (mTLS) authentication
 ### Network Requirements
 
 1. **Domain Name**: You need a domain name pointing to your Home Assistant's public IP
-2. **Port Forwarding**: Forward ports 80 and 443 from your router to Home Assistant
-3. **Firewall**: Ensure ports 80 and 443 are open
+2. **Port Forwarding**: On your router, forward external TCP port **80 to port
+   8080** and external TCP port **443 to port 8443** of your Home Assistant
+   host (the add-on's default host ports, see below)
+3. **Firewall**: Ensure the external ports 80 and 443 are open
+
+### Ports: 8080 and 8443 on the host (since 2.0.0)
+
+Inside the add-on, Caddy listens on ports 80 (HTTP) and 443 (HTTPS). Since
+Home Assistant 2026.8, **new Home Assistant OS installations serve Home
+Assistant itself on ports 80 and 443** (Settings > System > Network; existing
+installations keep their port, usually 8123), so an add-on cannot publish
+those ports there. The add-on therefore publishes them on the host as **8080**
+and **8443** by default:
+
+| Inside the add-on | Default host port | Port forwarding on the router            |
+| ----------------- | ----------------- | ---------------------------------------- |
+| `80/tcp` (HTTP)   | `8080`            | external TCP 80 -> `<HA host>:8080`      |
+| `443/tcp` (HTTPS) | `8443`            | external TCP 443 -> `<HA host>:8443`     |
+
+- You can change the host ports in the add-on's **Network** settings, e.g.
+  back to 80 and 443 on an installation where Home Assistant itself does not
+  use them. The add-on log shows the published host ports on every start.
+- `domain` is the bare host name (`home.example.com`), never with a port:
+  only the host-side mapping changes, the public ports stay 80 and 443.
+- The **public** ports stay 80 and 443: Let's Encrypt's HTTP-01 challenge
+  always connects to port 80, the CRL URL in every client certificate is
+  `http://<domain>/mTLS-CA.crl` (port 80), and the HTTP-to-HTTPS redirect
+  points to `https://<domain>/` (port 443) - all of them reach the add-on
+  through the router's port forwarding.
+- **In your LAN**, either use the public URL (if your router supports NAT
+  loopback / hairpin NAT) or `https://<domain>:8443` with `<domain>`
+  resolving to the Home Assistant host (local DNS or hosts file). The
+  certificate and the mTLS site are bound to the domain name, so
+  `https://<ip-address>:8443` does not work. A plain-HTTP request to
+  `http://<domain>:8080/` is redirected to `https://<domain>/` - port 443,
+  i.e. the router path.
 
 ### Port 80 Availability
 
-Let's Encrypt requires port 80 for the HTTP-01 challenge. If port 80 is not available:
+Let's Encrypt's HTTP-01 challenge requires that external TCP port 80 reaches
+the add-on's HTTP port (host port 8080 by default). If you cannot forward
+port 80:
 
 - Use the DNS-01 challenge by configuring a DNS provider (Cloudflare, Route53, or Hetzner)
-- Ensure no other service is using port 80
+- Ensure no other service is using the external port 80
 
 ## Installation
 
@@ -70,23 +106,34 @@ network.
 
 ### Required Options
 
-| Option   | Description             | Example             |
-| -------- | ----------------------- | ------------------- |
-| `domain` | Your domain name        | `home.example.com`  |
-| `email`  | Email for Let's Encrypt | `admin@example.com` |
+| Option   | Description                                       | Example             |
+| -------- | ------------------------------------------------- | ------------------- |
+| `domain` | Your domain name (host name only: no port, path) | `home.example.com`  |
+| `email`  | Email for Let's Encrypt                           | `admin@example.com` |
 
 ### Optional Options
 
 | Option                      | Default          | Description                                                                                                             |
 | --------------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------- |
 | `upstream_host`             | `homeassistant`  | Backend service hostname                                                                                                |
-| `upstream_port`             | `8123`           | Backend service port                                                                                                    |
+| `upstream_port`             | (unset)          | Backend service port. Unset with `upstream_host: homeassistant`: Home Assistant Core's own port, read from the Supervisor (80 on new Home Assistant OS installations since 2026.8, 8123 on older ones). Required for any other `upstream_host` |
 | `mtls_enabled`              | `true`           | Enable client certificate authentication                                                                                |
 | `client_names`              | `["user"]`       | List of client certificate names                                                                                        |
 | `client_cert_password`      | `LinumIQ`        | Password for .p12 files                                                                                                 |
 | `log_level`                 | `info`           | Add-on / Caddy log verbosity (`trace`, `debug`, `info`, `notice`, `warning`, `error`, `fatal`)                          |
 | `cert_expiry_warn_days`     | `[30, 14, 7, 1]` | List of days-before-expiry thresholds at which to fire a notification (one notification per crossed threshold per cert) |
 | `cert_check_interval_hours` | `6`              | How often the `cert-monitor` service polls certificate metadata and publishes sensor states (`1`-`168`)                 |
+
+### Upstream port (since 2.0.0)
+
+With the default `upstream_host: homeassistant` and no `upstream_port`, the
+add-on proxies to Home Assistant Core's own port as reported by the
+Supervisor - 80 on new Home Assistant OS installations (2026.8 and later),
+8123 on older ones; the log shows the resolved upstream on every start. If
+you saved the add-on options before 2.0.0, they may contain
+`upstream_port: 8123`; remove it to follow Core's port, or keep it if Core
+really listens there. Without the Supervisor API (tests) 8123 is assumed. The
+proxy talks plain HTTP to the upstream.
 
 ### CA Certificate Options
 
@@ -106,6 +153,12 @@ Use these options when port 80 is not available:
 | ------------------- | ------- | -------------------------------------------------------- |
 | `acme_dns_provider` | `none`  | DNS provider: `none`, `cloudflare`, `route53`, `hetzner` |
 | `dns_api_token`     | (empty) | API token for the DNS provider                           |
+
+The token never appears in the generated Caddyfile: Caddy reads it from the
+add-on's environment (`{env.*}` placeholders). If the Caddyfile check at
+start-up fails, its output is printed with the token replaced by
+`<redacted>` (the Cloudflare module quotes a token it considers malformed in
+its error message).
 
 #### Cloudflare Setup
 
@@ -144,12 +197,23 @@ Use these options when port 80 is not available:
 }
 ```
 
-2. Set `dns_api_token` to `ACCESS_KEY_ID:SECRET_ACCESS_KEY`
+2. Set `dns_api_token` to `ACCESS_KEY_ID:SECRET_ACCESS_KEY` (the access key
+   ID, a colon, the secret access key). The add-on splits it at the first
+   colon and passes both parts to Caddy's `route53` module (`access_key_id` /
+   `secret_access_key`). Before 2.0.0 this format was rendered as a single
+   positional argument, which the module rejects.
 
 #### Hetzner DNS Setup
 
-1. Go to [Hetzner DNS Console](https://dns.hetzner.com/settings/api-token)
-2. Create a new API token
+Since 2.0.0 the add-on uses the Hetzner module v2, which manages DNS zones in
+the **Hetzner Console** through the Hetzner Cloud API. The previous module
+(v1) used the deprecated DNS Console API (`dns.hetzner.com`) and its tokens
+no longer work with the add-on.
+
+1. Make sure the zone is managed in the [Hetzner Console](https://console.hetzner.cloud/)
+   (zones from the old DNS Console have to be moved there)
+2. In the project that holds the zone, go to **Security > API tokens** and
+   create a token with **Read & Write** permission
 3. Copy the token to `dns_api_token`
 
 ## Downloading Client Certificates
@@ -292,8 +356,14 @@ the state.
 
 ### "Connection refused" errors
 
-- Ensure ports 80 and 443 are properly forwarded
-- Check that no other service is using these ports
+- Ensure the external ports 80 and 443 are forwarded to the add-on's host
+  ports - **8080 and 8443 by default** since 2.0.0 (the add-on log shows the
+  published host ports on every start; see
+  [Ports](#ports-8080-and-8443-on-the-host-since-200))
+- After updating from 1.x: an installation whose Network settings were never
+  customised now publishes 8080/8443 instead of 80/443 - adjust the port
+  forwarding or set the host ports back in the add-on's **Network** settings
+- Check that no other service is using these host ports
 - Verify your domain points to the correct IP
 
 ### "Certificate not trusted" on clients
@@ -313,6 +383,59 @@ the state.
 - Verify your API token has the correct permissions
 - Check that the domain is managed by the selected DNS provider
 - Wait a few minutes for DNS propagation
+
+## Running outside Home Assistant (tests)
+
+The image can be started without Supervisor (this is what the smoke tests in
+`tests/` do):
+
+- Supervisor normally provides `/data/options.json` and the Supervisor API.
+  Outside it, copy an `options.json` into `/data` **and** into bashio's cache
+  `/tmp/.bashio/addons.self.options.config.cache` (bashio reads the options
+  from there instead of asking the API). Without a Supervisor token the
+  add-on logs `Host ports: unknown (no Supervisor API)` and the expiry
+  monitor publishes nothing.
+- `ACME_CA_URL` (environment variable, test-only - Supervisor offers no way to
+  set it): replaces the ACME directories of Let's Encrypt and ZeroSSL, as the
+  global `acme_ca` option and, with a DNS provider, as the site's `ca`. The
+  smoke tests point it at a closed local port (`http://127.0.0.1:9/directory`)
+  so that no request leaves the container; it is also useful with a local
+  test CA such as Pebble. Only plain `http(s)://` URLs are accepted.
+- `ALLOWED_INGRESS_IPS` (environment variable, default `172.30.32.2,127.0.0.1`):
+  the client addresses the certificate manager panel answers.
+
+Tests (both need docker; run them against an image built from this directory):
+
+```sh
+docker build --build-arg BUILD_FROM=ghcr.io/hassio-addons/base:21.0.10 \
+    --build-arg BUILD_ARCH=amd64 -t caddy-mtls-test caddy-mtls
+caddy-mtls/tests/smoke.sh caddy-mtls-test
+caddy-mtls/tests/apparmor-smoke.sh caddy-mtls-test caddy-mtls/apparmor.txt
+```
+
+- `tests/smoke.sh <image>` boots the image several times with
+  `--network none` (no external traffic): the panel, the CA and client
+  certificates, real mTLS handshakes before and after adding, revoking and
+  regenerating clients, the CRL, the plain-HTTP site, `mtls_enabled: false`,
+  one start per DNS provider (dummy tokens; the rendered `dns` directive must
+  pass `caddy validate` and Caddy must run with it) and the log hygiene.
+  Prints PASS/FAIL per check; exit 0 = all passed, 1 = a check failed,
+  2 = usage error.
+- `tests/apparmor-smoke.sh <image> <apparmor.txt>` (needs root or sudo and an
+  AppArmor kernel) loads the profile in enforce mode, boots the image under
+  it, adds and revokes a client and fails on any AppArmor denial (kernel log
+  and, if auditd runs, the audit log).
+
+## Maintainers: Python dependencies
+
+`requirements.in` lists the panel's direct dependencies (with the security
+minimums); `requirements.txt` is generated from it with hashes by
+`pip-compile` in the image's Python version - the command is in the header of
+`requirements.in`. The image installs it into a virtualenv
+(`/usr/lib/cert-mgr/.venv`) with `pip --require-hashes --only-binary=:all:`;
+the build fails if a downloaded wheel does not match its hash. Alpine's
+`py3-*` packages are not used (Alpine 3.24's `py3-starlette` 1.1.0 is below
+the 1.3.1 security minimum).
 
 ## Logs
 

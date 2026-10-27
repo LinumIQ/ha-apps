@@ -35,9 +35,10 @@ A Home Assistant add-on that provides a Caddy reverse proxy with mutual TLS (mTL
 domain: home.example.com
 email: admin@example.com
 
-# Upstream (default: Home Assistant)
+# Upstream (default: Home Assistant Core; without upstream_port the add-on
+# uses Core's own port as reported by the Supervisor)
 upstream_host: homeassistant
-upstream_port: 8123
+# upstream_port: 8123
 
 # mTLS settings
 mtls_enabled: true
@@ -61,9 +62,20 @@ dns_api_token: ""
 
 ## Network Requirements
 
-- **Port 80**: Required for Let's Encrypt HTTP-01 challenge (unless using DNS challenge)
-- **Port 443**: HTTPS traffic with mTLS
+Caddy listens on ports 80 and 443 inside the add-on; on the Home Assistant
+host they are published as **8080** and **8443** by default (since 2.0.0:
+new Home Assistant OS installations, 2026.8 and later, serve Home Assistant
+itself on ports 80 and 443). Forward the public ports from your router:
+
+- **External TCP 80 -> host port 8080**: Let's Encrypt HTTP-01 challenge
+  (unless using a DNS challenge), the CRL URL and the redirect to HTTPS
+- **External TCP 443 -> host port 8443**: HTTPS traffic with mTLS
 - **Domain**: Must point to your Home Assistant's public IP
+
+The host ports can be changed in the add-on's **Network** settings (e.g. back
+to 80/443 where Home Assistant does not use them). In the LAN, use
+`https://<domain>:8443` (or the public URL with NAT loopback). See
+[DOCS.md](DOCS.md#ports-8080-and-8443-on-the-host-since-200).
 
 ## Certificate Management
 
@@ -97,9 +109,10 @@ See [DOCS.md](DOCS.md) for detailed documentation including:
 ## Architecture
 
 ```
-Internet → Router:443 → Caddy (mTLS) → Home Assistant:8123
-                ↓
-         Let's Encrypt
+Internet → Router:443 → host:8443 → Caddy :443 (mTLS) → Home Assistant:8123
+Internet → Router:80  → host:8080 → Caddy :80  (HTTP-01, CRL, redirect to https)
+                                       ↓
+                                 Let's Encrypt
 ```
 
 ## License
