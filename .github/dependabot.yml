@@ -11,9 +11,12 @@ updates:
     commit-message:
       prefix: "ci"
 
-  # frp-tunnel/requirements.in (direct pins) -> requirements.txt
+  # <add-on>/requirements.in (direct pins) -> requirements.txt
   # (pip-compile --generate-hashes; Dependabot re-runs pip-compile with the
-  # options recorded in the file's header, so the hashes stay complete).
+  # options recorded in the file's header, so the hashes stay complete). The
+  # images run CPython 3.14 (base 21.0.10 = Alpine 3.24): a Dependabot lock
+  # made with another Python must be re-checked with the command in the
+  # requirements.in header before merging.
   - package-ecosystem: "pip"
     directory: "/frp-tunnel"
     schedule:
@@ -21,10 +24,19 @@ updates:
     commit-message:
       prefix: "deps"
 
+  - package-ecosystem: "pip"
+    directory: "/caddy-mtls"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "deps"
+
   # FROM lines with a literal image (e.g. caddy-mtls' golang builder stage).
-  # The Home Assistant base image comes in through build.yaml /
-  # ARG BUILD_FROM, which Dependabot does not resolve - bump it by hand in
-  # build.yaml, the Dockerfiles' ARG defaults and the CI/E2E build commands.
+  # The Home Assistant base image (currently ghcr.io/hassio-addons/base
+  # 21.0.10) comes in through build.yaml / ARG BUILD_FROM, which Dependabot
+  # does not resolve - bump it by hand in build.yaml, the Dockerfiles' ARG
+  # defaults, the CI/E2E build commands (lint.yml, frp-tunnel/tests/e2e) and
+  # the requirements.in headers, and re-lock requirements.txt with it.
   - package-ecosystem: "docker"
     directories:
       - "/frp-tunnel"

@@ -8,16 +8,30 @@ permissions: {}
 
 env:
   # Files/dirs (relative to an add-on directory) whose change rebuilds that
-  # add-on; .dockerignore decides what goes into the build context.
-  MONITORED_FILES: "build.yaml config.yaml Dockerfile .dockerignore rootfs requirements.txt apparmor.txt"
+  # add-on; .dockerignore decides what goes into the build context. (Folded:
+  # one space-separated line.)
+  MONITORED_FILES: >-
+    build.yaml config.yaml Dockerfile .dockerignore rootfs
+    requirements.in requirements.txt apparmor.txt
   # Repository files whose change rebuilds every add-on (the build itself).
   MONITORED_GLOBAL_FILES: ".github/workflows/builder.yml"
-  # home-assistant/builder 2024.08.2, pinned by image digest. The deprecated
-  # home-assistant/builder *action* is only a wrapper around this image, and
-  # it cannot be pinned by commit SHA (it derives the image tag from its own
-  # checkout path), so the image is run directly.
-  BUILDER_IMAGE: "ghcr.io/home-assistant/amd64-builder:2024.08.2"
-  BUILDER_DIGEST: "sha256:f55223d2c3a5aaf7ddf097a6c3fbfbb0a4154ed1140072031590c6ec0de5c50e"
+  # home-assistant/builder 2026.03.2, pinned by image digest (amd64 image
+  # manifest, 2026-10-27). It is the last builder IMAGE: home-assistant/builder
+  # deprecated builder.sh / the image in 2026.03.0 in favour of composable
+  # BuildKit actions (actions/build-image etc.; 2026.06.0+ releases contain no
+  # image, GHCR has version tags only up to 2026.03.2; `latest`/`dev` are an
+  # unreleased dev build). The deprecated home-assistant/builder *action* is
+  # only a wrapper around this image and cannot be pinned by commit SHA (it
+  # derives the image tag from its own checkout path), so the image is run
+  # directly. The flags used below (--test, --docker-hub, --target, --image,
+  # --addon, --aarch64/--amd64) are unchanged since 2024.08.2.
+  # Base-image signatures: builder.sh verifies BUILD_FROM with cosign only
+  # when build.yaml names a `cosign.base_identity`; ghcr.io/hassio-addons/base
+  # is not cosign-signed (no signature in the registry), so the add-ons set
+  # none and the check is skipped - verification stays enabled (no
+  # --no-cosign-verify), it just has nothing to verify.
+  BUILDER_IMAGE: "ghcr.io/home-assistant/amd64-builder:2026.03.2"
+  BUILDER_DIGEST: "sha256:bb0916d95292d912aaf9a02f0568db336f81d12f6f9b617a93d362efa8bc5d2f"
   # Repository of the images. Always passed: without it (and without an
   # `image:` key in config.yaml, e.g. frp-tunnel) the builder tags the image
   # "/<arch>-addon-<name>:<version>", which docker rejects (this is what made
@@ -55,7 +69,7 @@ jobs:
       changed: ${{ steps.changed_addons.outputs.changed }}
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -166,7 +180,7 @@ jobs:
         arch: ["aarch64", "amd64"]
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -205,7 +219,7 @@ jobs:
         arch: ["aarch64", "amd64"]
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 

@@ -27,15 +27,14 @@ jobs:
         addon: ["caddy-mtls", "frp-tunnel"]
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # Kept at v3.1.0 (hadolint 2.12): hadolint 2.15 (action v3.5.0) newly
-      # flags caddy-mtls' shell-form HEALTHCHECK (DL3025) - bump the action
-      # together with that change.
+      # hadolint 2.15.1 (the action's image), e.g. DL3025: JSON (exec) form
+      # for CMD / ENTRYPOINT / HEALTHCHECK.
       - name: Run Hadolint
-        uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
         with:
           dockerfile: ${{ matrix.addon }}/Dockerfile
 
@@ -46,15 +45,15 @@ jobs:
       contents: read
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # Scans every shell script of both add-ons: *.sh (helper libraries,
-      # frp-tunnel/tests/e2e/run.sh) and - via additional_files - the s6
-      # `run`/`finish` scripts. Those have no extension, are mode 644 in git
-      # and use the `with-contenv bashio` / `execlineb` shebangs, so the
-      # action's own shebang detection skips them.
+      # Scans every shell script of both add-ons: *.sh (helper libraries and
+      # the test scripts, e.g. */tests/*.sh and frp-tunnel/tests/e2e/run.sh)
+      # and - via additional_files - the s6 `run`/`finish` scripts. Those have
+      # no extension, are mode 644 in git and use the `with-contenv bashio` /
+      # `execlineb` shebangs, so the action's own shebang detection skips them.
       - name: Run Shellcheck
         uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38 # 2.0.0
         env:
@@ -76,7 +75,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -96,12 +95,14 @@ jobs:
         addon: ["caddy-mtls", "frp-tunnel"]
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Run Home Assistant Add-on Lint
-        uses: frenck/action-addon-linter@b9cfd1bc62ba60d2c4fc96317b5f7ada5923f4a7 # v2.21.1
+      # frenck/action-addon-linter was renamed to frenck/action-app-linter
+      # (Home Assistant add-ons are now "apps"); same commit for v2.21.1.
+      - name: Run Home Assistant App Linter
+        uses: frenck/action-app-linter@b9cfd1bc62ba60d2c4fc96317b5f7ada5923f4a7 # v2.21.1
         with:
           path: "./${{ matrix.addon }}"
 
@@ -112,15 +113,16 @@ jobs:
       contents: read
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # Same CPython minor version as the add-on image (Alpine 3.23: 3.12).
+      # Same CPython minor version as the add-on image (base 21.0.10 =
+      # Alpine 3.24: 3.14).
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
       - name: Compile
         run: >-
@@ -150,7 +152,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -159,7 +161,7 @@ jobs:
       - name: Build the amd64 image
         run: >-
           docker build
-          --build-arg BUILD_FROM=ghcr.io/hassio-addons/base:20.1.0
+          --build-arg BUILD_FROM=ghcr.io/hassio-addons/base:21.0.10
           --build-arg BUILD_ARCH=amd64
           -t frp-tunnel-test
           frp-tunnel
@@ -181,3 +183,58 @@ jobs:
       # without a single AppArmor denial.
       - name: AppArmor smoke test
         run: frp-tunnel/tests/apparmor-smoke.sh frp-tunnel-test frp-tunnel/apparmor.txt
+
+  caddy-mtls-python:
+    name: Caddy mTLS Python (compile)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Same CPython minor version as the add-on image (base 21.0.10 =
+      # Alpine 3.24: 3.14).
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.14"
+
+      - name: Compile
+        run: >-
+          python -m py_compile
+          caddy-mtls/rootfs/usr/lib/cert-mgr/app.py
+          caddy-mtls/rootfs/usr/lib/cert-mgr/monitor.py
+
+  caddy-mtls-image:
+    name: Caddy mTLS image (amd64 build, smoke test, AppArmor smoke test)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Same build as Supervisor (base image from build.yaml); also builds
+      # Caddy with the pinned xcaddy / DNS modules.
+      - name: Build the amd64 image
+        run: >-
+          docker build
+          --build-arg BUILD_FROM=ghcr.io/hassio-addons/base:21.0.10
+          --build-arg BUILD_ARCH=amd64
+          -t caddy-mtls-test
+          caddy-mtls
+
+      # Boots the image and validates the rendered Caddyfile (incl. every
+      # pinned DNS provider module) - see caddy-mtls/tests/smoke.sh.
+      - name: Smoke test
+        run: bash caddy-mtls/tests/smoke.sh caddy-mtls-test
+
+      # Loads apparmor.txt (enforce mode) and boots the image under it; fails
+      # on any AppArmor denial for the profile.
+      - name: AppArmor smoke test
+        run: bash caddy-mtls/tests/apparmor-smoke.sh caddy-mtls-test caddy-mtls/apparmor.txt
