@@ -5,6 +5,52 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.1] - 2026-10-27
+
+Dependency update; no configuration change and no re-pairing needed.
+
+### Changed
+
+| Component | 2.2.0 | 2.2.1 |
+| --- | --- | --- |
+| Base image `ghcr.io/hassio-addons/base` | 20.1.0 | 21.0.10 |
+| Alpine | 3.23.4 | 3.24.3 |
+| CPython (panel virtualenv) | 3.12.15 | 3.14.8 |
+| OpenSSL (`libcrypto3`/`libssl3`) | 3.5.6 | 3.5.9 |
+| s6-overlay | 3.2.2.0 | 3.2.3.2 |
+| frpc (fatedier/frp) | 0.65.0 | 0.71.1 |
+| Starlette | 1.7.0 | 1.10.0 |
+| uvicorn | 0.54.0 | 0.54.0 (latest) |
+| MarkupSafe | 3.0.3 | 3.0.4 |
+| python-multipart, Jinja2 | 0.0.32, 3.1.6 | unchanged (latest) |
+
+- **frpc 0.71.1.** No change in what the add-on writes to `frpc.toml`, in
+  `frpc -c` / `frpc verify`, or in the log lines the panel evaluates
+  (`login to server success`, `connect to server error: ...`,
+  `start proxy success`). frpc keeps the default wire protocol `v1`; frp's
+  compatibility policy (since 0.69) covers frpc 0.71 with frps 0.63 - 0.79,
+  and the E2E run against the LinumIQ server's frps 0.65.0 passed (TLS
+  verification with the pinned CA included). Upstream fixes include a
+  deadlock when a connection is closed (0.66.0) and control connections that
+  got stuck after a write failure and blocked reconnecting (0.71.1);
+  duplicate proxy names in a config file are now an error (0.70.0).
+- **Starlette 1.10.0** (1.8: Python >= 3.11; 1.9: `request.url` percent-encodes
+  `?`, `#`, `\` and a leading `//` of the path; 1.10: form parsing fixes).
+  The panel is unaffected: its ingress guard decides from the TCP peer only.
+- **s6-overlay 3.2.3.2** (base image 21): the add-on's services are now
+  listed in the `user` bundle under `/etc/s6-overlay/user-bundles.d` instead
+  of `/etc/s6-overlay/s6-rc.d/user`. With the old location the new
+  s6-overlay rewrites the bundle at every start, which the add-on's AppArmor
+  profile denies - the add-on would not have started under Supervisor. The
+  image build now fails on a base image without `user-bundles.d`.
+- `requirements.txt` is locked with CPython 3.14 (all wheels of each pinned
+  version, so x86_64 and aarch64 are covered).
+- Repository: CI runs on Python 3.14 and builds with base 21.0.10; GitHub
+  Actions updated (checkout v7.0.1, setup-python v7.1.0, hadolint-action
+  v3.5.0 = hadolint 2.15.1, `frenck/action-app-linter` v2.21.1 - the renamed
+  add-on linter); the Builder workflow runs the last Home Assistant builder
+  image, 2026.03.2 (pinned by digest).
+
 ## [2.2.0] - 2026-10-13
 
 Security release (platform audit 2026-10-12: H4, M3, M4, add-on lows; add-on

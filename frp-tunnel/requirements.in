@@ -3,13 +3,18 @@
 # requirements.txt is generated from this file with hashes and installed in
 # the image with `pip install --require-hashes --only-binary=:all:` into a
 # virtualenv (/usr/lib/frp-mgr/.venv). Regenerate it - with the Python
-# version of the image (Alpine, CPython 3.12) - after changing a pin:
+# version of the image (base 21.0.10 = Alpine 3.24, CPython 3.14) - after
+# changing a pin (podman works the same way):
 #
-#   podman run --rm -v "$PWD/frp-tunnel:/w" -w /w --entrypoint sh \
-#       ghcr.io/hassio-addons/base:20.1.0 -c 'apk add --no-cache python3 >/dev/null &&
-#       python3 -m venv /tmp/v && /tmp/v/bin/pip -q install pip-tools &&
+#   docker run --rm -v "$PWD/frp-tunnel:/w" -w /w --entrypoint sh \
+#       ghcr.io/hassio-addons/base:21.0.10 -c 'apk add --no-cache python3 >/dev/null &&
+#       python3 -m venv /tmp/v && /tmp/v/bin/pip -q install pip-tools==7.6.2 &&
 #       /tmp/v/bin/pip-compile -q --generate-hashes --allow-unsafe --strip-extras
 #       --no-emit-index-url -o requirements.txt requirements.in'
+#
+# pip-compile --generate-hashes lists the hashes of ALL release files of a
+# pinned version, so the lock also covers aarch64 (e.g. markupsafe's
+# cp314 musllinux x86_64 and aarch64 wheels).
 #
 # Minimum versions (security):
 #   starlette >= 1.3.1        GHSA-86qp-5c8j-p5mr (Host header -> request.url.path),
@@ -17,8 +22,8 @@
 #                             GHSA-x746-7m8f-x49c, GHSA-82w8-qh3p-5jfq
 #   python-multipart >= 0.0.31  GHSA-wp53-j4wj-2cfg, GHSA-mj87-hwqh-73pj, GHSA-pp6c-gr5w-3c5g,
 #                             GHSA-5rvq-cxj2-64vf and lows
-starlette==1.7.0
+starlette==1.10.0
 python-multipart==0.0.32
 jinja2==3.1.6
-markupsafe==3.0.3
+markupsafe==3.0.4
 uvicorn==0.54.0

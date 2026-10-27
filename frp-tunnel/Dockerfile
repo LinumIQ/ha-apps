@@ -1,4 +1,4 @@
-ARG BUILD_FROM=ghcr.io/hassio-addons/base:20.1.0
+ARG BUILD_FROM=ghcr.io/hassio-addons/base:21.0.10
 
 # hadolint ignore=DL3006
 FROM ${BUILD_FROM}
@@ -12,12 +12,12 @@ ARG BUILD_REF
 ARG BUILD_REPOSITORY
 ARG BUILD_VERSION
 
-# Pinned upstream frp release (v0.65.x line) and the SHA-256 of each release
+# Pinned upstream frp release (v0.71.x line) and the SHA-256 of each release
 # tarball, as published in the release's frp_sha256_checksums.txt. Bumping
 # FRP_VERSION requires updating both checksums; the build fails on a mismatch.
-ARG FRP_VERSION=0.65.0
-ARG FRP_SHA256_AMD64=52ced8c5fdf772f48a9909da4c10c7568c061861946ac9af7a86eeaf14b7e6d5
-ARG FRP_SHA256_ARM64=d3e2be696d70b8e8dc475a81b8b5e4089f3a2acde5e42e47d6fc020fe3ddb180
+ARG FRP_VERSION=0.71.1
+ARG FRP_SHA256_AMD64=1d9875210972a5d1a62b2dc4c48df45ab0af05d3ca1b5e494a014428259df803
+ARG FRP_SHA256_ARM64=8edf590b0c396fa42f9c147121a76af83cfc2002b08f5aef0ea1008c43482019
 
 # The hassio-addons base already provides bash, jq, curl, tzdata,
 # ca-certificates, s6-overlay and bashio. Added here:
@@ -63,15 +63,27 @@ RUN set -eux; \
 ENV PATH="/usr/lib/frp-mgr/.venv/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1
 
-# Copy the s6-overlay services and the frp-mgr panel / renderer
+# Copy the s6-overlay services and the frp-mgr panel / renderer. The
+# services are defined in /etc/s6-overlay/s6-rc.d and started through the
+# `user` bundle in /etc/s6-overlay/user-bundles.d (s6-overlay >= 3.2.3.2,
+# base image 21.x): a bundle left in s6-rc.d/user makes s6-overlay's
+# rc.init rewrite it at every start, which the AppArmor profile denies.
 COPY rootfs /
 
 # Normalise the permissions of everything copied from rootfs/ (the build
 # context's modes depend on the checkout's umask; frpc runs unprivileged and
 # must be able to traverse /etc), make every executable asset executable in
 # one place, precompile the panel and pre-create the runtime data directory
-# (bind-mounted by Supervisor; used as-is outside it).
-RUN find /etc/s6-overlay/s6-rc.d /usr/lib/frp-mgr -path /usr/lib/frp-mgr/.venv -prune \
+# (bind-mounted by Supervisor; used as-is outside it). The build fails on a
+# base image whose s6-overlay does not start bundles from user-bundles.d
+# (base < 21: none of the add-on's services would start).
+RUN if [ -e /etc/s6-overlay/s6-rc.d/user ] \
+        || [ ! -f /etc/s6-overlay/user-bundles.d/user/type ]; then \
+        echo "BUILD_FROM: s6-overlay without user-bundles.d (need base 21.x)" >&2; \
+        exit 1; \
+    fi \
+    && find /etc/s6-overlay/s6-rc.d /etc/s6-overlay/user-bundles.d /usr/lib/frp-mgr \
+        -path /usr/lib/frp-mgr/.venv -prune \
         -o -type d -exec chmod 0755 {} + -o -type f -exec chmod 0644 {} + \
     && chmod 0755 /etc /etc/s6-overlay /usr /usr/lib \
     && chmod a+x \

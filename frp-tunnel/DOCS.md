@@ -494,9 +494,9 @@ See the tests README for the commands.
 
 `requirements.in` lists the panel's direct dependencies (with the security
 minimums); `requirements.txt` is generated from it with hashes by
-`pip-compile` in the image's Python version - the command is in the header of
-`requirements.in`. The image build fails if a downloaded wheel does not match
-its hash.
+`pip-compile` in the image's Python version (base image 21.0.10: Alpine 3.24,
+CPython 3.14) - the command is in the header of `requirements.in`. The image
+build fails if a downloaded wheel does not match its hash.
 
 ## Maintainers: publishing to GHCR
 

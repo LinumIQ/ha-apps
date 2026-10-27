@@ -1243,7 +1243,7 @@ def public_hostname(settings: Settings, subdomain: str) -> str:
 def render_frpc_toml(
     settings: Settings, subdomain: str, token: str, ca_file: Optional[str] = None
 ) -> str:
-    """Render the frpc v0.65 TOML configuration.
+    """Render the frpc (v0.65 - v0.71) TOML configuration.
 
     ``ca_file`` (the path ``settings.ca_pem`` was written to) is required
     when ``settings.tls_mode`` is TLS_VERIFIED; TLS_BLOCKED is refused.

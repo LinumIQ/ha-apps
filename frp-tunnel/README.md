@@ -29,7 +29,7 @@ to a remote frps server — by default the LinumIQ tunneling service at
 - **Ingress management panel**: view connection status and the paired
   account, change subdomain, refresh the tunnel configuration, unpair — all
   from within Home Assistant.
-- **Pinned upstream `frpc` v0.65.0**.
+- **Pinned upstream `frpc` v0.71.1** (checksum-verified).
 - **s6-overlay v3** with auto-restart on crash.
 - **Tested**: unit tests, an AppArmor smoke test and an end-to-end harness
   that pairs a real container against a LinumIQ stack (`tests/`).

@@ -68,7 +68,7 @@ never silently run against production.
 | -------- | ------- | ------- |
 | `DOCKER` | `docker` | Container CLI (`podman` works). |
 | `E2E_CREATE_ARGS` | - | Extra arguments for `$DOCKER create` of the add-on container (word-split), e.g. `--security-opt apparmor=frp_tunnel` after `sudo apparmor_parser -r -W frp-tunnel/apparmor.txt`, to run the whole flow confined by the add-on's AppArmor profile (then check `dmesg \| grep DENIED`). |
-| `ADDON_IMAGE` | - | Use this image; otherwise build `frp-tunnel-e2e` with `$DOCKER build --build-arg BUILD_FROM=ghcr.io/hassio-addons/base:20.1.0 --build-arg BUILD_ARCH=<amd64\|aarch64> -t frp-tunnel-e2e frp-tunnel/`. |
+| `ADDON_IMAGE` | - | Use this image; otherwise build `frp-tunnel-e2e` with `$DOCKER build --build-arg BUILD_FROM=ghcr.io/hassio-addons/base:21.0.10 --build-arg BUILD_ARCH=<amd64\|aarch64> -t frp-tunnel-e2e frp-tunnel/`. |
 | `NETWORK` | default bridge | Docker network to attach the add-on container to (must reach `LOCAL_HOST`). |
 | `E2E_PIN_SERVER` | `1` | `1`: also write `server_addr`/`server_port`/`domain_base` overrides (= `SERVER_*`/`DOMAIN_BASE`) into `options.json`. `0`: leave them unset so the **server-provided** values drive `frpc.toml` (also verifies the dashboard's `FRP_SERVER_*`/`TUNNEL_DOMAIN_BASE`). Running both is recommended. |
 | `E2E_PUBLIC_FROM` | `host` | Where the public HTTPS request is made from: `host` (the harness host) or `addon` (inside the add-on container). |
@@ -78,7 +78,7 @@ never silently run against production.
 | `E2E_KEEP_CONTAINER` | `0` | `1`: do not remove the add-on container (debugging). |
 | `E2E_ALLOWED_INGRESS_IPS` | `127.0.0.1` | Passed to the panel as `ALLOWED_INGRESS_IPS` (IPs/CIDRs). The harness drives the panel with `docker exec ... curl http://127.0.0.1:8099`, so loopback must be allowed explicitly (the add-on's default is the Supervisor ingress proxy `172.30.32.2` only - checked in a second container, see below). State-changing requests carry `Sec-Fetch-Site: same-origin` (the panel's CSRF guard refuses them otherwise). |
 | `E2E_BOOT_TIMEOUT` / `E2E_PAIR_TIMEOUT` / `E2E_FRPC_TIMEOUT` / `E2E_PUBLIC_TIMEOUT` | `90` / `180` / `60` / `180` s | Timeouts. The public timeout covers on-demand certificate issuance for a new subdomain. |
-| `E2E_BUILD_ARCH`, `E2E_BUILD_FROM`, `E2E_BUILD_TAG` | auto / base 20.1.0 / `frp-tunnel-e2e` | Build knobs. |
+| `E2E_BUILD_ARCH`, `E2E_BUILD_FROM`, `E2E_BUILD_TAG` | auto / base 21.0.10 / `frp-tunnel-e2e` | Build knobs. |
 
 Host requirements: bash 4.4+, curl, the container CLI, python3 (GoTrue mode
 only). `jq` is not needed on the host (it runs inside the add-on container).
@@ -178,14 +178,14 @@ E2E_TOTP_SECRET_FILE=/root/.addon-e2e-totp frp-tunnel/tests/e2e/run.sh
 tests (`test_config.py`, `test_totp.py`) anywhere; the panel flow tests
 (`test_app.py`, including ASGI-level tests of the ingress guard and the CSRF
 check) need the panel's dependencies: `pip install --require-hashes
---only-binary=:all: -r frp-tunnel/requirements.txt` (Python 3.12, as in the
+--only-binary=:all: -r frp-tunnel/requirements.txt` (Python 3.14, as in the
 image), or run them inside the image. `FRP_MGR_DIR` points the tests at the
 panel code installed in the image, and `FRP_TESTS_REQUIRE_PANEL=1` turns
 missing dependencies into a failure. This is what CI runs (besides the host
 run with the pinned dependencies):
 
 ```sh
-docker build --build-arg BUILD_FROM=ghcr.io/hassio-addons/base:20.1.0 \
+docker build --build-arg BUILD_FROM=ghcr.io/hassio-addons/base:21.0.10 \
     --build-arg BUILD_ARCH=amd64 -t frp-tunnel-test frp-tunnel
 docker run --rm -v "$PWD/frp-tunnel/tests:/tests:ro" \
     -e FRP_MGR_DIR=/usr/lib/frp-mgr -e FRP_TESTS_REQUIRE_PANEL=1 \

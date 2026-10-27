@@ -19,7 +19,8 @@ sys.path.insert(0, str(FRP_MGR))
 
 import frpclog  # noqa: E402
 
-# Lines as frpc 0.65 prints them (incl. its ANSI colours).
+# Lines as frpc prints them (incl. its ANSI colours); the messages are the
+# same in 0.65 and 0.71 (client/service.go, client/control.go).
 CONNECTING = "2026-10-13 10:00:00.000 [I] [client/service.go:295] try to connect to server..."
 SUCCESS = ("\x1b[1;34m2026-10-13 10:00:00.100 [I] [client/service.go:287] [0123abcd] "
            "login to server success, get run id [0123abcd]\x1b[0m")
