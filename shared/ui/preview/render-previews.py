@@ -84,8 +84,8 @@ def frp_base(**overrides):
         "account_email_masked": "",
         "local_host": "homeassistant",
         "local_port": 8123,
-        "app_base": "https://app.linumiq.com",
-        "app_host": "app.linumiq.com",
+        "app_base": "https://app.linumiq.net",
+        "app_host": "app.linumiq.net",
         "updated_at": "",
         "flash_error": None,
         "flash_ok": None,
@@ -95,7 +95,7 @@ def frp_base(**overrides):
 
 
 FRP_PAIRING = dict(pairing_active=True, user_code="ABCD-EF23",
-                   verification_uri_complete="https://app.linumiq.com/activate?code=ABCD-EF23")
+                   verification_uri_complete="https://app.linumiq.net/activate?code=ABCD-EF23")
 FRP_PAIRED = dict(
     paired=True, frpc_status="running", subdomain="my-home", public_url="https://my-home.linumiq.net",
     account_email_masked="g***@example.com", tls_verified=True, tls_login="ok",
@@ -140,7 +140,7 @@ FRP_STATES = [
     ("paired-tls-error", frp_base(**dict(
         FRP_PAIRED, frpc_status="running", tls_verified=False, tls_login="failed", frpc_logged_in_at="",
         tls_errors=[LOGIN_FAILED],
-        flash_error="Cannot reach app.linumiq.com: [Errno -3] Temporary failure in name resolution")), {}),
+        flash_error="Cannot reach app.linumiq.net: [Errno -3] Temporary failure in name resolution")), {}),
 ]
 
 
