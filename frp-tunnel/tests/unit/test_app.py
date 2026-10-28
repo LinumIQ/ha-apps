@@ -89,7 +89,11 @@ def asgi_call(app, method, path, headers=(), client=INGRESS, body=b"", host="pan
     messages = [{"type": "http.request", "body": body, "more_body": False}]
 
     async def receive():
-        return messages.pop(0) if messages else {"type": "http.disconnect"}
+        if messages:
+            return messages.pop(0)
+        # The client stays connected until the response is complete (a file
+        # response listens for a disconnect while it streams and would stop).
+        await asyncio.Event().wait()
 
     async def send(message):
         sent.append(message)
@@ -578,6 +582,94 @@ class PanelFlowTests(unittest.TestCase):
         self.assertIn("linumiq.net:7001", body)
         self.assertIn("Refresh tunnel config", body)
 
+    # -- shared LinumIQ UI (shared/ui, copied by scripts/sync-shared.sh) ----
+
+    def _pages(self):
+        """The dashboard in every state: unpaired, pairing in progress (with
+        the pairing link), approved without a tunnel, paired."""
+        pages = {"unpaired": self.app.index(get_request()).body.decode()}
+        self._start_pairing(verification_uri_complete="https://app.test/activate?code=ABCD-EFGH")
+        pages["pairing"] = self.app.index(get_request()).body.decode()
+        self.paths.pairing.unlink()
+        self.cfg.write_json(self.paths.state, {"device_token": DEVICE_TOKEN})
+        pages["approved_no_tunnel"] = self.app.index(get_request()).body.decode()
+        self._paired()
+        pages["paired"] = self.app.index(get_request()).body.decode()
+        return pages
+
+    def test_static_files_are_served_with_their_content_types(self):
+        for path, content_type in (
+            ("/static/shared/linumiq.css", "text/css"),
+            ("/static/app.css", "text/css"),
+            ("/static/brand/icon.svg", "image/svg+xml"),
+            ("/static/shared/brand/linumiq-logo.png", "image/png"),
+            ("/static/shared/fonts/roboto-latin.woff2", "font/woff2"),
+            ("/static/shared/fonts/roboto-latin-ext.woff2", "font/woff2"),
+            ("/static/shared/fonts/inter-latin.woff2", "font/woff2"),
+            ("/static/shared/fonts/inter-latin-ext.woff2", "font/woff2"),
+        ):
+            with self.subTest(path=path):
+                status, headers, body = asgi_call(self.app.app, "GET", path)
+                self.assertEqual(status, 200)
+                self.assertEqual(headers["content-type"].split(";")[0], content_type)
+                self.assertGreater(len(body), 100)
+                if content_type == "font/woff2":
+                    self.assertEqual(body[:4], b"wOF2")
+
+    def test_pages_use_the_shared_layout(self):
+        pages = self._pages()
+        for state, body in pages.items():
+            with self.subTest(state=state):
+                self.assertTrue(body.lstrip().startswith("<!doctype html>"), body[:80])
+                self.assertIn('<meta name="color-scheme" content="light dark" />', body)
+                self.assertIn("<title>FRP Tunnel - Pairing Panel</title>", body)
+                # Shared stylesheet first, then the app's own.
+                shared_css = body.index('<link rel="stylesheet" href="static/shared/linumiq.css" />')
+                self.assertLess(shared_css, body.index('<link rel="stylesheet" href="static/app.css" />'))
+                # Header: the app's mark (no emoji any more), name, subtitle.
+                self.assertIn('class="app-header__mark"', body)
+                self.assertIn('src="static/brand/icon.svg"', body)
+                self.assertIn("<h1>FRP Tunnel</h1>", body)
+                self.assertIn("reachable on the public internet.", body)
+                self.assertNotIn("\U0001f517", body)
+                # Footer: the LinumIQ logo linking to linumiq.com in a new tab.
+                footer = body[body.index('<footer class="app-footer">'):]
+                self.assertIn('href="https://linumiq.com"', footer)
+                self.assertIn('target="_blank"', footer)
+                self.assertIn('rel="noopener noreferrer"', footer)
+                self.assertIn('src="static/shared/brand/linumiq-logo.png"', footer)
+                self.assertIn('alt="LinumIQ"', footer)
+        # The single call to action of the pairing flow is the orange button.
+        self.assertIn('<button class="btn-cta" type="submit">Start Pairing</button>', pages["unpaired"])
+        self.assertIn('class="btn-cta"', pages["pairing"])
+        self.assertNotIn("btn-cta", pages["paired"] + pages["approved_no_tunnel"])
+
+    def test_no_external_resources(self):
+        """Nothing is loaded from another host (no Google Fonts, no CDN): every
+        resource URL is relative; the only absolute URLs are the links to
+        linumiq.com, the pairing page and the public URL."""
+        allowed = {"https://linumiq.com", "https://app.test/activate?code=ABCD-EFGH",
+                   "https://home.dev.linumiq.net"}
+        for state, body in self._pages().items():
+            with self.subTest(state=state):
+                for url in re.findall(r'\b(?:href|src|srcset|action|poster|data)="([^"]*)"', body):
+                    if re.match(r"[a-z][a-z0-9+.-]*:|//", url):
+                        self.assertIn(url, allowed)
+                self.assertNotRegex(body, r"url\(|@import")
+                for tag in re.findall(r"<(?:link|script|img|source|iframe)\b[^>]*>", body):
+                    for url in re.findall(r'\b(?:src|href)="([^"]*)"', tag):
+                        self.assertRegex(url, r"^(?![a-z][a-z0-9+.-]*:|/)", tag)
+                self.assertNotIn("fonts.googleapis", body)
+                self.assertNotIn("gstatic", body)
+        css_files = sorted((FRP_MGR / "static").rglob("*.css"))
+        self.assertEqual([p.name for p in css_files], ["app.css", "linumiq.css"])
+        for css in css_files:
+            with self.subTest(css=css.name):
+                text = css.read_text()
+                self.assertNotRegex(text, r"https?:|@import|//[a-z]")
+                for url in re.findall(r"url\(\s*['\"]?([^'\")]+)", text):
+                    self.assertTrue((css.parent / url).is_file(), url)
+
     # -- status / security ---------------------------------------------------
 
     def test_status_never_contains_secrets(self):
@@ -901,7 +993,7 @@ class PanelFlowTests(unittest.TestCase):
         # "Host: x/_health?" made request.url.path == "/_health" for POST /unpair.
         self._paired()
         self.backend[("DELETE", "/api/device/tunnel")] = (200, {"ok": True})
-        for host in ("x/_health?a=", "x/_health#", "x/static/style.css?", "127.0.0.1"):
+        for host in ("x/_health?a=", "x/_health#", "x/static/app.css?", "127.0.0.1"):
             for client in (("10.1.2.3", 4000), ("172.30.32.3", 1), ("", 0), None):
                 with self.subTest(host=host, client=client):
                     status, _, _ = asgi_call(self.app.app, "POST", "/unpair", SAME_ORIGIN,
@@ -910,8 +1002,10 @@ class PanelFlowTests(unittest.TestCase):
         self.assertTrue(self.paths.state.exists())
         self.assertEqual(self.calls, [])
         # Static files are behind the guard too.
-        self.assertEqual(asgi_call(self.app.app, "GET", "/static/style.css", client=("10.1.2.3", 1))[0], 403)
-        self.assertEqual(asgi_call(self.app.app, "GET", "/static/style.css")[0], 200)
+        self.assertEqual(asgi_call(self.app.app, "GET", "/static/app.css", client=("10.1.2.3", 1))[0], 403)
+        self.assertEqual(asgi_call(self.app.app, "GET", "/static/app.css")[0], 200)
+        self.assertEqual(asgi_call(self.app.app, "GET", "/static/shared/fonts/inter-latin.woff2",
+                                   client=("10.1.2.3", 1))[0], 403)
 
     def test_post_requires_same_origin(self):
         self._paired()

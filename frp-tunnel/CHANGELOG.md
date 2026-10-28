@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.0] - 2026-10-28
+
+The pairing panel in the LinumIQ look. No re-pairing needed; the pairing
+flow and everything the panel does are unchanged.
+
+### Changed
+
+- **LinumIQ look** for the pairing panel: the brand colours (Anchor Blue for
+  buttons and links, Spark Orange for the one call to action of the pairing
+  flow - "Start Pairing" and "Open pairing page" - and for warnings), the
+  brand fonts Roboto (headings) and Inter (text), and a light and a dark mode
+  that follow the device's light/dark setting (`prefers-color-scheme`). The
+  header shows the add-on's mark instead of an emoji, the footer the LinumIQ
+  logo (a link to linumiq.com, opens in a new tab). Fonts and logo are part
+  of the add-on image (the fonts under the SIL Open Font License 1.1, see
+  NOTICE): the panel loads nothing from other hosts, it works offline in the
+  LAN.
+- **Icon and logo**: the add-on shows an icon and a logo in the add-on store
+  for the first time (the LinumIQ ring with the add-on's symbol, in the brand
+  colours, for light and dark backgrounds).
+- One source for the look of both LinumIQ add-ons: `shared/ui` in the
+  repository (stylesheet, fonts, logo, page layout), copied into the add-on
+  by `scripts/sync-shared.sh` and checked in CI. The panel's `static/style.css`
+  is now `static/shared/linumiq.css` (shared) plus `static/app.css` (this
+  add-on's own components), and `templates/index.html` extends the shared
+  `templates/_layout.html`.
+- Layout details: the values in the status card are no longer indented by
+  the browser's default 40 px, status words ("unknown", "certificate not
+  verified") keep the text size, the pairing code fits on narrow phones,
+  every control has a focus ring in the brand blue, and the "connected" dot
+  stands still and the spinner only fades when the system asks for reduced
+  motion.
+
 ## [2.3.1] - 2026-10-28
 
 Security fix. No re-pairing needed.
