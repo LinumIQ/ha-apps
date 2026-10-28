@@ -81,22 +81,39 @@ to 80/443 where Home Assistant does not use them). In the LAN, use
 
 ### Adding Users
 
-Add names to the `client_names` list and restart the add-on:
+Click **Create client** in the add-on's web interface (no restart needed), or
+add names to the `client_names` list and restart the add-on - at every
+start, a name the add-on does not know yet gets a client certificate:
 
 ```yaml
 client_names:
   - existing-user
-  - new-user # Added
+  - new-user # Added: issued at the next start
 ```
+
+A name has 1-64 characters (letters, digits, `.`, `_`, `-`) and does not
+start with a dot. Removing a name from `client_names` does **not** revoke its
+certificate, and the name of a revoked client is never issued again (the
+add-on skips it with a warning).
 
 ### Revoking Access
 
-To revoke all certificates:
+Revoking happens in the add-on's web interface (Home Assistant sidebar,
+administrators only):
 
-1. Stop the add-on
-2. Delete `/addon_configs/local_caddy_mtls/certs/`
-3. Remove revoked users from `client_names`
-4. Restart the add-on
+- **One client** (e.g. a lost phone): click **Revoke** next to the client.
+  Caddy refuses its certificate at once, without a restart, and the serial is
+  added to the certificate revocation list (CRL).
+- **All client certificates** (e.g. the CA key may have leaked): open
+  **Regenerate CA**, type `REGENERATE-CA` and confirm. Every existing bundle
+  stops working at once; the active clients get new certificates, which you
+  download and distribute again. Revoked clients stay revoked - revoke the
+  clients you want to drop for good *before* regenerating the CA.
+
+Deleting certificate files in `/addon_configs/` or removing names from
+`client_names` revokes nothing: that folder only holds copies for download,
+and the CA and the list of accepted certificates live in the add-on's own
+storage. See [DOCS.md](DOCS.md#certificate-revocation).
 
 ## Documentation
 
