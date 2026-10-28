@@ -2,12 +2,14 @@
   "name": "ha-apps-brand",
   "version": "1.0.0",
   "private": true,
-  "description": "Renders the LinumIQ add-on icons and logos (SVG sources) to the PNGs Home Assistant shows.",
+  "description": "Renders the LinumIQ add-on icons and logos (SVG sources in this directory) to the PNGs Home Assistant shows.",
   "type": "module",
   "license": "Apache-2.0",
   "scripts": {
     "render": "node render.mjs",
-    "check": "node render.mjs --check"
+    "check": "node render.mjs --check",
+    "census": "node render.mjs --census",
+    "logos": "node logo.mjs --font"
   },
   "engines": {
     "node": ">=20"
