@@ -364,9 +364,10 @@ uses_shared_layout() {
     [[ "${html}" == "<!doctype html>"* \
         && "${html}" == *'href="static/shared/linumiq.css"'*'href="static/app.css"'* \
         && "${html}" == *'<header class="app-header">'*'src="static/brand/icon.svg"'*'<h1>Caddy mTLS</h1>'* \
-        && "${html}" == *'<footer class="app-footer">'*'href="https://linumiq.com"'*'src="static/shared/brand/linumiq-logo.png"'*"state version"* ]]
+        && "${html}" == *'<footer class="app-footer">'*'href="https://linumiq.com"'*'src="static/shared/brand/linumiq-logo.png"'*'</footer>'* \
+        && "${html}" != *"state version"* ]]
 }
-check "main: dashboard uses the shared layout (stylesheets, app mark, footer logo)" uses_shared_layout
+check "main: dashboard uses the shared layout (stylesheets, app mark, footer logo, no state version line)" uses_shared_layout
 # Nothing is loaded from another host (no Google Fonts, no CDN): the only
 # absolute URL in an attribute is the footer's link to linumiq.com.
 no_external_resources() {
