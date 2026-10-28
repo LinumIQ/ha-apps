@@ -1,0 +1,20 @@
+{
+  "name": "linumiq-ha-apps-shared-ui",
+  "private": true,
+  "description": "Maintainer tools of the shared LinumIQ panel UI (not part of the add-on images): footer logo, previews and screenshots.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "logo": "node tools/make-logo.mjs",
+    "logo:check": "node tools/make-logo.mjs --check",
+    "previews": "python3 preview/render-previews.py",
+    "screenshots": "node preview/screenshot.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.64.1",
+    "sharp": "0.35.5"
+  }
+}
