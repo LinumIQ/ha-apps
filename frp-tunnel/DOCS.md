@@ -556,8 +556,11 @@ build fails if a downloaded wheel does not match its hash.
 
 `config.yaml` intentionally has no `image:` key yet, so Supervisor builds the
 add-on locally from the `Dockerfile`. The repository's **Builder** workflow
-test-builds every change; when a GitHub **release** is published it builds and
-pushes `ghcr.io/linumiq/{arch}-addon-frp-tunnel:<version>` (`aarch64`, `amd64`).
+test-builds every change; when a GitHub **release** tagged
+`frp-tunnel-v<version>` (e.g. `frp-tunnel-v2.3.1`) is published it builds and
+pushes `ghcr.io/linumiq/{arch}-addon-frp-tunnel:<version>` (`aarch64`, `amd64`)
+for this add-on only; a version that is already in GHCR is skipped, never
+overwritten. See "Releases" in the repository README.
 Once the first release exists (and the GHCR package is public), add
 
 ```yaml

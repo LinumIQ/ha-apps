@@ -93,6 +93,14 @@ jobs:
           echo "Discovered add-ons: ${addons[*]}"
 
       # Changed files come from git itself (no third-party action).
+      # Releases are per add-on: a release tag "<add-on dir>-v<version>"
+      # (e.g. frp-tunnel-v2.3.1, caddy-mtls-v2.0.0) selects ONLY that add-on,
+      # and <version> must be the version in its config.yaml (the workflow
+      # fails otherwise). Any other tag - e.g. the caddy-mtls release tags
+      # v1.1.0 ... v1.2.7 from before frp-tunnel existed - keeps the old
+      # behaviour and selects every add-on; the publish job still skips each
+      # version that is already in GHCR. workflow_dispatch test-builds every
+      # add-on.
       - name: Get changed add-ons
         id: changed_addons
         env:
@@ -101,12 +109,35 @@ jobs:
           PUSH_BEFORE: ${{ github.event.before }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           read -r -a addons <<< "${ADDONS}"
           read -r -a monitored <<< "${MONITORED_FILES}"
           selected=()
-          if [[ "${EVENT_NAME}" == "release" || "${EVENT_NAME}" == "workflow_dispatch" ]]; then
-            # On release or workflow_dispatch every add-on is (re)built.
+          if [[ "${EVENT_NAME}" == "release" ]]; then
+            # The add-on whose "<dir>-v" prefixes the tag (the longest such
+            # dir name, should one dir name be a prefix of another).
+            match=""
+            for addon in "${addons[@]}"; do
+              if [[ "${RELEASE_TAG}" == "${addon}-v"* && ${#addon} -gt ${#match} ]]; then
+                match="${addon}"
+              fi
+            done
+            if [[ -n "${match}" ]]; then
+              version="$(sed -n 's/^version: *"\{0,1\}\([^"]*\)"\{0,1\} *$/\1/p' \
+                "${match}/config.yaml" 2>/dev/null | head -n 1 || true)"
+              if [[ -z "${version}" || "${RELEASE_TAG}" != "${match}-v${version}" ]]; then
+                echo "::error::release tag ${RELEASE_TAG} does not match ${match}/config.yaml" \
+                  "(version ${version:-missing}): expected ${match}-v${version:-<version>}"
+                exit 1
+              fi
+              selected=("${match}")
+              echo "Release ${RELEASE_TAG}: building and publishing ${match} ${version} only"
+            else
+              selected=("${addons[@]}")
+              echo "Release ${RELEASE_TAG} names no add-on (<add-on>-v<version>): every add-on is selected"
+            fi
+          elif [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
             selected=("${addons[@]}")
           else
             base="${PR_BASE}"
@@ -200,10 +231,12 @@ jobs:
             --image "{arch}-addon-${ADDON}" \
             --addon
 
-  # On a published GitHub release every add-on is built and pushed to
-  # ghcr.io/linumiq/{arch}-addon-<dir> (e.g. amd64-addon-frp-tunnel). An add-on
-  # uses the published image only once its config.yaml sets `image:`
-  # (frp-tunnel does not yet, so Supervisor builds it from the Dockerfile).
+  # On a published GitHub release the add-on(s) selected by the release tag
+  # (see init) are built and pushed to ghcr.io/linumiq/{arch}-addon-<dir>:
+  # <version> (e.g. amd64-addon-frp-tunnel:2.3.1) - unless that version is
+  # already there. An add-on uses the published image only once its
+  # config.yaml sets `image:` (frp-tunnel does not yet, so Supervisor builds
+  # it from the Dockerfile).
   publish:
     needs: init
     runs-on: ubuntu-latest
@@ -223,13 +256,81 @@ jobs:
         with:
           persist-credentials: false
 
+      # A published version is never overwritten (a re-run, overlapping
+      # releases, or a tag that selects every add-on): HEAD of the version's
+      # manifest in the registry, with a pull token from ghcr.io/token
+      # requested with the job's GITHUB_TOKEN (credentials go to curl on
+      # stdin, never in argv). 200 = published -> skip this add-on/arch (the
+      # job succeeds); 404 = not published -> build and push. 401/403 = no
+      # such package yet, or not readable with this token -> asked again
+      # anonymously, which answers 200 for a published public image. Any
+      # other answer (network error, 5xx) fails the job instead of risking an
+      # overwrite.
+      - name: Check whether ${{ matrix.addon }} (${{ matrix.arch }}) is already published
+        id: published
+        env:
+          ADDON: ${{ matrix.addon }}
+          ARCH: ${{ matrix.arch }}
+          REGISTRY_USER: ${{ github.repository_owner }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="$(sed -n 's/^version: *"\{0,1\}\([^"]*\)"\{0,1\} *$/\1/p' \
+            "${ADDON}/config.yaml" 2>/dev/null | head -n 1 || true)"
+          if [[ ! "${version}" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]*$ ]]; then
+            echo "::error::no valid version in ${ADDON}/config.yaml"
+            exit 1
+          fi
+          repo="${IMAGE_REPOSITORY#ghcr.io/}/${ARCH}-addon-${ADDON}"
+          ref="ghcr.io/${repo}:${version}"
+          accept="application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json"
+          accept="${accept},application/vnd.docker.distribution.manifest.list.v2+json"
+          accept="${accept},application/vnd.docker.distribution.manifest.v2+json"
+          # head_manifest <auth|anon>: HTTP status of HEAD manifests/<version>,
+          # or the token endpoint's status when it issues no token.
+          head_manifest() {
+            local cfg="" body status token
+            [[ "$1" == auth ]] && cfg="user = \"${REGISTRY_USER}:${REGISTRY_TOKEN}\""
+            body="$(mktemp)"
+            status="$(printf '%s\n' "${cfg}" | curl -sS -o "${body}" -w '%{http_code}' --max-time 30 \
+              --config - "https://ghcr.io/token?service=ghcr.io&scope=repository:${repo}:pull")" || status=000
+            token="$(jq -r '.token // empty' "${body}" 2>/dev/null || true)"
+            rm -f "${body}"
+            if [[ "${status}" != 200 || -z "${token}" ]]; then
+              echo "${status}"
+              return
+            fi
+            curl -sS -o /dev/null -I -w '%{http_code}' --max-time 30 -H "Accept: ${accept}" \
+              -H @<(printf 'Authorization: Bearer %s\n' "${token}") \
+              "https://ghcr.io/v2/${repo}/manifests/${version}" || true
+          }
+          code="$(head_manifest auth)"
+          if [[ "${code}" == 401 || "${code}" == 403 ]]; then
+            code="$(head_manifest anon)"
+          fi
+          case "${code}" in
+            200)
+              echo "${ref} is already published, skipping (a published version is never overwritten)"
+              echo "skip=true" >> "${GITHUB_OUTPUT}"
+              ;;
+            401 | 403 | 404)
+              echo "${ref} is not published yet (registry answered ${code}): building and pushing"
+              echo "skip=false" >> "${GITHUB_OUTPUT}"
+              ;;
+            *)
+              echo "::error::cannot tell whether ${ref} is already published (registry answered ${code}); not pushing"
+              exit 1
+              ;;
+          esac
+
       - name: Login to GitHub Container Registry
+        if: steps.published.outputs.skip == 'false'
         env:
           REGISTRY_USER: ${{ github.repository_owner }}
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: printf '%s' "${REGISTRY_TOKEN}" | docker login ghcr.io --username "${REGISTRY_USER}" --password-stdin
 
       - name: Build and push ${{ matrix.addon }} (${{ matrix.arch }})
+        if: steps.published.outputs.skip == 'false'
         env:
           ADDON: ${{ matrix.addon }}
           ARCH: ${{ matrix.arch }}

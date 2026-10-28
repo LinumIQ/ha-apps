@@ -39,6 +39,12 @@ Security fix. No re-pairing needed.
   configured log level, and when a start-up step of the base image fails,
   frpc and the panel are not started at all.
 
+### Changed
+
+- Repository: a GitHub release tagged `frp-tunnel-v<version>` builds and
+  publishes this add-on only, and a version that is already in GHCR is never
+  pushed again (see "Releases" in the repository README).
+
 ## [2.3.0] - 2026-10-27
 
 The tunnel follows Home Assistant's own port (port 80 on new Home Assistant

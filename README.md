@@ -41,6 +41,29 @@ Or add it manually:
 4. Click **Add**, then close the dialog.
 5. The LinumIQ add-ons should now appear in the add-on store.
 
+## Releases (maintainers)
+
+Each add-on is released on its own. Publish a GitHub release whose tag is
+`<add-on directory>-v<version>`, with `<version>` exactly the `version` in that
+add-on's `config.yaml` - e.g. `caddy-mtls-v2.0.0` or `frp-tunnel-v2.3.1`. The
+**Builder** workflow then builds and pushes only that add-on, as
+`ghcr.io/linumiq/{aarch64,amd64}-addon-<add-on directory>:<version>`; a tag
+whose version does not match `config.yaml` fails the workflow. A tag without an
+add-on prefix (such as the caddy-mtls tags `v1.1.0` ... `v1.2.7` from before
+the per-add-on scheme) keeps the old behaviour and builds every add-on. A
+version that is already in GHCR is skipped, never pushed again, so re-running a
+release workflow is safe.
+
+What users get depends on the add-on's `config.yaml`:
+
+- **caddy-mtls** has an `image:` key: Supervisor pulls the prebuilt image, so
+  users see a new version only after its release has been published (and the
+  workflow has pushed the image). Merge a version bump and release it together.
+- **frp-tunnel** has no `image:` key yet: Supervisor builds it locally from the
+  `Dockerfile`, so a version bump reaches users as soon as it is on `main`; its
+  release only publishes the image, for when the `image:` key is added (see
+  [frp-tunnel/DOCS.md](frp-tunnel/DOCS.md#maintainers-publishing-to-ghcr)).
+
 ## License
 
 Source code in this repository is licensed under the [Apache License 2.0](LICENSE).
