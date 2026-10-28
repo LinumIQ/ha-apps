@@ -11,6 +11,13 @@ certificate, and:
     days). Each (cert, threshold) is fired only once until the cert is
     rotated.
 
+It also watches the public (Let's Encrypt) server certificate
+(public_cert.py): while there is none - and for the first 30 minutes after
+the start - it checks every minute; after 2 minutes without a certificate it
+raises a persistent notification with the last ACME error and a port
+forwarding checklist, and dismisses it as soon as the certificate exists. The
+add-on log gets one line per change of that state.
+
 Failure to reach the Supervisor never crashes the loop - we log and try
 again on the next iteration.
 
@@ -35,6 +42,8 @@ from typing import Any
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+import public_cert
+
 LOG = logging.getLogger("cert-monitor")
 logging.basicConfig(
     level=os.environ.get("CERT_MGR_LOG_LEVEL", "INFO").upper(),
@@ -50,6 +59,15 @@ THRESHOLDS = sorted(
     {int(s.strip()) for s in THRESHOLDS_RAW.split(",") if s.strip()},
     reverse=True,
 )
+
+# Public certificate watch: check interval while there is no certificate and
+# during the first FAST_LANE_SECONDS after the start, and how long the
+# certificate may be missing before the notification is raised. (Overridable
+# for tests only.)
+PUBLIC_CERT_FAST_INTERVAL = int(os.environ.get("CERT_MONITOR_FAST_INTERVAL_SECONDS", "60"))
+PUBLIC_CERT_GRACE_SECONDS = int(os.environ.get("CERT_MONITOR_PUBLIC_CERT_GRACE_SECONDS", "120"))
+FAST_LANE_SECONDS = int(os.environ.get("CERT_MONITOR_FAST_LANE_SECONDS", "1800"))
+PUBLIC_CERT_NOTIFICATION_ID = "caddy_mtls_public_certificate"
 
 # Tracks which (cert_id, threshold_days) pairs we've already notified for
 # in the current state, so we don't spam HA on every loop iteration.
@@ -174,16 +192,24 @@ def _publish_sensor(slug: str, friendly: str, days_left: int, not_after: str) ->
     return _supervisor_request("POST", f"/core/api/states/{entity_id}", payload)
 
 
-def _send_notification(title: str, message: str, notification_id: str) -> None:
+def _send_notification(title: str, message: str, notification_id: str) -> bool:
     payload = {
         "title": title,
         "message": message,
         "notification_id": notification_id,
     }
-    _supervisor_request(
+    return _supervisor_request(
         "POST",
         "/core/api/services/persistent_notification/create",
         payload,
+    )
+
+
+def _dismiss_notification(notification_id: str) -> bool:
+    return _supervisor_request(
+        "POST",
+        "/core/api/services/persistent_notification/dismiss",
+        {"notification_id": notification_id},
     )
 
 
@@ -282,6 +308,103 @@ def _process_once() -> bool:
     return any_published
 
 
+def _notification_message(status: public_cert.Status) -> str:
+    """Markdown text of the "no public certificate" notification."""
+    domain = status.domain
+    lines = [
+        f"Caddy could not get a public (Let's Encrypt) certificate for "
+        f"**{domain}** yet, so {domain} is not reachable over HTTPS.",
+        "",
+    ]
+    if status.last_error:
+        lines += [
+            f"Last error ({public_cert.local_time(status.last_error.ts)}): "
+            f"{status.last_error.text}",
+            "",
+        ]
+    lines.append("Please check:")
+    lines += [f"- {item}" for item in public_cert.checklist(status)]
+    lines += [
+        "",
+        public_cert.retry_hint(status),
+        "The app's web interface (Caddy mTLS) shows the current state.",
+    ]
+    return "\n".join(lines)
+
+
+class PublicCertWatch:
+    """State machine for the public certificate notification.
+
+    States: ``None`` (not checked yet), ``"ok"`` (a valid certificate),
+    ``"missing"`` (none, for less than PUBLIC_CERT_GRACE_SECONDS),
+    ``"notified"`` (none for longer: the notification is raised). The add-on
+    log gets one line per change of state; the Supervisor is called only to
+    raise the notification (retried until it succeeds) and to dismiss it once
+    the certificate exists (also at the first check after a start: a
+    notification of a previous run may still be shown).
+    """
+
+    def __init__(self, started: float) -> None:
+        self.started = started
+        self.state: str | None = None
+        self.missing_since: float | None = None
+        self._raised = False
+        self._dismiss_pending = False
+
+    def check(self, now: float, status: public_cert.Status) -> None:
+        if status.state == "unknown":
+            LOG.debug("public certificate: no runtime information yet")
+            return
+        if status.has_valid_certificate:
+            self.missing_since = None
+            if self.state != "ok":
+                cert = status.certificate
+                assert cert is not None
+                LOG.info(
+                    "Public certificate for %s: %s, valid until %s (%d days).",
+                    status.domain,
+                    cert.issuer,
+                    cert.not_after.strftime("%Y-%m-%d"),
+                    cert.days_left(status.now),
+                )
+                self.state = "ok"
+                self._dismiss_pending = True
+            if self._dismiss_pending and _dismiss_notification(PUBLIC_CERT_NOTIFICATION_ID):
+                self._dismiss_pending = False
+                self._raised = False
+            return
+
+        self._dismiss_pending = False
+        if self.missing_since is None:
+            self.missing_since = now
+        if now - self.missing_since < PUBLIC_CERT_GRACE_SECONDS:
+            self.state = "missing"
+            return
+        if self.state != "notified":
+            error = status.last_error.text if status.last_error else "no error logged yet"
+            LOG.warning(
+                "No public certificate for %s after %d minutes - last error: %s. "
+                "Check the router's port forwarding (details in the app's web "
+                "interface), then restart the app to retry immediately.",
+                status.domain,
+                int((now - self.missing_since) // 60),
+                error,
+            )
+            self.state = "notified"
+        if not self._raised:
+            self._raised = _send_notification(
+                title=f"Caddy mTLS: no public certificate for {status.domain}",
+                message=_notification_message(status),
+                notification_id=PUBLIC_CERT_NOTIFICATION_ID,
+            )
+
+    def interval(self, now: float) -> float:
+        """Seconds until the next check."""
+        if self.state != "ok" or now - self.started < FAST_LANE_SECONDS:
+            return PUBLIC_CERT_FAST_INTERVAL
+        return INTERVAL_SECONDS
+
+
 def main() -> None:
     LOG.info(
         "cert-monitor starting (interval=%ds thresholds=%s state=%s)",
@@ -289,34 +412,49 @@ def main() -> None:
         THRESHOLDS,
         STATE_FILE,
     )
+    started = time.monotonic()
+    watch = PublicCertWatch(started)
     # On startup, Home Assistant Core may not yet be ready (Supervisor
     # returns 502 Bad Gateway while HA boots). Retry quickly with
     # exponential backoff until the first publication succeeds, instead
     # of waiting a full INTERVAL_SECONDS (6h by default).
     backoff = 5
     max_backoff = 300
+    initial_done = False
+    retry_logged = False
+    next_expiry = next_public = started
     while True:
-        try:
-            published = _process_once()
-            if published:
+        now = time.monotonic()
+        if now >= next_expiry:
+            try:
+                published = _process_once()
+            except Exception as exc:  # noqa: BLE001 - never crash the loop
+                LOG.exception("cert-monitor iteration failed: %s", exc)
+                published = False
+            if initial_done:
+                next_expiry = now + INTERVAL_SECONDS
+            elif published:
                 LOG.info("Initial publication to Home Assistant succeeded.")
-                break
-            LOG.info(
-                "Initial publication did not reach Home Assistant yet "
-                "(retrying in %ds)...",
-                backoff,
-            )
-        except Exception as exc:  # noqa: BLE001 - never crash the loop
-            LOG.exception("cert-monitor startup iteration failed: %s", exc)
-        time.sleep(backoff)
-        backoff = min(backoff * 2, max_backoff)
-
-    while True:
-        time.sleep(INTERVAL_SECONDS)
-        try:
-            _process_once()
-        except Exception as exc:  # noqa: BLE001 - never crash the loop
-            LOG.exception("cert-monitor iteration failed: %s", exc)
+                initial_done = True
+                next_expiry = now + INTERVAL_SECONDS
+            else:
+                # Logged once; outside Supervisor this never succeeds.
+                LOG.log(
+                    logging.DEBUG if retry_logged else logging.INFO,
+                    "Initial publication did not reach Home Assistant yet "
+                    "(retrying in %ds)...",
+                    backoff,
+                )
+                retry_logged = True
+                next_expiry = now + backoff
+                backoff = min(backoff * 2, max_backoff)
+        if now >= next_public:
+            try:
+                watch.check(now, public_cert.current_status())
+            except Exception as exc:  # noqa: BLE001 - never crash the loop
+                LOG.exception("public certificate check failed: %s", exc)
+            next_public = now + watch.interval(now)
+        time.sleep(max(1.0, min(next_expiry, next_public) - time.monotonic()))
 
 
 if __name__ == "__main__":

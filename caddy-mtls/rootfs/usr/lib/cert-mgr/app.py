@@ -2,10 +2,12 @@
 Caddy mTLS Proxy - certificate management web UI.
 
 Runs on the Home Assistant ingress port (8099), only reachable via the
-Supervisor's ingress proxy at 172.30.32.2. Provides a dashboard to view
-certificate metadata, download client bundles, regenerate or revoke
-individual client certs, regenerate the server cert, and (with a typed
-confirmation) regenerate the entire CA.
+Supervisor's ingress proxy at 172.30.32.2. Provides a dashboard with the
+state of the public (Let's Encrypt) server certificate (public_cert.py,
+refreshed every 30 s), the CA and client certificate metadata, client bundle
+downloads, regenerating or revoking individual client certs, and (with a
+typed confirmation) regenerating the entire CA (the mTLS CA - the public
+server certificate is Caddy's).
 
 All mutations:
   1. Run the matching shell helper inside the existing cert-helpers.sh
@@ -40,6 +42,8 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import BaseHTTPMiddleware
+
+import public_cert
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -216,7 +220,13 @@ class FlashError(Exception):
 # Application
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="Caddy mTLS - Cert Manager", docs_url=None, redoc_url=None)
+# No /docs, /redoc or /openapi.json: the panel is not an API for others.
+app = FastAPI(
+    title="Caddy mTLS - Cert Manager",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 
 
 @app.exception_handler(FlashError)
@@ -270,8 +280,20 @@ async def health() -> str:
     return "ok"
 
 
+def _public_cert_context() -> dict[str, Any]:
+    """Template variables of the "Public certificate" card."""
+    status = public_cert.current_status(probe=True)
+    return {
+        "pc": status,
+        "pc_checklist": public_cert.checklist(status),
+        "pc_retry_hint": public_cert.retry_hint(status),
+        "pc_time": public_cert.local_time,
+    }
+
+
+# Sync (def) routes run in the thread pool: they read files and call openssl.
 @app.get("/", response_class=HTMLResponse)
-async def index(request: Request) -> Any:
+def index(request: Request) -> Any:
     state = _read_state()
     ca_crt_exists = (CERT_DIR / "mTLS-CA.crt").exists()
     crl_exists = (CERT_DIR / "mTLS-CA.crl").exists()
@@ -286,8 +308,45 @@ async def index(request: Request) -> Any:
             "crl_exists": crl_exists,
             "flash_error": flash_error,
             "flash_ok": flash_ok,
+            **_public_cert_context(),
         },
     )
+
+
+@app.get("/public-cert", response_class=HTMLResponse)
+def public_cert_card(request: Request) -> Any:
+    """The "Public certificate" card alone (the dashboard reloads it every
+    30 s)."""
+    return templates.TemplateResponse(request, "_public_cert.html", _public_cert_context())
+
+
+@app.get("/api/public-cert")
+def api_public_cert() -> dict[str, Any]:
+    status = public_cert.current_status(probe=True)
+    cert = status.certificate
+    err = status.last_error
+    return {
+        "state": status.state,
+        "domain": status.domain,
+        "certificate": None if cert is None else {
+            "issuer": cert.issuer,
+            "subject_cn": cert.subject_cn,
+            "not_after": cert.not_after.isoformat(),
+            "days_left": cert.days_left(status.now),
+            "fingerprint_sha256": cert.fingerprint_sha256,
+            "served": status.served,
+        },
+        "last_error": None if err is None else {
+            "ts": err.ts, "logger": err.logger, "text": err.text,
+        },
+        "challenges": [
+            {"type": c.challenge_type, "ts": c.ts, "text": c.text} for c in status.challenges
+        ],
+        "next_attempt": status.next_attempt,
+        "http_host_port": status.runtime.http_host_port if status.runtime else None,
+        "https_host_port": status.runtime.https_host_port if status.runtime else None,
+        "checklist": public_cert.checklist(status),
+    }
 
 
 @app.get("/api/state")

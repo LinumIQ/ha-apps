@@ -116,3 +116,13 @@ configuration:
     description: >-
       Verbosity for both the add-on init script and the Caddy server.
       One of: trace, debug, info, notice, warning, error, fatal. Default: info.
+      With debug or trace, the access logs of Caddy and of the web interface
+      are on as well.
+
+  access_log:
+    name: Access Log
+    description: >-
+      Log every request through the proxy (Caddy's access log, one line of
+      about 1.5 KB per request - loading the Home Assistant frontend makes
+      several hundred). Off by default; turn it on to debug a connection
+      problem.

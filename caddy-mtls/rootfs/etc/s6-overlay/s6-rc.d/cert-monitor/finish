@@ -1,3 +1,0 @@
-#!/command/execlineb -S0
-foreground { s6-sleep 5 }
-exit 0
