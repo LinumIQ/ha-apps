@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- LinumIQ ring (shared/brand/README.md) -->
+  <g fill="none" stroke="#0883DA" stroke-width="9.42" transform="rotate(45 128 128)">
+    <rect x="24.37" y="24.37" width="207.26" height="207.26" rx="75.41"/>
+    <rect x="50.63" y="50.63" width="154.74" height="154.74" rx="49.11"/>
+  </g>
+  <!-- two keys pointing opposite ways: both sides present a certificate (mutual TLS) -->
+  <g fill="none" stroke-width="9.42" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M73 110A17 17 0 0 1 107 110A17 17 0 0 1 73 110M107 110H172V95M154 110V98" stroke="#FF9D0B"/>
+    <path d="M183 146A17 17 0 0 1 149 146A17 17 0 0 1 183 146M149 146H84V161M102 146V158" stroke="#0883DA" stroke-opacity="0.7"/>
+  </g>
+</svg>
