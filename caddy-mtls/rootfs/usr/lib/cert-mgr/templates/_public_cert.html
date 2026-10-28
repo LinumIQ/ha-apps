@@ -1,0 +1,97 @@
+{#- "Public certificate" card: rendered into index.html and alone by
+    GET public-cert, which the dashboard fetches every 30 s. pc is a
+    public_cert.Status. -#}
+{%- set labels = {
+  "ok": "Valid",
+  "renewal_failing": "Renewal failing",
+  "missing": "Missing",
+  "pending": "Requesting",
+  "unknown": "Unknown",
+} -%}
+{%- set cert = pc.certificate -%}
+<section
+  class="card pc pc--{{ pc.state }}"
+  id="public-cert"
+  aria-labelledby="pc-heading"
+  aria-live="polite"
+  data-state="{{ pc.state }}"
+>
+  <div class="card__header">
+    <h2 class="card__title" id="pc-heading">Public certificate</h2>
+    <span class="status pc-badge pc-badge--{{ pc.state }}">{{ labels[pc.state] }}</span>
+  </div>
+
+  {% if pc.state == "ok" %}
+  <p class="pc__lead">
+    Certificate for <strong>{{ pc.domain }}</strong> from {{ cert.issuer }},
+    valid until {{ cert.not_after.strftime("%Y-%m-%d") }}
+    ({{ cert.days_left(pc.now) }} days).
+  </p>
+  <p class="pc__note">
+    {% if pc.served is true %}Caddy serves it on port 443.
+    {% elif pc.served is false %}Caddy does not serve this certificate on
+    port 443 at the moment; restart the app if this persists.
+    {% endif %}Caddy renews it automatically before it expires.
+  </p>
+  {% elif pc.state == "renewal_failing" %}
+  <p class="pc__lead">
+    The certificate for <strong>{{ pc.domain }}</strong> ({{ cert.issuer }})
+    is valid until {{ cert.not_after.strftime("%Y-%m-%d") }}
+    ({{ cert.days_left(pc.now) }} days), but <strong>renewing it
+    failed</strong>. Fix the cause before it expires.
+  </p>
+  {% elif pc.state == "missing" %}
+  <p class="pc__lead">
+    <strong>No public certificate yet</strong> &mdash; {{ pc.domain }} is not
+    reachable over HTTPS.
+    {% if cert %}The stored certificate ({{ cert.issuer }}) expired on
+    {{ cert.not_after.strftime("%Y-%m-%d") }}.{% endif %}
+  </p>
+  {% elif pc.state == "pending" %}
+  <p class="pc__lead">
+    Requesting a certificate for <strong>{{ pc.domain }}</strong> (since
+    {{ pc_time(pc.runtime.started_at) }}). This usually takes less than a
+    minute; if it fails, the reason and what to check appear here.
+  </p>
+  {% else %}
+  <p class="pc__lead">
+    The certificate state is not available yet: the app is still starting.
+  </p>
+  {% endif %}
+
+  {% if pc.state in ("missing", "renewal_failing") %}
+  {% if pc.last_error %}
+  <div class="pc__error">
+    <div class="pc__error-label">
+      Last error ({{ pc_time(pc.last_error.ts) }})
+    </div>
+    <code class="pc__error-text">{{ pc.last_error.text }}</code>
+    {% for c in pc.challenges %}
+    <div class="pc__challenge">
+      {{ c.challenge_type }} challenge ({{ pc_time(c.ts) }}):
+      <code>{{ c.text }}</code>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="pc__note">
+    Caddy has not reported an error since the start
+    ({{ pc_time(pc.runtime.started_at) }}).
+  </p>
+  {% endif %}
+  <p class="pc__note"><strong>Please double-check:</strong></p>
+  <ol class="pc__checklist">
+    {% for item in pc_checklist %}
+    <li>{{ item }}</li>
+    {% endfor %}
+  </ol>
+  <p class="pc__note">{{ pc_retry_hint }}</p>
+  {% endif %}
+
+  {% if pc.runtime and pc.runtime.acme_ca %}
+  <p class="pc__note pc__note--test">
+    Test override: certificates are requested from
+    <code>{{ pc.runtime.acme_ca }}</code>.
+  </p>
+  {% endif %}
+</section>

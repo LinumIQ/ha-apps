@@ -5,7 +5,7 @@
 #
 # Sourced by:
 #   /etc/s6-overlay/scripts/init-caddy
-#   /usr/lib/cert-mgr/scripts/run.sh   (via subprocess from the FastAPI app)
+#   /usr/lib/cert-mgr/app.py   (the panel, via `bash -c`)
 #
 # Required globals (env vars):
 #   CERT_DIR
@@ -42,6 +42,23 @@ _ch_die() {
         printf '[cert-helpers] FATAL: %s\n' "$*" >&2
         exit 1
     fi
+}
+
+###############################################################################
+# Run `openssl <args...>` and print its output (stdout and stderr) only if it
+# fails: `openssl ca` writes a "Certificate Details" dump of every issued
+# certificate and progress lines ("Using configuration from ...", "Database
+# updated") to stderr, which would otherwise fill the add-on log. On failure
+# the whole output goes to stderr, so the caller's error message is preceded
+# by openssl's reason.
+###############################################################################
+_ch_openssl_quiet() {
+    local out rc=0
+    out="$(openssl "$@" 2>&1)" || rc=$?
+    if (( rc != 0 )); then
+        printf '%s\n' "${out}" >&2
+    fi
+    return "${rc}"
 }
 
 ###############################################################################
@@ -113,7 +130,7 @@ generate_client_cert() {
 
     SAN_DNS="DNS:${client_name}.invalid" \
     CRL_DOMAIN="${DOMAIN:-localhost}" \
-    openssl ca -batch -notext \
+    _ch_openssl_quiet ca -batch -notext \
         -config "${OPENSSL_CA_CNF}" \
         -extensions client_ext \
         -days "${CLIENT_VALIDITY_DAYS}" \
@@ -309,7 +326,7 @@ generate_crl() {
     init_ca_db
 
     SAN_DNS="DNS:none" CRL_DOMAIN="none" \
-    openssl ca -batch \
+    _ch_openssl_quiet ca -batch \
         -config "${OPENSSL_CA_CNF}" \
         -gencrl \
         -crldays "${CRL_VALIDITY_DAYS}" \

@@ -5,6 +5,82 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.1] - 2026-10-28
+
+Fixes from the first real installation (Home Assistant OS 18.4, Supervisor
+2026.10.4): a clean and fast stop, crashes visible to the Supervisor, a quiet
+log, and the state of the Let's Encrypt certificate in the web interface and
+as a notification.
+
+### Fixed
+
+- **A Caddy crash looked like a normal stop.** When Caddy exited for any
+  reason, its s6 `finish` script shut the whole add-on down with exit code 0,
+  so the Supervisor showed `stopped` (not `error`) and a Watchdog-enabled
+  installation restarted it without ever showing an error. The add-on now
+  stops only when Caddy really crashed, with Caddy's exit code (128 + signal
+  when it was killed, e.g. 137): the Supervisor logs `App Caddy mTLS Proxy
+  exited with non-zero exit code 137` and shows the error. A clean exit of
+  Caddy alone (exit code 0) restarts Caddy instead. DOCS.md has a new
+  troubleshooting entry for "Start although it is running / restarts by
+  itself".
+- **Unclean stop.** Every stop logged `s6-supervise cert-monitor: warning:
+  finish script lifetime reached maximum value - sending it a SIGKILL`,
+  `s6-ipcclient: fatal: unable to connect to .../s6rc-oneshot-runner/s:
+  Connection refused` and `s6-rc: warning: unable to stop service
+  init-caddy: command exited 111`. Causes: the `finish` scripts of the panel
+  and the monitor slept 2 and 5 s (s6 kills a finish script after 5 s), and
+  Caddy's `finish` script started a second shutdown (`s6-svscanctl -t`) that
+  tore down the s6 supervision tree - the oneshot runner included - while
+  s6-rc was still stopping the services. The sleeps and the second shutdown
+  are gone: a stop takes about 3 s (was 5 s) without any warning.
+- **Log spam.** Caddy's access log (`handled request`, about 1.5 KB per
+  request - 692 lines in one minute while the Home Assistant frontend loaded
+  through the proxy) is off by default (new option `access_log`); the health
+  probes no longer log a line each (Caddy's `admin.api` logger is excluded,
+  uvicorn's access log is off unless `log_level` is `debug` or `trace`);
+  `openssl ca` no longer prints the "Certificate Details" of every issued
+  client certificate (its output is shown only when it fails); the generated
+  Caddyfile is formatted (`caddy fmt`), so Caddy no longer warns "Caddyfile
+  input is not formatted" twice per start.
+- **No information when the Let's Encrypt certificate could not be
+  obtained.** See Added.
+
+### Added
+
+- **"Public certificate" card** at the top of the web interface, refreshed
+  every 30 s: green with issuer, expiry and days left (and whether Caddy
+  serves the certificate on port 443); red "No public certificate yet -
+  `<domain>` is not reachable over HTTPS" with Let's Encrypt's last error,
+  the result per challenge type and a checklist with the add-on's real host
+  ports (router forwards external TCP 80 / 443 to them, the domain resolves
+  to the public IP, nothing else answers on those ports, ...) and the hint
+  to restart the add-on once fixed; yellow when a valid certificate exists
+  but renewing it failed. Caddy writes its certificate events to
+  `/data/caddy/log/acme.log` (JSON, 0600, rolled at 1 MB) for this; they
+  stay in the add-on log as well.
+- **Notification "Caddy mTLS: no public certificate for `<domain>`".** While
+  there is no certificate (and during the first 30 minutes after a start)
+  the `cert-monitor` service checks every minute; after two minutes without
+  a certificate it raises a persistent notification with the last error and
+  the checklist, and dismisses it when the certificate exists. The add-on
+  log gets one line per change of this state.
+- Option **`access_log`** (default `false`): Caddy's access log.
+
+### Changed
+
+- Health check: once a minute after the start period (was 30 s), 15 s
+  timeout (was 10 s), unhealthy after 5 failures in a row (was 3); every 5 s
+  during the 2-minute start period (`--start-interval`), so the add-on
+  reaches the state `started` about 5 s after a start. The Supervisor's
+  Watchdog restarts an unhealthy add-on - the probe is more tolerant now.
+- `timeout: 60` (was 300): how long the Supervisor waits for a stop before
+  it kills the container. Caddy gives open requests at most 10 s on a stop
+  or reload (`grace_period`, was unlimited), the web interface 3 s.
+- The web interface no longer serves FastAPI's `/openapi.json`.
+- `cert-monitor` logs "Initial publication did not reach Home Assistant
+  yet" once, not at every retry.
+
 ## [2.0.0] - 2026-10-27
 
 Dependency refresh (base image, Python, Caddy and its DNS modules), new

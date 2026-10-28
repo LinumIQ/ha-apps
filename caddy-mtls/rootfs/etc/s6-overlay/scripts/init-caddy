@@ -21,9 +21,18 @@ source /etc/s6-overlay/scripts/lib/dns-provider.sh
 readonly CERT_DIR="/data/certs"
 readonly CADDY_DATA="/data/caddy"
 readonly CADDYFILE="/etc/caddy/Caddyfile"
+# Caddy's certificate events (JSON), read by the panel and the expiry monitor
+# (public_cert.py). Caddy runs as root; the file is 0600.
+readonly ACME_LOG="${CADDY_DATA}/log/acme.log"
+# Facts of this start for the panel and the monitor (host ports, domain,
+# start time); /run is empty at every start.
+readonly RUNTIME_DIR="/run/caddy-mtls"
+readonly RUNTIME_FILE="${RUNTIME_DIR}/runtime.json"
+STARTED_AT="$(date +%s)"
 
-mkdir -p "${CERT_DIR}" "${CADDY_DATA}"
-chmod 700 "${CERT_DIR}"
+mkdir -p "${CERT_DIR}" "${CADDY_DATA}" "${CADDY_DATA}/log" "${RUNTIME_DIR}"
+chmod 700 "${CERT_DIR}" "${CADDY_DATA}/log"
+chmod 755 "${RUNTIME_DIR}"
 
 ###############################################################################
 # Read configuration
@@ -51,6 +60,7 @@ DNS_API_TOKEN="$(bashio::config 'dns_api_token')"
 # Optional (password?): bashio prints "null" when the key is missing.
 [[ "${DNS_API_TOKEN}" == "null" ]] && DNS_API_TOKEN=""
 LOG_LEVEL="$(bashio::config 'log_level' 'info')"
+ACCESS_LOG="$(bashio::config 'access_log' 'false')"
 
 # Required by the helper functions and the cert-mgr / cert-monitor services.
 export CERT_DIR DOMAIN \
@@ -260,6 +270,27 @@ case "${LOG_LEVEL}" in
     *)                      CADDY_LOG_LEVEL="INFO" ;;
 esac
 
+# Caddy's access log ("handled request", one line of ~1.5 KB per request):
+# only with access_log: true, or with log_level debug / trace. Its entries
+# have level INFO (ERROR for 5xx), so it logs at INFO even with a higher
+# log_level.
+SITE_LOG=""
+if bashio::var.true "${ACCESS_LOG}" || [[ "${CADDY_LOG_LEVEL}" == "DEBUG" ]]; then
+    ACCESS_LOG_LEVEL="INFO"
+    [[ "${CADDY_LOG_LEVEL}" == "DEBUG" ]] && ACCESS_LOG_LEVEL="DEBUG"
+    SITE_LOG="
+    log {
+        output stdout
+        format console
+        level ${ACCESS_LOG_LEVEL}
+    }"
+fi
+
+# The loggers of certificate management: obtaining / renewing (the retry
+# loop's "will retry" and "certificate obtained successfully" included), the
+# ACME client (challenge results) and the ACME issuer.
+readonly ACME_LOGGERS="tls.obtain tls.renew tls.issuance http.acme_client"
+
 TLS_DIRECTIVES=""
 if [[ "${ACME_DNS_PROVIDER}" != "none" ]]; then
     # The secret is passed via environment variables referenced through
@@ -319,12 +350,7 @@ http://${DOMAIN} {
     handle {
         redir https://{host}{uri} permanent
     }
-
-    log {
-        output stdout
-        format console
-        level ${CADDY_LOG_LEVEL}
-    }
+${SITE_LOG}
 }
 "
 fi
@@ -342,10 +368,39 @@ cat > "${CADDYFILE}" <<CADDYFILE
     # Loopback-only admin API so cert-mgr can reload Caddy in-place.
     admin localhost:2019
 
+    # A stop or reload waits at most 10 s for open requests (default:
+    # forever), so the add-on always stops within Supervisor's timeout.
+    grace_period 10s
+
+    # Everything goes to the add-on log - except the admin API's request
+    # lines (one per health probe and per panel action).
     log default {
         output stdout
         format console
         level ${CADDY_LOG_LEVEL}
+        exclude admin.api
+    }
+
+    # Certificate events also go to ${ACME_LOG} (JSON, 0600) for the
+    # panel's "Public certificate" card and the expiry monitor.
+    log acme_file {
+        output file ${ACME_LOG} {
+            mode 0600
+            roll_size 1MiB
+            roll_keep 2
+        }
+        format json
+        level INFO
+        include ${ACME_LOGGERS}
+    }
+
+    # A log with "include" takes its loggers out of the default log, so the
+    # certificate events are written to the add-on log here.
+    log acme_console {
+        output stdout
+        format console
+        level ${CADDY_LOG_LEVEL}
+        include ${ACME_LOGGERS}
     }
 }
 
@@ -356,15 +411,16 @@ ${DOMAIN} {
     reverse_proxy ${UPSTREAM_HOST}:${UPSTREAM_PORT} {
         header_up X-Real-IP {remote_host}
     }
-
-    log {
-        output stdout
-        format console
-        level ${CADDY_LOG_LEVEL}
-    }
+${SITE_LOG}
 }
 ${CRL_SITE}
 CADDYFILE
+
+# Caddy's own formatting (tabs), so that `caddy validate` / `caddy run` do
+# not warn "Caddyfile input is not formatted" at every start.
+if ! /usr/bin/caddy fmt --overwrite "${CADDYFILE}" >/dev/null 2>&1; then
+    bashio::log.warning "caddy fmt could not format ${CADDYFILE}; validating it as it is."
+fi
 
 bashio::log.info "Validating generated Caddyfile..."
 # The output is scrubbed of the DNS credentials: e.g. the Cloudflare module
@@ -416,6 +472,11 @@ bashio::log.info "  Upstream:    ${UPSTREAM_HOST}:${UPSTREAM_PORT} (${UPSTREAM_P
 bashio::log.info "  mTLS:        ${MTLS_ENABLED}"
 bashio::log.info "  ACME DNS:    ${ACME_DNS_PROVIDER}"
 bashio::log.info "  Log level:   ${LOG_LEVEL} (caddy=${CADDY_LOG_LEVEL})"
+if [[ -n "${SITE_LOG}" ]]; then
+    bashio::log.info "  Access log:  on"
+else
+    bashio::log.info "  Access log:  off (option access_log)"
+fi
 
 ###############################################################################
 # Published host ports. Caddy listens on 80/443 inside the container; the
@@ -424,6 +485,9 @@ bashio::log.info "  Log level:   ${LOG_LEVEL} (caddy=${CADDY_LOG_LEVEL})"
 # Assistant itself on 80/443). Informational only - never fails the start,
 # and silent outside Supervisor (no API token and no cached add-on info).
 ###############################################################################
+HOST_PORTS_KNOWN=false
+HTTP_HOST_PORT=""
+HTTPS_HOST_PORT=""
 log_host_ports() {
     local http_port https_port
     if [[ -z "${SUPERVISOR_TOKEN:-}" ]] && ! bashio::cache.exists 'addons.self.info'; then
@@ -434,6 +498,9 @@ log_host_ports() {
     https_port="$(bashio::app.port 443/tcp)" || return 0
     [[ "${http_port}" =~ ^[0-9]+$ ]] || http_port=""
     [[ "${https_port}" =~ ^[0-9]+$ ]] || https_port=""
+    HOST_PORTS_KNOWN=true
+    HTTP_HOST_PORT="${http_port}"
+    HTTPS_HOST_PORT="${https_port}"
 
     bashio::log.info "  Host ports:  80/tcp -> ${http_port:-disabled}, 443/tcp -> ${https_port:-disabled}"
     if [[ -n "${http_port}" && -n "${https_port}" ]]; then
@@ -451,6 +518,31 @@ log_host_ports() {
     fi
 }
 log_host_ports || true
+
+###############################################################################
+# Facts of this start for the panel's "Public certificate" card and the
+# expiry monitor (public_cert.py): the domain, the published host ports (for
+# the port-forwarding checklist), the ACME mode and the start time (only
+# certificate events after it count). Not secret.
+###############################################################################
+jq -n \
+    --arg domain "${DOMAIN}" \
+    --argjson started_at "${STARTED_AT}" \
+    --argjson ports_known "${HOST_PORTS_KNOWN}" \
+    --arg http_port "${HTTP_HOST_PORT}" \
+    --arg https_port "${HTTPS_HOST_PORT}" \
+    --arg dns_provider "${ACME_DNS_PROVIDER}" \
+    --arg acme_ca "${ACME_CA_URL}" \
+    --arg acme_log "${ACME_LOG}" \
+    --arg caddy_storage "${CADDY_DATA}" \
+    '{domain: $domain, started_at: $started_at, host_ports_known: $ports_known,
+      http_host_port: ($http_port | tonumber? // null),
+      https_host_port: ($https_port | tonumber? // null),
+      acme_dns_provider: $dns_provider, acme_ca: $acme_ca,
+      acme_log: $acme_log, caddy_storage: $caddy_storage}' \
+    > "${RUNTIME_FILE}.tmp"
+chmod 644 "${RUNTIME_FILE}.tmp"
+mv -f "${RUNTIME_FILE}.tmp" "${RUNTIME_FILE}"
 
 ###############################################################################
 # Reverse-proxy reminder for Home Assistant Core.

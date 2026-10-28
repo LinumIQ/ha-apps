@@ -3,7 +3,7 @@
 # https://developers.home-assistant.io/docs/add-ons/configuration/
 
 name: "Caddy mTLS Proxy"
-version: "2.0.0"
+version: "2.0.1"
 slug: "caddy_mtls"
 description: >-
   Caddy reverse proxy with mutual TLS (mTLS) client certificate authentication
@@ -75,6 +75,7 @@ options:
   acme_dns_provider: "none"
   dns_api_token: ""
   log_level: "info"
+  access_log: false
   cert_expiry_warn_days:
     - 30
     - 14
@@ -102,9 +103,14 @@ schema:
   acme_dns_provider: list(none|cloudflare|route53|hetzner)
   dns_api_token: password?
   log_level: list(trace|debug|info|notice|warning|error|fatal)?
+  access_log: bool
   cert_expiry_warn_days:
     - int(1,365)
   cert_check_interval_hours: int(1,168)
 
-# Resource configuration
-timeout: 300
+# Seconds Supervisor waits after SIGTERM before it kills the container on a
+# stop / restart (docker stop -t). A stop takes about a second: Caddy (at
+# most 10 s for open requests, grace_period), uvicorn (3 s) and the monitor
+# exit at once on SIGTERM and s6 stops the services in order. 60 s leaves
+# room for a slow host; Supervisor's default would be 10.
+timeout: 60

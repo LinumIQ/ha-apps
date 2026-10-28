@@ -28,6 +28,13 @@ case "${LOG_LEVEL}" in
     *)                      UVICORN_LOG_LEVEL="info";  export CERT_MGR_LOG_LEVEL="INFO" ;;
 esac
 
+# uvicorn's access log (one line per panel request and per health probe) only
+# with log_level debug or trace.
+UVICORN_ACCESS_LOG="--no-access-log"
+if [[ "${UVICORN_LOG_LEVEL}" == "debug" ]]; then
+    UVICORN_ACCESS_LOG="--access-log"
+fi
+
 export CERT_DIR="/data/certs"
 export STATE_FILE="/data/state.json"
 export STATE_LOCK="/data/state.json.lock"
@@ -42,8 +49,12 @@ export DOMAIN \
 # dependencies, see requirements.in).
 readonly APP_DIR="/usr/lib/cert-mgr"
 cd "${APP_DIR}" || exit 1
+# --timeout-graceful-shutdown: on SIGTERM (add-on stop) uvicorn waits at
+# most 3 s for open requests instead of indefinitely.
 exec "${APP_DIR}/.venv/bin/uvicorn" app:app \
     --app-dir "${APP_DIR}" \
     --host 0.0.0.0 \
     --port 8099 \
-    --log-level "${UVICORN_LOG_LEVEL}"
+    --log-level "${UVICORN_LOG_LEVEL}" \
+    "${UVICORN_ACCESS_LOG}" \
+    --timeout-graceful-shutdown 3

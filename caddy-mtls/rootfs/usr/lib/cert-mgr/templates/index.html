@@ -28,6 +28,8 @@
       <div class="flash flash-ok" role="status">{{ flash_ok }}</div>
       {% endif %}
 
+      {% include "_public_cert.html" %}
+
       <section class="card" aria-labelledby="ca-heading">
         <div class="card__header">
           <h2 class="card__title" id="ca-heading">Certificate Authority</h2>
@@ -210,5 +212,24 @@
         <p>state version {{ state.version }}</p>
       </footer>
     </div>
+    <script>
+      // Reload the "Public certificate" card every 30 s (relative URL: it
+      // stays inside the ingress path), so the result of a fixed port
+      // forwarding shows up without reloading the page.
+      (function () {
+        if (!window.fetch) return;
+        setInterval(function () {
+          fetch("public-cert", { credentials: "same-origin", cache: "no-store" })
+            .then(function (r) {
+              return r.ok ? r.text() : null;
+            })
+            .then(function (html) {
+              var card = document.getElementById("public-cert");
+              if (html && card) card.outerHTML = html;
+            })
+            .catch(function () {});
+        }, 30000);
+      })();
+    </script>
   </body>
 </html>

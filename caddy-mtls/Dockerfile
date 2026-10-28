@@ -149,11 +149,10 @@ RUN if [ -e /etc/s6-overlay/s6-rc.d/user ] \
         /etc/s6-overlay/s6-rc.d/caddy/run \
         /etc/s6-overlay/s6-rc.d/caddy/finish \
         /etc/s6-overlay/s6-rc.d/cert-mgr/run \
-        /etc/s6-overlay/s6-rc.d/cert-mgr/finish \
         /etc/s6-overlay/s6-rc.d/cert-monitor/run \
-        /etc/s6-overlay/s6-rc.d/cert-monitor/finish \
     && /usr/lib/cert-mgr/.venv/bin/python3 -m compileall -q \
-        /usr/lib/cert-mgr/app.py /usr/lib/cert-mgr/monitor.py
+        /usr/lib/cert-mgr/app.py /usr/lib/cert-mgr/monitor.py \
+        /usr/lib/cert-mgr/public_cert.py
 
 # Health monitoring: probe Caddy's local admin API and the cert-mgr
 # ingress port. We deliberately avoid hitting the public HTTPS port
@@ -161,8 +160,15 @@ RUN if [ -e /etc/s6-overlay/s6-rc.d/user ] \
 # be present, which isn't true during the brief startup window or when
 # ACME challenges are temporarily failing - both of which are normal,
 # recoverable conditions that should not flap the add-on.
+# Supervisor shows the add-on as "started" after the first healthy probe
+# (until then: "startup", and the UI offers "Start"): during the start
+# period Docker probes every 5 s (--start-interval). Afterwards once a
+# minute; only 5 failed probes in a row (about 5 minutes) make the add-on
+# "unhealthy" - which Supervisor's Watchdog, if enabled, answers with a
+# restart. Neither probe logs a line (admin.api is excluded from Caddy's
+# log, uvicorn has no access log at log_level info).
 # Exec form (hadolint DL3025); the shell is needed for the `&&` chain.
-HEALTHCHECK --start-period=2m --interval=30s --timeout=10s --retries=3 \
+HEALTHCHECK --start-period=2m --start-interval=5s --interval=60s --timeout=15s --retries=5 \
     CMD ["/bin/sh", "-c", "curl --silent --fail --max-time 5 http://127.0.0.1:2019/config/ > /dev/null && curl --silent --fail --max-time 5 http://127.0.0.1:8099/_health > /dev/null || exit 1"]
 
 # OCI image labels

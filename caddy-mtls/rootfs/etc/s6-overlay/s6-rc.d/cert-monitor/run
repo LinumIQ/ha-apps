@@ -2,7 +2,8 @@
 # ==============================================================================
 # Home Assistant Add-on: Caddy mTLS Proxy
 # Long-running cert expiry monitor: publishes per-cert sensor entities and
-# raises persistent notifications as warning thresholds are crossed.
+# raises persistent notifications as warning thresholds are crossed - and
+# while the public (Let's Encrypt) certificate is missing (monitor.py).
 # ==============================================================================
 
 bashio::log.info "Starting cert-monitor service..."
@@ -25,7 +26,9 @@ THRESHOLDS="$(bashio::jq '/data/options.json' '.cert_expiry_warn_days // [30,14,
 export CERT_EXPIRY_WARN_DAYS="${THRESHOLDS}"
 
 export STATE_FILE="/data/state.json"
-export SUPERVISOR_URL="http://supervisor"
+# Test-only override (Supervisor never sets it): tests/smoke.sh points the
+# monitor at a fake Supervisor.
+export SUPERVISOR_URL="${SUPERVISOR_URL:-http://supervisor}"
 
 # monitor.py uses the standard library only; it runs with the panel's
 # virtualenv interpreter anyway, so the add-on has exactly one Python.

@@ -1,4 +1,5 @@
-"""Unit tests for cert-mgr/monitor.py (the certificate expiry monitor).
+"""Unit tests for cert-mgr/monitor.py (the certificate expiry monitor and the
+public certificate notification).
 
 Standard library only. Runs against the repository's monitor.py, or against
 the installed one with CERT_MGR_DIR, e.g. inside the built image:
@@ -237,6 +238,156 @@ class ProcessOnceTest(unittest.TestCase):
         self.calls.clear()
         monitor._process_once()
         self.assertFalse(any("persistent_notification" in path for _, path, _ in self.calls))
+
+
+class PublicCertWatchTest(unittest.TestCase):
+    """The public certificate notification (fast lane, notify after 2
+    minutes, dismiss when the certificate exists) with a mocked Supervisor."""
+
+    DOMAIN = "ladyfit.duckdns.org"
+
+    def setUp(self) -> None:
+        self.calls: list[tuple[str, str, dict]] = []
+        self.supervisor_ok = True
+
+        def fake_request(method: str, path: str, payload: dict | None = None) -> bool:
+            self.calls.append((method, path, payload or {}))
+            return self.supervisor_ok
+
+        for name, value in (
+            ("_supervisor_request", mock.Mock(side_effect=fake_request)),
+            ("PUBLIC_CERT_FAST_INTERVAL", 60),
+            ("PUBLIC_CERT_GRACE_SECONDS", 120),
+            ("FAST_LANE_SECONDS", 1800),
+            ("INTERVAL_SECONDS", 21600),
+        ):
+            patcher = mock.patch.object(monitor, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.started_wall = datetime.now(timezone.utc).timestamp() - 5
+        self.runtime = monitor.public_cert.Runtime.from_dict({
+            "domain": self.DOMAIN, "started_at": self.started_wall, "host_ports_known": True,
+            "http_host_port": 8080, "https_host_port": 8443,
+        })
+
+    def status(self, with_cert: bool) -> "monitor.public_cert.Status":
+        now = self.started_wall + 10
+        error = json.dumps({
+            "level": "error", "ts": now - 1, "logger": "tls.obtain",
+            "msg": "could not get certificate from issuer", "identifier": self.DOMAIN,
+            "error": "HTTP 400 urn:ietf:params:acme:error:connection - 86.62.32.88: Error getting validation data",
+        })
+        cert = None
+        if with_cert:
+            cert = monitor.public_cert.Certificate(
+                path="/x.crt", subject_cn=self.DOMAIN, issuer_cn="E7", issuer_org="Let's Encrypt",
+                not_after=datetime.now(timezone.utc) + timedelta(days=89),
+                fingerprint_sha256="ab" * 32, mtime=now,
+            )
+        events = [monitor.public_cert.parse_event(error)]
+        return monitor.public_cert.evaluate(self.runtime, cert, [e for e in events if e], now)
+
+    def creates(self) -> list[dict]:
+        return [p for _, path, p in self.calls if path.endswith("/persistent_notification/create")]
+
+    def dismisses(self) -> list[dict]:
+        return [p for _, path, p in self.calls if path.endswith("/persistent_notification/dismiss")]
+
+    def test_notify_after_two_minutes_then_dismiss(self) -> None:
+        watch = monitor.PublicCertWatch(started=0.0)
+        missing = self.status(with_cert=False)
+        self.assertEqual(missing.state, "missing")
+
+        watch.check(0.0, missing)
+        watch.check(60.0, missing)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(watch.state, "missing")
+        self.assertEqual(watch.interval(60.0), 60)
+
+        with self.assertLogs("cert-monitor", level="INFO") as logs:
+            watch.check(120.0, missing)
+            watch.check(180.0, missing)
+            watch.check(240.0, missing)
+        warnings = [r for r in logs.records if r.levelname == "WARNING"]
+        self.assertEqual(len(warnings), 1, logs.output)  # one line per state change
+        self.assertIn(self.DOMAIN, warnings[0].getMessage())
+        self.assertIn("86.62.32.88: Error getting validation data", warnings[0].getMessage())
+        self.assertEqual(watch.state, "notified")
+
+        creates = self.creates()
+        self.assertEqual(len(creates), 1)
+        note = creates[0]
+        self.assertEqual(note["notification_id"], "caddy_mtls_public_certificate")
+        self.assertEqual(note["title"], f"Caddy mTLS: no public certificate for {self.DOMAIN}")
+        for text in (
+            "port 8080", "port 8443", f"{self.DOMAIN} resolves to your public IP",
+            "connection: 86.62.32.88: Error getting validation data",
+            "restart the app to retry immediately",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, note["message"])
+        self.assertEqual(self.dismisses(), [])
+
+        ok = self.status(with_cert=True)
+        self.assertEqual(ok.state, "ok")
+        self.calls.clear()
+        with self.assertLogs("cert-monitor", level="INFO") as logs:
+            watch.check(300.0, ok)
+            watch.check(360.0, ok)
+        self.assertEqual(len(logs.records), 1, logs.output)
+        self.assertIn("Public certificate for", logs.records[0].getMessage())
+        self.assertEqual(self.dismisses(), [{"notification_id": "caddy_mtls_public_certificate"}])
+        self.assertEqual(self.creates(), [])
+        self.assertEqual(watch.state, "ok")
+
+    def test_fast_lane(self) -> None:
+        watch = monitor.PublicCertWatch(started=1000.0)
+        watch.check(1000.0, self.status(with_cert=True))
+        self.assertEqual(watch.interval(1000.0), 60)  # first 30 minutes
+        self.assertEqual(watch.interval(1000.0 + 1799), 60)
+        self.assertEqual(watch.interval(1000.0 + 1800), 21600)  # then the normal interval
+        watch.check(5000.0, self.status(with_cert=False))
+        self.assertEqual(watch.interval(5000.0), 60)  # no certificate: fast again
+
+    def test_first_check_with_a_certificate_dismisses_once(self) -> None:
+        # A notification from before a restart may still be shown.
+        watch = monitor.PublicCertWatch(started=0.0)
+        watch.check(0.0, self.status(with_cert=True))
+        watch.check(60.0, self.status(with_cert=True))
+        self.assertEqual(len(self.dismisses()), 1)
+        self.assertEqual(self.creates(), [])
+
+    def test_notification_retried_until_the_supervisor_answers(self) -> None:
+        self.supervisor_ok = False
+        watch = monitor.PublicCertWatch(started=0.0)
+        missing = self.status(with_cert=False)
+        with self.assertLogs("cert-monitor", level="WARNING") as logs:
+            watch.check(0.0, missing)
+            watch.check(120.0, missing)
+            watch.check(180.0, missing)
+            self.supervisor_ok = True
+            watch.check(240.0, missing)
+            watch.check(300.0, missing)
+        self.assertEqual(len(logs.records), 1)
+        self.assertEqual(len(self.creates()), 3)  # 120 (failed), 180 (failed), 240 (ok)
+
+    def test_certificate_lost_later(self) -> None:
+        watch = monitor.PublicCertWatch(started=0.0)
+        watch.check(0.0, self.status(with_cert=True))
+        missing = self.status(with_cert=False)
+        watch.check(4000.0, missing)
+        watch.check(4100.0, missing)
+        self.assertEqual(self.creates(), [])
+        watch.check(4120.0, missing)
+        self.assertEqual(len(self.creates()), 1)
+
+    def test_unknown_state_does_nothing(self) -> None:
+        watch = monitor.PublicCertWatch(started=0.0)
+        unknown = monitor.public_cert.Status(state="unknown", runtime=None)
+        for t in (0.0, 200.0, 400.0):
+            watch.check(t, unknown)
+        self.assertEqual(self.calls, [])
+        self.assertIsNone(watch.state)
 
 
 if __name__ == "__main__":
