@@ -208,6 +208,47 @@ state_all_clients() {
 }
 
 ###############################################################################
+# Print a client's status ("active", "revoked"), or nothing if state.json
+# does not know the name.
+# Arguments:
+#   $1 - client name
+###############################################################################
+state_client_status() {
+    [[ -f "${STATE_FILE}" ]] || return 0
+    jq -r --arg name "$1" \
+        'first(.clients[]? | select(.name == $name) | .status // "") // ""' < "${STATE_FILE}"
+}
+
+###############################################################################
+# Rebuild the active/ allowlist from the active clients in state.json, one
+# array element per name (populate_active_dir is in cert-helpers.sh, which
+# every caller sources as well).
+###############################################################################
+state_sync_active_dir() {
+    local names=()
+    mapfile -t names < <(state_active_clients)
+    populate_active_dir "${names[@]}"
+}
+
+###############################################################################
+# After a CA regeneration (state_reset + re-issuing the active clients):
+# restore the client list in its previous order. Entries that were not
+# active (revoked clients) come back unchanged as history - status, serial
+# and revocation reason of the old CA, no files; the active ones are replaced
+# by their re-issued entries.
+# Arguments:
+#   $1 - JSON file with the previous .clients array
+###############################################################################
+state_restore_clients() {
+    state_jq --slurpfile previous "$1" '
+        (.clients | map({key: .name, value: .}) | from_entries) as $issued
+        | .clients = [
+            $previous[0][]
+            | if .status == "active" then ($issued[.name] // empty) else . end
+          ]'
+}
+
+###############################################################################
 # Reset the state file to empty (used by full CA regen).
 ###############################################################################
 state_reset() {

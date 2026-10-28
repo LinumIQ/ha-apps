@@ -1,9 +1,10 @@
 #!/command/with-contenv bashio
 # ==============================================================================
 # Home Assistant Add-on: Caddy mTLS Proxy
-# Init oneshot: validate config, ensure CA + server certs, seed clients on
-# first boot from `client_names`, refresh /data/state.json metadata, render
-# the Caddyfile, generate the CRL, populate the active-cert allowlist.
+# Init oneshot: validate config, ensure the CA, refresh /data/state.json
+# metadata, issue certificates for new names in `client_names` (every start),
+# re-encrypt .p12 bundles after a client_cert_password change, render the
+# Caddyfile, generate the CRL, populate the active-cert allowlist.
 # ==============================================================================
 set -e
 
@@ -142,11 +143,47 @@ fi
 ###############################################################################
 state_init
 
-# Detect first boot for client seeding (no clients tracked yet).
-FIRST_BOOT_CLIENTS=0
-if [[ "$(jq -r '(.clients // []) | length' "${STATE_FILE}")" == "0" ]]; then
-    FIRST_BOOT_CLIENTS=1
-fi
+###############################################################################
+# client_names: a listed name that state.json does not know gets a client
+# certificate - on every start, not only the first one. Nothing is ever
+# revoked here (removing a name from the option keeps the client; the panel
+# revokes), and a name whose client was revoked is skipped: a revoked name is
+# never issued again. Invalid names are skipped with a warning instead of
+# stopping the start (Supervisor validates the option with the same rule).
+# Arguments:
+#   $1 - client name from the option
+###############################################################################
+ensure_option_client() {
+    local name="$1" status
+    [[ -z "${name}" ]] && return 0
+    if ! client_name_valid "${name}"; then
+        bashio::log.warning "client_names: skipping $(jq -rn --arg n "${name}" '$n | @json'): a client name has 1-64 characters (letters, digits, '.', '_', '-') and does not start with a dot."
+        return 0
+    fi
+    status="$(state_client_status "${name}")"
+    case "${status}" in
+        active)
+            return 0
+            ;;
+        revoked)
+            bashio::log.warning "client_names: skipping '${name}': this client was revoked, and a revoked name is never issued again. Remove it from client_names (use a new name for a new certificate)."
+            return 0
+            ;;
+        "")
+            ;;
+        *)
+            bashio::log.warning "client_names: skipping '${name}': unexpected status '${status}' in state.json."
+            return 0
+            ;;
+    esac
+    if client_cert_reusable "${name}"; then
+        bashio::log.info "client_names: tracking the existing certificate of '${name}'."
+    else
+        bashio::log.info "client_names: issuing a client certificate for '${name}'."
+        generate_client_cert "${name}"
+    fi
+    state_refresh_client "${name}"
+}
 
 ###############################################################################
 # Generate certificates if mTLS is enabled
@@ -164,25 +201,37 @@ if bashio::var.true "${MTLS_ENABLED}"; then
 
     state_refresh_ca
 
-    if [[ "${FIRST_BOOT_CLIENTS}" == "1" ]]; then
-        bashio::log.info "First boot detected: seeding clients from 'client_names' option..."
-        while IFS= read -r client_name; do
-            [[ -z "${client_name}" ]] && continue
-            if [[ ! -f "${CERT_DIR}/mTLS-client-${client_name}.p12" ]]; then
-                bashio::log.info "Generating client certificate for: ${client_name}"
-                generate_client_cert "${client_name}"
-            else
-                bashio::log.info "Reusing existing client certificate for: ${client_name}"
-            fi
-            state_refresh_client "${client_name}"
-        done < <(bashio::jq "/data/options.json" '.client_names[]?')
-    else
-        bashio::log.info "Refreshing metadata for tracked clients..."
-        while IFS= read -r client_name; do
-            [[ -z "${client_name}" ]] && continue
-            state_refresh_client "${client_name}"
-        done < <(state_all_clients)
-    fi
+    # (Arrays, not `while read` loops: openssl must not read the loop's
+    # input. jq --raw-output0: one array element per option entry, whatever
+    # characters it contains.)
+    bashio::log.info "Refreshing metadata for tracked clients..."
+    mapfile -t TRACKED_CLIENTS < <(state_all_clients)
+    for client_name in "${TRACKED_CLIENTS[@]}"; do
+        [[ -z "${client_name}" ]] && continue
+        state_refresh_client "${client_name}"
+    done
+
+    bashio::log.info "Checking 'client_names' for new clients..."
+    mapfile -d '' -t OPTION_CLIENTS < <(jq --raw-output0 '.client_names[]? | tostring' /data/options.json)
+    for client_name in "${OPTION_CLIENTS[@]}"; do
+        ensure_option_client "${client_name}"
+    done
+
+    # Every active client's .p12 bundle must open with the current
+    # client_cert_password; otherwise (the password was changed - bundles
+    # issued with the old one, e.g. the public default, kept it) it is
+    # re-exported from the client's key and certificate. The /config mirror
+    # below copies the new bundles.
+    mapfile -t ACTIVE_CLIENTS < <(state_active_clients)
+    for client_name in "${ACTIVE_CLIENTS[@]}"; do
+        [[ -z "${client_name}" ]] && continue
+        client_p12_opens "${client_name}" && continue
+        if reencrypt_client_p12 "${client_name}"; then
+            bashio::log.info "Re-encrypted the .p12 bundle of client '${client_name}' with the current client_cert_password."
+        else
+            bashio::log.warning "The .p12 bundle of client '${client_name}' does not open with the current client_cert_password and could not be re-exported (key or certificate missing)."
+        fi
+    done
 fi
 
 ###############################################################################
@@ -190,8 +239,7 @@ fi
 ###############################################################################
 if bashio::var.true "${MTLS_ENABLED}"; then
     bashio::log.info "Populating active client cert allowlist..."
-    # shellcheck disable=SC2046
-    populate_active_dir $(state_active_clients | tr '\n' ' ')
+    state_sync_active_dir
 
     bashio::log.info "Generating CRL..."
     generate_crl

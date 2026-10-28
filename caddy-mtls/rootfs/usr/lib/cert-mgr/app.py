@@ -22,8 +22,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
@@ -159,6 +161,14 @@ def _validate_client_name(name: str) -> str:
     return (name or "").strip()
 
 
+#: Client names: 1-64 characters - letters, digits, ".", "_", "-" - not
+#: starting with a dot. That rules out "." and ".." (browsers drop such path
+#: segments, so the client's revoke / regenerate / download URLs would never
+#: reach it) and hidden files. The same rule as the client_names option's
+#: schema (config.yaml) and init-caddy (client_name_valid in cert-helpers.sh).
+CLIENT_NAME_RE = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}")
+
+
 def _client_name_error(name: str) -> str | None:
     """Return a human-readable error if the name is invalid, else None."""
     name = (name or "").strip()
@@ -166,13 +176,26 @@ def _client_name_error(name: str) -> str | None:
         return "Client name is required."
     if len(name) > 64:
         return "Client name is too long (max 64 characters)."
-    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
-    if not set(name).issubset(allowed):
-        return (
-            "Client name may only contain letters, digits, dash, underscore "
-            "and dot."
-        )
-    return None
+    if CLIENT_NAME_RE.fullmatch(name):
+        return None
+    if name.startswith("."):
+        return "Client name must not start with a dot."
+    return (
+        "Client name may only contain letters, digits, dash, underscore "
+        "and dot."
+    )
+
+
+def _find_client(state: dict[str, Any], name: str) -> dict[str, Any] | None:
+    """The state.json entry of a client, or None."""
+    return next(
+        (
+            c
+            for c in state.get("clients", [])
+            if isinstance(c, dict) and c.get("name") == name
+        ),
+        None,
+    )
 
 
 class FlashError(Exception):
@@ -344,11 +367,7 @@ async def add_client(request: Request, name: str = Form(...)):
         raise FlashError(err)
     name = name.strip()
 
-    state = _read_state()
-    existing = next(
-        (c for c in state.get("clients", []) if c.get("name") == name),
-        None,
-    )
+    existing = _find_client(_read_state(), name)
     if existing is not None:
         if existing.get("status") == "revoked":
             raise FlashError(
@@ -369,7 +388,7 @@ async def add_client(request: Request, name: str = Form(...)):
     rc, _, err_out = _bash_invoke(
         f"generate_client_cert {shlex.quote(name)}\n"
         f"state_refresh_client {shlex.quote(name)}\n"
-        f"populate_active_dir $(state_active_clients | tr '\\n' ' ')\n"
+        "state_sync_active_dir\n"
         f"generate_crl\n"
         f"state_refresh_crl\n"
     )
@@ -395,11 +414,18 @@ async def revoke_client(request: Request, name: str, reason: str = Form("unspeci
     if err:
         raise FlashError(err)
     name = name.strip()
-    if not (CERT_DIR / f"mTLS-client-{name}.crt").exists():
+    existing = _find_client(_read_state(), name)
+    if existing is None and not (CERT_DIR / f"mTLS-client-{name}.crt").exists():
         raise FlashError(f"Client '{name}' was not found.")
+    if existing is not None and existing.get("status") == "revoked":
+        raise FlashError(f"Client '{name}' is already revoked.")
+    # The helper revokes the client's own certificate file; the serial is
+    # only needed when that file is missing (fallback: the CA database's
+    # copy in ca-db/newcerts).
+    serial = str((existing or {}).get("serial") or "")
 
     rc, _, err_out = _bash_invoke(
-        f"revoke_client_by_name {shlex.quote(name)} {shlex.quote(reason)}\n"
+        f"revoke_client_by_name {shlex.quote(name)} {shlex.quote(reason)} {shlex.quote(serial)}\n"
         f"state_mark_revoked {shlex.quote(name)} {shlex.quote(reason)}\n"
         f"generate_crl\n"
         f"state_refresh_crl\n"
@@ -430,27 +456,26 @@ async def regenerate_client(request: Request, name: str):
     crt = CERT_DIR / f"mTLS-client-{name}.crt"
     p12 = CERT_DIR / f"mTLS-client-{name}.p12"
 
-    state = _read_state()
-    existing = next(
-        (c for c in state.get("clients", []) if c.get("name") == name),
-        None,
-    )
+    existing = _find_client(_read_state(), name)
     if existing is None or existing.get("status") != "active":
         raise FlashError(
             f"Cannot regenerate '{name}': no active client with this name."
         )
+    serial = str(existing.get("serial") or "")
 
-    snippet = ""
-    if crt.exists():
-        # Revoke the old serial in the CA db / CRL but keep the client's
-        # state entry "active" - the user is rotating, not removing.
-        snippet += f"revoke_client_by_name {shlex.quote(name)} superseded\n"
+    # Revoke the old serial in the CA db / CRL but keep the client's state
+    # entry "active" - the user is rotating, not removing. (The helper revokes
+    # the certificate file, or the CA database's copy of the serial if the
+    # file is missing.)
+    snippet = (
+        f"revoke_client_by_name {shlex.quote(name)} superseded {shlex.quote(serial)}\n"
+    )
     # Remove the previous on-disk artefacts so generate_client_cert will issue fresh.
     snippet += (
         f"rm -f {shlex.quote(str(crt))} {shlex.quote(str(p12))} {shlex.quote(str(CERT_DIR / f'mTLS-client-{name}.key'))}\n"
         f"generate_client_cert {shlex.quote(name)}\n"
         f"state_refresh_client {shlex.quote(name)}\n"
-        f"populate_active_dir $(state_active_clients | tr '\\n' ' ')\n"
+        "state_sync_active_dir\n"
         f"generate_crl\n"
         f"state_refresh_crl\n"
     )
@@ -473,9 +498,14 @@ async def regenerate_client(request: Request, name: str):
 
 @app.post("/api/ca/regenerate")
 async def regenerate_ca(request: Request, confirm: str = Form(...)):
-    """Wipe everything and regenerate CA + the previously known clients.
+    """Wipe everything and regenerate the CA + the active clients.
 
     Guarded by the user typing the literal string `REGENERATE-CA`.
+
+    Only clients with status ``active`` get new certificates. Revoked clients
+    stay in state.json as history (status, serial and reason of the old CA;
+    their files are wiped with the rest) - they are never re-issued, and
+    their names stay taken.
     """
     if confirm != "REGENERATE-CA":
         raise FlashError(
@@ -488,8 +518,32 @@ async def regenerate_ca(request: Request, confirm: str = Form(...)):
             "Cannot regenerate CA: the DOMAIN configuration option is not set."
         )
 
-    state = _read_state()
-    client_names = [c["name"] for c in state.get("clients", []) if c.get("name")]
+    clients = [
+        c
+        for c in _read_state().get("clients", [])
+        if isinstance(c, dict) and isinstance(c.get("name"), str) and c["name"]
+    ]
+    reissue: list[str] = []
+    previous: list[dict[str, Any]] = []
+    for c in clients:
+        if c.get("status") != "active":
+            previous.append(c)  # history: kept as it is
+        elif _client_name_error(c["name"]) is None and c["name"] not in reissue:
+            reissue.append(c["name"])
+            previous.append(c)
+        else:
+            LOG.warning(
+                "regenerate_ca: not re-issuing client %r (invalid or duplicate name)",
+                c["name"],
+            )
+
+    # The previous client list goes to the shell helper as a file: no size
+    # limit of a command-line argument applies.
+    with tempfile.NamedTemporaryFile(
+        "w", prefix="cert-mgr-clients-", suffix=".json", delete=False
+    ) as fh:
+        json.dump(previous, fh)
+        previous_file = fh.name
 
     snippet = (
         "wipe_cert_dir\n"
@@ -497,15 +551,19 @@ async def regenerate_ca(request: Request, confirm: str = Form(...)):
         "generate_ca\n"
         "state_refresh_ca\n"
     )
-    for cname in client_names:
+    for cname in reissue:
         snippet += f"generate_client_cert {shlex.quote(cname)}\n"
         snippet += f"state_refresh_client {shlex.quote(cname)}\n"
     snippet += (
-        "populate_active_dir $(state_active_clients | tr '\\n' ' ')\n"
+        f"state_restore_clients {shlex.quote(previous_file)}\n"
+        "state_sync_active_dir\n"
         "generate_crl\n"
         "state_refresh_crl\n"
     )
-    rc, _, err_out = _bash_invoke(snippet)
+    try:
+        rc, _, err_out = _bash_invoke(snippet)
+    finally:
+        os.unlink(previous_file)
     if rc != 0:
         LOG.error("regenerate_ca failed: %s", err_out.strip())
         raise FlashError(

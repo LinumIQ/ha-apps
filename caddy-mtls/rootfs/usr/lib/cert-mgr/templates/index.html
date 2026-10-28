@@ -74,9 +74,11 @@
           <div class="danger-zone__body">
             <p>
               This wipes <strong>all</strong> existing certificates and issues a
-              brand-new CA, server cert and client certs (using the current
-              client list). All previously installed client bundles will stop
-              working immediately and must be redistributed.
+              brand-new CA and new certificates for the <strong>active</strong>
+              clients. Revoked clients stay revoked (they are kept in the list
+              as history and are not re-issued). All previously installed
+              client bundles stop working immediately; the new bundles must be
+              redistributed.
             </p>
             <form method="post" action="api/ca/regenerate" class="form-inline">
               <div class="field">
@@ -141,7 +143,8 @@
                 <button
                   class="btn-danger"
                   type="submit"
-                  onclick="return confirm('Revoke client {{ c.name }}?')"
+                  data-client="{{ c.name }}"
+                  onclick="return confirm('Revoke client ' + this.dataset.client + '?')"
                 >
                   Revoke
                 </button>
@@ -168,7 +171,8 @@
               type="text"
               name="name"
               required
-              pattern="[A-Za-z0-9._\-]{1,64}"
+              pattern="[A-Za-z0-9_\-][A-Za-z0-9._\-]{0,63}"
+              title="1-64 characters: letters, digits, dot, dash and underscore; not starting with a dot"
               autocomplete="off"
               spellcheck="false"
               placeholder="e.g. alice-phone"
