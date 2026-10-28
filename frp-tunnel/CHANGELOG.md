@@ -44,6 +44,13 @@ Security fix. No re-pairing needed.
 - Repository: a GitHub release tagged `frp-tunnel-v<version>` builds and
   publishes this add-on only, and a version that is already in GHCR is never
   pushed again (see "Releases" in the repository README).
+- **Prebuilt image** (added on 2026-10-28, after the `frp-tunnel-v2.3.1`
+  release had published the 2.3.1 images; the add-on itself is unchanged):
+  `config.yaml` sets `image: "ghcr.io/linumiq/{arch}-addon-frp-tunnel"`, so
+  Home Assistant downloads the add-on image built by the repository's Builder
+  workflow instead of building it on your device (no more download of frpc
+  and the Python packages and no image build during install/update). Every
+  later version is published as a release before it is offered as an update.
 
 ## [2.3.0] - 2026-10-27
 

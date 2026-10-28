@@ -425,7 +425,9 @@ retire it).
   confirm the revocation, the panel says so (local data is removed anyway).
   The panel always shows the real frpc status and warns if frpc runs while
   the device is not paired.
-- **Supply chain.** The `frpc` binary is downloaded from the official
+- **Supply chain.** The image is built by the repository's Builder workflow
+  on GitHub and pulled from GHCR (see "Maintainers: publishing to GHCR"). The
+  `frpc` binary is downloaded from the official
   fatedier/frp release and verified against a SHA-256 pinned per
   architecture in the `Dockerfile`; the build fails on a mismatch. The panel's
   Python dependencies (Starlette, uvicorn, Jinja2, python-multipart and their
@@ -554,18 +556,27 @@ build fails if a downloaded wheel does not match its hash.
 
 ## Maintainers: publishing to GHCR
 
-`config.yaml` intentionally has no `image:` key yet, so Supervisor builds the
-add-on locally from the `Dockerfile`. The repository's **Builder** workflow
-test-builds every change; when a GitHub **release** tagged
-`frp-tunnel-v<version>` (e.g. `frp-tunnel-v2.3.1`) is published it builds and
-pushes `ghcr.io/linumiq/{arch}-addon-frp-tunnel:<version>` (`aarch64`, `amd64`)
-for this add-on only; a version that is already in GHCR is skipped, never
-overwritten. See "Releases" in the repository README.
-Once the first release exists (and the GHCR package is public), add
+The repository's **Builder** workflow test-builds every change; when a GitHub
+**release** tagged `frp-tunnel-v<version>` (e.g. `frp-tunnel-v2.3.1`) is
+published it builds and pushes
+`ghcr.io/linumiq/{arch}-addon-frp-tunnel:<version>` (`aarch64`, `amd64`) for
+this add-on only; a version that is already in GHCR is skipped, never
+overwritten. See "Releases" in the repository README. The packages are public
+(anonymous pulls).
+
+Since 2.3.1 `config.yaml` sets
 
 ```yaml
 image: "ghcr.io/linumiq/{arch}-addon-frp-tunnel"
 ```
 
-to `config.yaml` so that Supervisor pulls the prebuilt image. From then on every
-version bump in `config.yaml` must be released before users can update.
+(added on 2026-10-28, after the `frp-tunnel-v2.3.1` release had published
+both 2.3.1 images), so Supervisor **pulls** the prebuilt image of the version
+in `config.yaml` instead of building the `Dockerfile` on the user's device.
+From now on **every version bump must be released** as
+`frp-tunnel-v<version>` before users can update: a bump that reaches `main`
+without its release shows users an update whose image pull fails. Merge a
+version bump and publish its release together (release right after the
+merge), and check that both `<version>` images exist
+(`docker manifest inspect ghcr.io/linumiq/amd64-addon-frp-tunnel:<version>`,
+same for `aarch64`).

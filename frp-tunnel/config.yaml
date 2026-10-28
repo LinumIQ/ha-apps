@@ -11,6 +11,12 @@ description: >-
   browser-based device-authorization flow — no manual tokens or config
   files required. Manage subdomains directly from the ingress panel.
 url: "https://github.com/LinumIQ/ha-apps/tree/main/frp-tunnel"
+# Prebuilt image, published by the Builder workflow for a GitHub release
+# tagged frp-tunnel-v<version> (since 2.3.1): Supervisor pulls
+# <image>:<version> instead of building the Dockerfile. Every version bump
+# must therefore be released before users can update (DOCS.md, "Maintainers:
+# publishing to GHCR").
+image: "ghcr.io/linumiq/{arch}-addon-frp-tunnel"
 
 # Supported architectures
 arch:

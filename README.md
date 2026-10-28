@@ -59,9 +59,10 @@ What users get depends on the add-on's `config.yaml`:
 - **caddy-mtls** has an `image:` key: Supervisor pulls the prebuilt image, so
   users see a new version only after its release has been published (and the
   workflow has pushed the image). Merge a version bump and release it together.
-- **frp-tunnel** has no `image:` key yet: Supervisor builds it locally from the
-  `Dockerfile`, so a version bump reaches users as soon as it is on `main`; its
-  release only publishes the image, for when the `image:` key is added (see
+- **frp-tunnel** has an `image:` key too (since 2.3.1, added on 2026-10-28):
+  the same rule applies - release every version bump as
+  `frp-tunnel-v<version>`; a bump on `main` without its release shows users an
+  update whose image pull fails (see
   [frp-tunnel/DOCS.md](frp-tunnel/DOCS.md#maintainers-publishing-to-ghcr)).
 
 ## License
