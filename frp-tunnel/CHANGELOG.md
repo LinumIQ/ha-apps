@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.1] - 2026-10-28
+
+Fixes the pairing panel's buttons when Home Assistant is opened over plain
+`http://`. No re-pairing needed.
+
+### Fixed
+
+- **"Forbidden: cross-site request." on every button** of the panel ("Start
+  Pairing", "Refresh tunnel config", "Unpair", the subdomain forms) when Home
+  Assistant is opened over plain `http://` (for example
+  `http://homeassistant.local:8123` or an IP address); the add-on log showed
+  `Rejecting cross-site POST //pair/start`. Home Assistant serves its pages,
+  the add-on panel included, with `Referrer-Policy: no-referrer`, under which
+  browsers send `Origin: null` with a form, and over `http://` browsers send
+  no `Sec-Fetch-Site` either - so the CSRF check added in 2.2.0 found no sign
+  that the request came from the panel (over `https://` the browser's
+  `Sec-Fetch-Site: same-origin` passed). The panel now puts a random token
+  into its forms and the pairing page's status check (a new one at every
+  start of the add-on) and accepts a request that carries it, whatever the
+  browser or a proxy sends; the browser's own same-origin signals still
+  count, and an `Origin` may also name the `X-Forwarded-Host` (a reverse
+  proxy in front of Home Assistant that rewrites the Host). Requests from
+  other web sites are still refused. The panel page is no longer stored by
+  the browser, so it always carries the current token.
+- A refused request now answers "Forbidden: cross-site request. Reload the
+  panel and try again." (a page opened before the add-on restarted carries
+  an outdated token), the pairing page shows that instead of retrying
+  forever, and the add-on log names what the request carried
+  (`sec-fetch-site=... origin=... host=... x-forwarded-host=...
+  x-forwarded-proto=... token=absent|wrong|too-large`, never a token value).
+  See DOCS.md, Troubleshooting.
+
 ## [2.4.0] - 2026-10-28
 
 The pairing panel in the LinumIQ look. No re-pairing needed; the pairing
