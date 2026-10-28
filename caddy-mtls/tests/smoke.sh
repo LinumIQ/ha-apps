@@ -13,9 +13,17 @@
 #              Caddy's admin API (leaf verifier), the plain-HTTP site (CRL,
 #              308 to https), real mTLS handshakes, client add / revoke /
 #              regenerate through the panel (CRL, active/, Caddy reloaded: a
-#              revoked certificate is rejected at once), the .p12 download,
-#              the ingress allow-list (crafted Host header), the host-port log
-#              line and no secrets in the log.
+#              revoked certificate is rejected at once), revoking without the
+#              CA database's copy or without the .crt (M2), invalid names
+#              (L1), "Regenerate CA" (only active clients re-issued, revoked
+#              ones stay revoked: M3), the .p12 download, the ingress
+#              allow-list (crafted Host header), the host-port log line and no
+#              secrets in the log.
+#   restart    two restarts as Supervisor does them (a new container with the
+#              previous /data): new and invalid names in client_names (issued
+#              resp. skipped at every start, revoked names skipped: M5, L1), a
+#              changed client_cert_password (existing .p12 bundles re-encrypted
+#              once, also in the /config mirror: M7).
 #   no-mtls    mtls_enabled: false renders and validates (public domain);
 #              upstream_port unset: Home Assistant Core's port from the
 #              (seeded) Supervisor info.
@@ -138,7 +146,11 @@ stop_cleanly() {
         && [[ "$("${DOCKER}" inspect -f '{{.State.Status}}' "${CTR}")" == exited ]]
 }
 
-# boot <name> <options-json>: create, seed and start a container (not waited for).
+# boot <name> <options-json> [<data.tar>]: create, seed and start a container
+# (not waited for). With <data.tar> (`docker cp <old>:/data -` of a stopped
+# container) it is a restart as Supervisor does it: a new container with the
+# previous /data - plus an empty /config (the addon_config mapping), so that
+# init-caddy's /config/certs mirror runs.
 boot() {
     local name="$1" options="$2" dir="${WORK}/$1"
     CTR="${PREFIX}-${name}"
@@ -158,6 +170,11 @@ boot() {
     CONTAINERS+=("${CTR}")
     "${DOCKER}" create --name "${CTR}" --network none \
         -e ACME_CA_URL="${ACME_SINKHOLE}" -e TZ=Europe/Vienna "${IMAGE}" >/dev/null
+    if [[ -n "${3:-}" ]]; then
+        "${DOCKER}" cp - "${CTR}:/" <"$3"
+        mkdir -p "${dir}/root/config"
+        tar -C "${dir}/root" --owner=0 --group=0 --numeric-owner -cf - config | "${DOCKER}" cp - "${CTR}:/"
+    fi
     # Files go in owned by root, as Supervisor creates them.
     tar -C "${dir}/data" --owner=0 --group=0 --numeric-owner -cf - . | "${DOCKER}" cp - "${CTR}:/data"
     tar -C "${dir}/tmp" --owner=0 --group=0 --numeric-owner -cf - . | "${DOCKER}" cp - "${CTR}:/tmp"
@@ -171,16 +188,19 @@ show_log_on_failure() {
     fi
 }
 # options <domain> <mtls_enabled> <provider> <token> [<upstream_host> [<upstream_port>]]
-# (upstream default 127.0.0.1:8123; an empty port leaves upstream_port unset)
+# (upstream default 127.0.0.1:8123; an empty port leaves upstream_port unset;
+# client_names and client_cert_password from OPT_CLIENT_NAMES / OPT_PASSWORD)
+OPT_CLIENT_NAMES='["alice", "bob"]'
+OPT_PASSWORD="${P12_PASSWORD}"
 options() {
     jq -n --arg domain "$1" --argjson mtls "$2" --arg provider "$3" --arg token "$4" \
         --arg uhost "${5:-127.0.0.1}" --arg uport "${6-8123}" \
-        --arg pass "${P12_PASSWORD}" '{
+        --arg pass "${OPT_PASSWORD}" --argjson names "${OPT_CLIENT_NAMES}" '{
         domain: $domain, email: "smoke@example.com",
         upstream_host: $uhost, mtls_enabled: $mtls,
         ca_country: "AT", ca_state: "Styria", ca_locality: "Graz",
         ca_organization: "LinumIQ", ca_common_name: "Caddy mTLS smoke CA",
-        client_names: ["alice", "bob"], client_cert_password: $pass,
+        client_names: $names, client_cert_password: $pass,
         acme_dns_provider: $provider, dns_api_token: $token,
         log_level: "info", cert_expiry_warn_days: [30, 14, 7, 1],
         cert_check_interval_hours: 6}
@@ -266,6 +286,15 @@ check "main: explicit upstream_port used (127.0.0.1:8123)" \
 dashboard() { cexec curl -fsS --max-time 10 "http://127.0.0.1:8099$1" 2>/dev/null; }
 check "main: dashboard HTML lists the seeded clients" \
     eval 'html="$(dashboard /)" && [[ "${html}" == *"Caddy mTLS"* && "${html}" == *alice* && "${html}" == *bob* ]]'
+# The Revoke button's confirm() reads the client name from a data attribute
+# (HTML-escaped); the name is never interpolated into the inline script (L1).
+confirm_uses_data_attribute() {
+    local html
+    html="$(dashboard /)" || return 1
+    [[ "${html}" == *'data-client="alice"'* && "${html}" == *"this.dataset.client"* \
+        && "${html}" != *"Revoke client alice"* ]]
+}
+check "L1: Revoke confirm() takes the client name from a data attribute" confirm_uses_data_attribute
 check "main: GET // (doubled ingress slash) serves the dashboard" \
     eval '[[ "$(dashboard //)" == *"Certificate Authority"* ]]'
 check "main: static stylesheet served" eval 'dashboard /static/style.css >/dev/null'
@@ -315,6 +344,14 @@ check "main: duplicate name rejected with a flash error" \
     eval '[[ "$(panel_post /api/clients name=carol)" == "303 http://127.0.0.1:8099${INGRESS_PREFIX}/?error="*"already+exists"* ]]'
 check "main: invalid name rejected with a flash error" \
     eval '[[ "$(panel_post /api/clients "name=bad name!")" == "303 http://127.0.0.1:8099${INGRESS_PREFIX}/?error="* ]]'
+# "." and ".." would be dropped from the client's URLs by the browser (never
+# revocable); a leading dot is refused in general (L1).
+for bad in . .. .hidden; do
+    check "L1: name '${bad}' rejected with a flash error" \
+        eval '[[ "$(panel_post /api/clients "name=${bad}")" == "303 http://127.0.0.1:8099${INGRESS_PREFIX}/?error="* ]]'
+done
+check "L1: no client starting with a dot in state.json" \
+    test "$(state '[.clients[] | select(.name | startswith("."))] | length')" == 0
 check "main: carol's .p12 download = the file on disk" eval '
     cexec curl -fsS -o /tmp/carol.p12 http://127.0.0.1:8099/download/client/carol &&
     cexec cmp -s /tmp/carol.p12 /data/certs/mTLS-client-carol.p12'
@@ -375,6 +412,95 @@ check "main: Caddy reloaded: alice's old certificate refused" mtls_is 000 /tmp/a
 check "main: Caddy reloaded: alice's new certificate accepted" \
     mtls_is 502 /data/certs/mTLS-client-alice.crt /data/certs/mTLS-client-alice.key
 
+# p12_serial <.p12 in the container> <password>: serial of the client
+# certificate in the bundle (uppercase hex), empty if it does not open.
+p12_serial() {
+    "${DOCKER}" exec -e P12PASS="$2" "${CTR}" sh -c 'openssl pkcs12 -legacy -in "$0" -passin env:P12PASS -nokeys -clcerts 2>/dev/null |
+        openssl x509 -noout -serial 2>/dev/null | sed "s/^serial=//" | tr a-f A-F' "$1" 2>/dev/null || true
+}
+ok_url() { printf '303 http://127.0.0.1:8099%s/?ok=%s' "${INGRESS_PREFIX}" "$1"; }
+
+# --- revoke without the CA database's copy / without the .crt (review M2) ---------
+# The client's own certificate file is revoked; the CA database's copy
+# (ca-db/newcerts/<serial>.pem) is only the fallback when the file is missing.
+# Before, a missing newcerts copy made Revoke and Regenerate fail.
+check "M2: POST /api/clients (erin, frank) -> 303" eval '
+    test "$(panel_post /api/clients name=erin)" == "$(ok_url "Client+%27erin%27+created.")" &&
+    test "$(panel_post /api/clients name=frank)" == "$(ok_url "Client+%27frank%27+created.")"'
+erin_serial="$(crt_serial /data/certs/mTLS-client-erin.crt)"
+frank_serial="$(crt_serial /data/certs/mTLS-client-frank.crt)"
+cexec cp /data/certs/mTLS-client-frank.crt /tmp/frank.crt
+cexec cp /data/certs/mTLS-client-frank.key /tmp/frank.key
+check "M2: erin and frank accepted" eval '
+    mtls_is 502 /data/certs/mTLS-client-erin.crt /data/certs/mTLS-client-erin.key &&
+    mtls_is 502 /tmp/frank.crt /tmp/frank.key'
+check "M2: erin's CA database copy newcerts/${erin_serial}.pem deleted" eval '
+    file_exists "/data/certs/ca-db/newcerts/${erin_serial}.pem" &&
+    cexec rm "/data/certs/ca-db/newcerts/${erin_serial}.pem" &&
+    file_absent "/data/certs/ca-db/newcerts/${erin_serial}.pem"'
+check "M2: POST /api/clients/erin/revoke (no newcerts copy) -> 303 revoked" \
+    test "$(panel_post /api/clients/erin/revoke reason=keyCompromise)" == "$(ok_url "Client+%27erin%27+revoked.")"
+check "M2: erin revoked in state.json, CRL lists ${erin_serial}, active/ without erin" eval '
+    test "$(state ".clients[] | select(.name == \"erin\") | \"\(.status) \(.revocation_reason)\"")" == "revoked keyCompromise" &&
+    crl_has_serial "${erin_serial}" && file_absent /data/certs/active/mTLS-client-erin.pem'
+check "M2: Caddy reloaded: erin's certificate refused" \
+    mtls_is 000 /data/certs/mTLS-client-erin.crt /data/certs/mTLS-client-erin.key
+cexec rm /data/certs/mTLS-client-frank.crt
+check "M2: POST /api/clients/frank/revoke (no .crt: newcerts fallback) -> 303 revoked" \
+    test "$(panel_post /api/clients/frank/revoke reason=superseded)" == "$(ok_url "Client+%27frank%27+revoked.")"
+check "M2: frank revoked in state.json, CRL lists ${frank_serial}, active/ without frank" eval '
+    test "$(state ".clients[] | select(.name == \"frank\") | .status")" == revoked &&
+    crl_has_serial "${frank_serial}" && file_absent /data/certs/active/mTLS-client-frank.pem'
+check "M2: Caddy reloaded: frank's certificate refused" mtls_is 000 /tmp/frank.crt /tmp/frank.key
+check "M2: revoking a revoked client again -> flash error, reason unchanged" eval '
+    [[ "$(panel_post /api/clients/erin/revoke reason=superseded)" == "303 http://127.0.0.1:8099${INGRESS_PREFIX}/?error="*"already+revoked"* ]] &&
+    test "$(state ".clients[] | select(.name == \"erin\") | .revocation_reason")" == keyCompromise'
+
+# --- Regenerate CA (review M3) ------------------------------------------------------
+# Only active clients get new certificates; revoked ones stay revoked (kept in
+# state.json as history, without files). Before, they came back as active.
+ca_fp_before="$(state .ca.fingerprint_sha256)"
+alice_ca1="$(crt_serial /data/certs/mTLS-client-alice.crt)"
+carol_ca1="$(crt_serial /data/certs/mTLS-client-carol.crt)"
+cexec cp /data/certs/mTLS-client-alice.crt /tmp/alice-ca1.crt
+cexec cp /data/certs/mTLS-client-alice.key /tmp/alice-ca1.key
+# shellcheck disable=SC2016
+REVOKED_FILTER='[.clients[] | select(.status != "active") | "\(.name) \(.status) \(.serial) \(.revocation_reason)"] | join(",")'
+revoked_before="$(state "${REVOKED_FILTER}")"
+revoked_unchanged() { [[ -n "${revoked_before}" ]] && test "$(state "${REVOKED_FILTER}")" == "${revoked_before}"; }
+new_ca_in_place() {
+    local fp
+    fp="$(state .ca.fingerprint_sha256)"
+    [[ -n "${fp}" && "${fp}" != "${ca_fp_before}" ]] &&
+        test "${fp}" == "$(cexec openssl x509 -in /data/certs/mTLS-CA.crt -noout -fingerprint -sha256 | sed "s/^.*Fingerprint=//")"
+}
+check "M3: POST /api/ca/regenerate (REGENERATE-CA) -> 303" \
+    test "$(panel_post /api/ca/regenerate confirm=REGENERATE-CA)" == "$(ok_url "CA+regenerated.")"
+check "M3: new CA: fingerprint changed, state.json = the CA file" new_ca_in_place
+check "M3: client list and order kept (alice,bob,carol,erin,frank)" \
+    test "$(state '[.clients[].name] | join(",")')" == "alice,bob,carol,erin,frank"
+alice_ca2="$(crt_serial /data/certs/mTLS-client-alice.crt)"
+carol_ca2="$(crt_serial /data/certs/mTLS-client-carol.crt)"
+reissued_by_new_ca() {
+    [[ -n "${alice_ca2}" && "${alice_ca2}" != "${alice_ca1}" && -n "${carol_ca2}" && "${carol_ca2}" != "${carol_ca1}" ]] &&
+        test "$(state '[.clients[] | select(.status == "active") | "\(.name)=\(.serial)"] | join(",")')" == "alice=${alice_ca2},carol=${carol_ca2}" &&
+        cexec openssl verify -CAfile /data/certs/mTLS-CA.crt \
+            /data/certs/mTLS-client-alice.crt /data/certs/mTLS-client-carol.crt >/dev/null 2>&1
+}
+check "M3: alice and carol active with new serials, signed by the new CA" reissued_by_new_ca
+check "M3: bob, erin and frank still revoked (serial and reason unchanged)" eval '
+    [[ "${revoked_before}" == "bob revoked "*" keyCompromise,erin revoked "*",frank revoked "* ]] && revoked_unchanged'
+check "M3: no certificate files for the revoked clients" \
+    eval '! cexec ls /data/certs | grep -E "^mTLS-client-(bob|erin|frank)\." >/dev/null'
+check "M3: active/ = alice and carol (the new certificates)" eval '
+    test "$(cexec ls /data/certs/active | tr "\n" " ")" == "mTLS-client-alice.pem mTLS-client-carol.pem " &&
+    cexec cmp -s /data/certs/active/mTLS-client-alice.pem /data/certs/mTLS-client-alice.crt'
+check "M3: Caddy reloaded: alice's new certificate accepted" \
+    mtls_is 502 /data/certs/mTLS-client-alice.crt /data/certs/mTLS-client-alice.key
+check "M3: alice's certificate of the old CA refused" mtls_is 000 /tmp/alice-ca1.crt /tmp/alice-ca1.key
+check "M3: carol's new .p12 holds her new certificate" eval '
+    [[ -n "${carol_ca2}" ]] && test "$(p12_serial /data/certs/mTLS-client-carol.p12 "${P12_PASSWORD}")" == "${carol_ca2}"'
+
 # --- ingress allow-list -------------------------------------------------------------
 # A second panel instance that does not allow loopback (as under Supervisor,
 # where only 172.30.32.2 is allowed): /_health stays open, everything else is
@@ -399,6 +525,95 @@ check "main: no 'permission denied' / Traceback in the log" \
     eval 'logs_lack "ermission denied" && logs_lack "Traceback"'
 check "main: clean docker stop" stop_cleanly
 show_log_on_failure "${before}"
+
+# ==============================================================================
+# 1b. restart: client_names at every start (M5, L1), new client_cert_password (M7)
+# ==============================================================================
+# As Supervisor restarts an add-on: a new container with the previous /data.
+P12_PASSWORD_NEW="smoke-p12-new-$$-${RANDOM}${RANDOM}"
+P12_NEW_PASS_FILE="$(secret_file p12-pass-new "${P12_PASSWORD_NEW}")"
+OPT_PASSWORD="${P12_PASSWORD_NEW}"
+OPT_CLIENT_NAMES='["alice", "bob", "dave-phone", "bad name!", "..", ".hidden", "erin"]'
+"${DOCKER}" cp "${CTR}:/data" - >"${WORK}/data-main.tar"
+log "restart: new container with main's /data (client_names + dave-phone and invalid names, new client_cert_password)"
+before=${FAIL_COUNT}
+boot restart "$(options "${DOMAIN}" true none "")" "${WORK}/data-main.tar"
+if wait_for "${BOOT_TIMEOUT}" booted; then
+    pass "restart: add-on booted (invalid client_names entries do not block the start)"
+    check "M5: dave-phone (new in client_names) issued: state active, key/p12 600, active/ pem" eval '
+        test "$(state ".clients[] | select(.name == \"dave-phone\") | .status")" == active &&
+        test "$(state ".clients[] | select(.name == \"dave-phone\") | .serial")" == "$(crt_serial /data/certs/mTLS-client-dave-phone.crt)" &&
+        file_mode_is /data/certs/mTLS-client-dave-phone.key 600 && file_mode_is /data/certs/mTLS-client-dave-phone.p12 600 &&
+        cexec cmp -s /data/certs/active/mTLS-client-dave-phone.pem /data/certs/mTLS-client-dave-phone.crt'
+    check "M5: log: client_names: issuing a client certificate for 'dave-phone'" \
+        logs_contain "client_names: issuing a client certificate for 'dave-phone'."
+    check "M5: dave-phone's certificate accepted" \
+        wait_for 60 mtls_is 502 /data/certs/mTLS-client-dave-phone.crt /data/certs/mTLS-client-dave-phone.key
+    check "M5: revoked bob and erin skipped with a warning, still revoked, not re-issued" eval '
+        logs_contain "client_names: skipping '"'"'bob'"'"': this client was revoked" &&
+        logs_contain "client_names: skipping '"'"'erin'"'"': this client was revoked" &&
+        revoked_unchanged &&
+        ! cexec ls /data/certs | grep -E "^mTLS-client-(bob|erin)\." >/dev/null'
+    check "L1: invalid client_names entries skipped with a warning" eval '
+        logs_contain "client_names: skipping \"bad name!\": a client name has 1-64 characters" &&
+        logs_contain "client_names: skipping \"..\":" && logs_contain "client_names: skipping \".hidden\":"'
+    check "M5/L1: state.json = the previous clients + dave-phone" \
+        test "$(state '[.clients[].name] | join(",")')" == "alice,bob,carol,erin,frank,dave-phone"
+    check "M5: alice and carol unchanged (same serials)" \
+        test "$(state '[.clients[] | select(.name == "alice" or .name == "carol") | .serial] | join(",")')" == "${alice_ca2},${carol_ca2}"
+    check "M7: log: the bundles of alice and carol re-encrypted (one line each), no other" eval '
+        test "$("${DOCKER}" logs "${CTR}" 2>&1 | grep -c "Re-encrypted the .p12 bundle of client")" == 2 &&
+        logs_contain "Re-encrypted the .p12 bundle of client '"'"'alice'"'"' with the current client_cert_password." &&
+        logs_contain "Re-encrypted the .p12 bundle of client '"'"'carol'"'"' with the current client_cert_password."'
+    for c in alice carol; do
+        check "M7: ${c}'s .p12 opens with the new password (her current certificate), not with the old one" eval '
+            serial="$(crt_serial "/data/certs/mTLS-client-${c}.crt")" && [[ -n "${serial}" ]] &&
+            test "$(p12_serial "/data/certs/mTLS-client-${c}.p12" "${P12_PASSWORD_NEW}")" == "${serial}" &&
+            test -z "$(p12_serial "/data/certs/mTLS-client-${c}.p12" "${P12_PASSWORD}")"'
+    done
+    check "M7: dave-phone's new .p12 opens with the new password" eval '
+        serial="$(crt_serial /data/certs/mTLS-client-dave-phone.crt)" && [[ -n "${serial}" ]] &&
+        test "$(p12_serial /data/certs/mTLS-client-dave-phone.p12 "${P12_PASSWORD_NEW}")" == "${serial}"'
+    check "M7: re-encrypted bundles: mode 600, no temporary file left" eval '
+        file_mode_is /data/certs/mTLS-client-alice.p12 600 && file_mode_is /data/certs/mTLS-client-carol.p12 600 &&
+        ! cexec ls /data/certs | grep -F ".tmp" >/dev/null'
+    check "M7: /config/certs mirror = the re-encrypted bundles (and dave-phone's)" eval '
+        cexec cmp -s /config/certs/mTLS-client-alice.p12 /data/certs/mTLS-client-alice.p12 &&
+        cexec cmp -s /config/certs/mTLS-client-carol.p12 /data/certs/mTLS-client-carol.p12 &&
+        cexec cmp -s /config/certs/mTLS-client-dave-phone.p12 /data/certs/mTLS-client-dave-phone.p12'
+    check "restart: the old client_cert_password not in the log" logs_lack_secret "${P12_PASS_FILE}"
+    check "restart: the new client_cert_password not in the log" logs_lack_secret "${P12_NEW_PASS_FILE}"
+    # For the second restart: the bundles and serials must stay as they are.
+    bundles_before="$(cexec sh -c 'sha256sum /data/certs/*.p12' 2>/dev/null)"
+    serials_before="$(state '[.clients[] | "\(.name)=\(.serial)"] | join(",")')"
+    check "restart: clean docker stop" stop_cleanly
+else
+    fail "restart: add-on booted (invalid client_names entries do not block the start)"
+fi
+show_log_on_failure "${before}"
+
+# A second restart without any change re-exports and issues nothing.
+"${DOCKER}" cp "${CTR}:/data" - >"${WORK}/data-restart.tar"
+log "restart2: new container, same options"
+before=${FAIL_COUNT}
+boot restart2 "$(options "${DOMAIN}" true none "")" "${WORK}/data-restart.tar"
+if wait_for "${BOOT_TIMEOUT}" booted; then
+    pass "restart2: add-on booted"
+    check "M7: second restart re-encrypts nothing" logs_lack "Re-encrypted the .p12 bundle"
+    check "M5: second restart issues nothing" logs_lack "client_names: issuing"
+    unchanged_since_restart() {
+        [[ -n "${bundles_before:-}" && -n "${serials_before:-}" ]] &&
+            test "$(cexec sh -c 'sha256sum /data/certs/*.p12' 2>/dev/null)" == "${bundles_before}" &&
+            test "$(state '[.clients[] | "\(.name)=\(.serial)"] | join(",")')" == "${serials_before}"
+    }
+    check "restart2: bundles and serials unchanged" unchanged_since_restart
+    check "restart2: clean docker stop" stop_cleanly
+else
+    fail "restart2: add-on booted"
+fi
+show_log_on_failure "${before}"
+OPT_PASSWORD="${P12_PASSWORD}"
+OPT_CLIENT_NAMES='["alice", "bob"]'
 
 # ==============================================================================
 # 2. no-mtls: mtls_enabled false (public domain, ACME sinkhole)

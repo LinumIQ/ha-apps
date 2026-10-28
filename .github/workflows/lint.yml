@@ -185,7 +185,7 @@ jobs:
         run: frp-tunnel/tests/apparmor-smoke.sh frp-tunnel-test frp-tunnel/apparmor.txt
 
   caddy-mtls-python:
-    name: Caddy mTLS Python (compile)
+    name: Caddy mTLS Python (compile + unit tests)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -207,6 +207,11 @@ jobs:
           python -m py_compile
           caddy-mtls/rootfs/usr/lib/cert-mgr/app.py
           caddy-mtls/rootfs/usr/lib/cert-mgr/monitor.py
+
+      # The expiry monitor (standard library only): entity-id slugs against
+      # Home Assistant's entity id rule, notification thresholds.
+      - name: Unit tests
+        run: python -m unittest discover -s caddy-mtls/tests/unit -v
 
   caddy-mtls-image:
     name: Caddy mTLS image (amd64 build, smoke test, AppArmor smoke test)
