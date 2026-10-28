@@ -29,5 +29,12 @@ Licensed under the SIL Open Font License, Version 1.1
 (shared/ui/static/fonts/OFL-Inter.txt)
 https://github.com/rsms/inter
 
+Roboto Bold 2.138 (glyph outlines of the add-on names in the logos:
+frp-tunnel/logo.png, caddy-mtls/logo.png and their sources
+shared/brand/<add-on>/logo.svg; the font file is not redistributed)
+Copyright 2011 Google Inc. All Rights Reserved.
+Licensed under the Apache License, Version 2.0
+https://github.com/googlefonts/roboto-2/releases/tag/v2.138
+
 The LinumIQ name and logo and the add-on icons and logos are trademarks of
 LinumIQ and are not covered by the Apache License of this repository.

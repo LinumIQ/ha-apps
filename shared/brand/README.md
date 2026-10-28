@@ -138,7 +138,7 @@ kerning.
 
 ```sh
 cd shared/brand
-npm ci                               # exact pins from package-lock.json
+npm ci --ignore-scripts              # exact pins from package-lock.json (no install scripts needed)
 node render.mjs                      # icon.svg / logo.svg -> the four PNGs
 node render.mjs --check              # verify the committed PNGs (see below)
 node render.mjs --census             # verify the colours of the committed PNGs
@@ -179,6 +179,20 @@ lie on the RGB segment from Spark Orange to Anchor Blue: pure orange, pure blue,
 blue over orange. Anti-aliasing changes only alpha. The tolerance is 2 + 255/alpha, to allow for
 8-bit un-premultiplication. It reports blue, orange, blend and off-line counts and fails on any
 off-line pixel.
+
+**CI.** The `Lint` workflow (`.github/workflows/lint.yml`) runs the job `brand-assets`
+("Brand assets (render check + colour census)") on every push and pull request to `main`. On
+ubuntu-latest with Node 22 it runs, in `shared/brand`:
+
+```sh
+npm ci --ignore-scripts
+node render.mjs --check
+node render.mjs --census
+```
+
+A changed SVG without re-rendered PNGs, or a PNG with a stray colour, fails the build. The job
+does not run `logo.mjs --check`, because that needs the Roboto download. Run it locally
+whenever you change an `icon.svg` or `logo.mjs`.
 
 ## Licence note (Roboto)
 

@@ -102,6 +102,36 @@ jobs:
       - name: Check the copies
         run: bash scripts/sync-shared.sh --check
 
+  brand-assets:
+    name: Brand assets (render check + colour census)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # sharp 0.35.5 needs Node >= 20.9; resvg-js 2.6.2 and sharp ship
+      # prebuilt binaries, so no install scripts are needed.
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+
+      # Each add-on's icon.png / logo.png is rendered from the SVG sources in
+      # shared/brand (render.mjs, pinned resvg-js): the committed PNGs must
+      # equal a fresh render (256x256 / 500x200, 8-bit RGBA), and every
+      # visible pixel must be Anchor Blue, Spark Orange or a blend of the two.
+      # logo.mjs --check stays a local step (it needs the Roboto download).
+      - name: Render check and colour census
+        working-directory: shared/brand
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          node render.mjs --check
+          node render.mjs --census
+
   addon-config:
     name: Add-on configuration (${{ matrix.addon }})
     runs-on: ubuntu-latest
