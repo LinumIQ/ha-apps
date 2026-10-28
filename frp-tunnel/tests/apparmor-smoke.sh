@@ -13,8 +13,9 @@
 # port from a fake Supervisor API (a second, unconfined container reachable
 # as `supervisor`), frpc started as user frpc
 # (it fails to connect - nothing listens - which is expected) with its log
-# watcher, unpair and a clean `docker stop`. Fails on any AppArmor denial for
-# the profile.
+# watcher, unpair and a clean `docker stop`. Also checks that user frpc
+# cannot read the Supervisor API token (or the device token) anywhere it can
+# reach. Fails on any AppArmor denial for the profile.
 #
 # Denials are read from the kernel log (dmesg) AND - where auditd runs, e.g.
 # on a server, and the kernel log stays silent - from /var/log/audit/audit.log
@@ -36,6 +37,8 @@ PROFILE="$(sed -n 's/^profile \([A-Za-z0-9_-]*\) .*/\1/p' "${PROFILE_FILE}" | he
 CTR="frp-tunnel-aa-smoke-$$"
 SUP_CTR="${CTR}-supervisor"
 SUP_TOKEN="smoke-supervisor-token-0123456789"
+DEVICE_TOKEN="smoke-device-token-0123456789"
+TUNNEL_TOKEN="smoke-tunnel-token-0123456789"
 WORK="$(mktemp -d)"
 FAILED=0
 SUDO=()
@@ -143,11 +146,11 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "${
     -subj "/CN=AppArmor smoke CA" -days 2 -addext basicConstraints=critical,CA:TRUE \
     -addext keyUsage=critical,keyCertSign -out "${WORK}/ca.pem" 2>/dev/null
 mkdir -p "${WORK}/state"
-python3 - "${WORK}/ca.pem" "${WORK}/state/frp-state.json" <<'PY'
+python3 - "${WORK}/ca.pem" "${WORK}/state/frp-state.json" "${DEVICE_TOKEN}" "${TUNNEL_TOKEN}" <<'PY'
 import json, sys
 ca = open(sys.argv[1]).read()
-json.dump({"version": 2, "device_token": "smoke-device-token-0123456789", "subdomain": "smoke",
-           "token": "smoke-tunnel-token-0123456789", "server_addr": "127.0.0.1", "server_port": 7000,
+json.dump({"version": 2, "device_token": sys.argv[3], "subdomain": "smoke",
+           "token": sys.argv[4], "server_addr": "127.0.0.1", "server_port": 7000,
            "domain_base": "smoke.invalid", "server_name": "frps.smoke.invalid", "server_ca_pem": ca},
           open(sys.argv[2], "w"))
 PY
@@ -175,7 +178,7 @@ sup_ip="$("${DOCKER}" inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddres
 [[ -n "${sup_ip}" ]] || { log "fake Supervisor has no IP address"; exit 2; }
 
 "${DOCKER}" create --name "${CTR}" --security-opt "apparmor=${PROFILE}" \
-    --add-host "supervisor:${sup_ip}" -e "SUPERVISOR_TOKEN=${SUP_TOKEN}" \
+    --add-host "supervisor:${sup_ip}" -e "SUPERVISOR_TOKEN=${SUP_TOKEN}" -e "HASSIO_TOKEN=${SUP_TOKEN}" \
     -e ALLOWED_INGRESS_IPS=127.0.0.1 -e TZ=Europe/Vienna "${IMAGE}" >/dev/null
 copy_into "${WORK}/data" /data
 copy_into "${WORK}/tmp" /tmp
@@ -211,6 +214,36 @@ frpc_up() {
 check "frpc runs as user frpc" wait_for 30 frpc_up
 check "frpc.toml + frps-ca.pem are 640 root:frpc" \
     test "$(cexec stat -c '%a %U:%G' /data/frpc.toml /data/frps-ca.pem 2>/dev/null | sort -u)" == "640 root:frpc"
+# User frpc cannot read the Supervisor API token (review 2026-10-27, FRP-01):
+# the container environment directory is root-only (frp-init oneshot; the
+# profile itself allows /run/**, so this is plain file permissions), and no
+# file frpc can read under /run /var/run /tmp /data holds that token or the
+# device token. /etc is not searched: the profile denies most of it to every
+# process of the add-on, and the search's reads would count as denials. /data
+# comes last: the tunnel token in /data/frpc.toml (frpc must read it) proves
+# the search ran through. Patterns go in on stdin. The renderer and the panel
+# (root, with-contenv) still get the token: see the local_port checks below.
+contenv_denied() {
+    local err
+    if err="$("${DOCKER}" exec --user frpc "${CTR}" cat /run/s6/container_environment/SUPERVISOR_TOKEN 2>&1 >/dev/null)"; then
+        return 1
+    fi
+    [[ "${err}" == *"ermission denied"* ]]
+}
+check "user frpc cannot read /run/s6/container_environment/SUPERVISOR_TOKEN (permission denied)" contenv_denied
+frpc_scan() { # frpc_scan <pattern-file>: files user frpc can read that contain a pattern
+    "${DOCKER}" exec -i --user frpc "${CTR}" timeout 60 grep -rlsF -f - /run /var/run /tmp /data \
+        <"$1" 2>/dev/null || true
+}
+printf '%s\n%s\n' "${SUP_TOKEN}" "${DEVICE_TOKEN}" >"${WORK}/tokens.pattern"
+copies="$(frpc_scan "${WORK}/tokens.pattern")"
+found="${copies//$'\n'/ }"
+check "no file readable by user frpc holds the Supervisor or device token (found: ${found:-none})" \
+    test -z "${copies}"
+printf '%s\n' "${TUNNEL_TOKEN}" >"${WORK}/control.pattern"
+control="$(frpc_scan "${WORK}/control.pattern")"
+check "the search as user frpc reached /data (control: tunnel token in /data/frpc.toml)" \
+    grep -qx /data/frpc.toml <<<"${control}"
 # 127.0.0.1:7000 is closed: frpc must get as far as connecting (config, CA
 # file and DNS-free address all readable as user frpc).
 check "frpc read its config and tried to connect" wait_for 30 logs_contain "connection refused"

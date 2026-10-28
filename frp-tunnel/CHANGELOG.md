@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.1] - 2026-10-28
+
+Security fix. No re-pairing needed.
+
+### Security
+
+- **frpc can no longer read the add-on's Supervisor API token** (review
+  2026-10-27, FRP-01, Medium). frpc runs as the unprivileged user `frpc`
+  with a scrubbed process environment, but s6-overlay keeps the add-on's
+  whole environment - `SUPERVISOR_TOKEN` and its legacy name `HASSIO_TOKEN`
+  included - as files in `/run/s6/container_environment`, which every user
+  could read. Code running as `frpc` (e.g. through a flaw in frpc) could have
+  used the token to change the add-on's own options (such as `app_base`) and
+  restart it, so that the next start sent the device token to another
+  server. The 2.2.0 note "frpc runs with a scrubbed environment" held only
+  for frpc's process environment. A new start-up step (s6 oneshot
+  `frp-init`) now makes that directory root-only (mode 700) before frpc or
+  the panel start; both depend on it, and the add-on does not start when it
+  fails. The panel and the renderer (root) read the token as before. The E2E
+  harness and the AppArmor smoke test check, as user `frpc`, that the token
+  file cannot be opened and that no file this user can read holds the
+  Supervisor token or the device token (everything else was already
+  root-only: the state file, bashio's cache, the frpc status file, the
+  environment of root processes). The image build fails if the oneshot is
+  missing.
+
+### Fixed
+
+- The add-on's services now start after the base image's start-up steps
+  (`dependencies.d/base`; review 2026-10-27, FRP-12). The banner no longer
+  interleaves with the services' output, their own log lines follow the
+  configured log level, and when a start-up step of the base image fails,
+  frpc and the panel are not started at all.
+
 ## [2.3.0] - 2026-10-27
 
 The tunnel follows Home Assistant's own port (port 80 on new Home Assistant

@@ -71,6 +71,9 @@ ENV PATH="/usr/lib/frp-mgr/.venv/bin:${PATH}" \
 # `user` bundle in /etc/s6-overlay/user-bundles.d (s6-overlay >= 3.2.3.2,
 # base image 21.x): a bundle left in s6-rc.d/user makes s6-overlay's
 # rc.init rewrite it at every start, which the AppArmor profile denies.
+# The oneshot frp-init makes the container environment directory (holds the
+# Supervisor API token) root-only; both longruns depend on it and on the
+# base image's `base` bundle.
 COPY rootfs /
 
 # Normalise the permissions of everything copied from rootfs/ (the build
@@ -79,17 +82,29 @@ COPY rootfs /
 # one place, precompile the panel and pre-create the runtime data directory
 # (bind-mounted by Supervisor; used as-is outside it). The build fails on a
 # base image whose s6-overlay does not start bundles from user-bundles.d
-# (base < 21: none of the add-on's services would start).
+# (base < 21: none of the add-on's services would start), and when the
+# frp-init oneshot is missing from the bundle or from either longrun's
+# dependencies (frpc could read the Supervisor API token).
 RUN if [ -e /etc/s6-overlay/s6-rc.d/user ] \
         || [ ! -f /etc/s6-overlay/user-bundles.d/user/type ]; then \
         echo "BUILD_FROM: s6-overlay without user-bundles.d (need base 21.x)" >&2; \
         exit 1; \
     fi \
+    && for f in \
+        /etc/s6-overlay/s6-rc.d/frp-init/type \
+        /etc/s6-overlay/s6-rc.d/frp-init/up \
+        /etc/s6-overlay/s6-rc.d/frp-init/run \
+        /etc/s6-overlay/user-bundles.d/user/contents.d/frp-init \
+        /etc/s6-overlay/s6-rc.d/frpc/dependencies.d/frp-init \
+        /etc/s6-overlay/s6-rc.d/frp-mgr/dependencies.d/frp-init; do \
+        test -f "${f}" || { echo "rootfs: ${f} missing (frp-init oneshot)" >&2; exit 1; }; \
+    done \
     && find /etc/s6-overlay/s6-rc.d /etc/s6-overlay/user-bundles.d /usr/lib/frp-mgr \
         -path /usr/lib/frp-mgr/.venv -prune \
         -o -type d -exec chmod 0755 {} + -o -type f -exec chmod 0644 {} + \
     && chmod 0755 /etc /etc/s6-overlay /usr /usr/lib \
     && chmod a+x \
+        /etc/s6-overlay/s6-rc.d/frp-init/run \
         /etc/s6-overlay/s6-rc.d/frpc/run \
         /etc/s6-overlay/s6-rc.d/frpc/finish \
         /etc/s6-overlay/s6-rc.d/frp-mgr/run \

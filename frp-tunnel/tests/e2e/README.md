@@ -122,11 +122,18 @@ Each check prints `PASS`, `FAIL` or `SKIP`:
    `E2E_FRPS_CA_FILE` is set) without certificate errors, and
    `start proxy success`. With `E2E_FRPS_CA_FILE`, `/api/status` reports
    `tls_verified=true` / `tls_login=ok` (set only after that login). The
-   container is started with a dummy `SUPERVISOR_TOKEN` (as Supervisor sets a
-   real one): it must be in the add-on environment
-   (`/run/s6/container_environment`) but not in frpc's
-   (`/proc/<frpc pid>/environ`, read as user `frpc`), which may only contain
-   `PATH`, `HOME` and `TZ`.
+   container is started with a dummy `SUPERVISOR_TOKEN` (and `HASSIO_TOKEN`,
+   as Supervisor sets a real one under both names): it must be in the add-on
+   environment (`/run/s6/container_environment`, read as root) but not in
+   frpc's (`/proc/<frpc pid>/environ`, read as user `frpc`), which may only
+   contain `PATH`, `HOME` and `TZ`. As user `frpc`,
+   `/run/s6/container_environment/SUPERVISOR_TOKEN` must fail with
+   "Permission denied", and a search of every file that user can read under
+   `/run`, `/var/run`, `/tmp`, `/etc` and `/data` must find neither that
+   token nor the device token - but must find the tunnel token in
+   `/data/frpc.toml` (control: the search ran through to `/data`, which comes
+   last). `/etc` is left out when the container runs under the add-on's own
+   AppArmor profile (`E2E_CREATE_ARGS`), which denies most of it anyway.
 7. `https://<sub>.<DOMAIN_BASE>/` returns the local service's content.
 8. **Refresh tunnel config** works and leaves `frpc.toml` unchanged; deleting
    `frpc.toml` and restarting the frpc service re-renders it identically from
@@ -145,8 +152,9 @@ Each check prints `PASS`, `FAIL` or `SKIP`:
 
 Tokens are never printed and never put on a command line (where `ps` would
 show them): expected `frpc.toml` lines are matched in-shell, and the
-"never logged" checks read their pattern from files in the harness's private
-work directory (mode 700, files 600, removed on exit). No curl call of the
+"never logged" checks and the token search as user `frpc` read their
+patterns from files in the harness's private work directory (mode 700, files
+600, removed on exit; the search gets them on stdin). No curl call of the
 harness carries a token; should one ever need to, pass it with
 `-H @file` / `--config file` from that directory, not as an argument. Do not
 run the harness with `bash -x`.
@@ -207,7 +215,9 @@ docker cp frp-tunnel/tests "$c:/tests" && docker start -a "$c"; docker rm "$c"
 sudo, docker and a kernel with AppArmor) loads the profile in enforce mode,
 boots the image confined by it and exercises start-up, the panel, the
 renderer with a pinned CA, frpc as user `frpc` with its log watcher, unpair
-and `docker stop` without any backend; it fails on any `apparmor="DENIED"`
+and `docker stop` without any backend, and checks that user `frpc` cannot
+read the Supervisor API token (the same permission check and token search
+as above, without `/etc`); it fails on any `apparmor="DENIED"`
 for the profile. CI
 runs it on every push. For the full flow under the profile, run `run.sh` with
 `E2E_CREATE_ARGS="--security-opt apparmor=frp_tunnel"`.

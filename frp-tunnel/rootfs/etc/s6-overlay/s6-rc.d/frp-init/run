@@ -1,0 +1,44 @@
+#!/command/with-contenv bashio
+# shellcheck shell=bash
+# ==============================================================================
+# Home Assistant Add-on: FRP Tunnel
+# Oneshot frp-init: runs once per container start, after the base image's
+# oneshots (dependencies.d/base) and before both longruns (frpc and frp-mgr
+# depend on it), so before any process of the unprivileged user `frpc` exists.
+#
+# s6-overlay keeps the whole container environment - including the add-on's
+# Supervisor API token (SUPERVISOR_TOKEN and its legacy name HASSIO_TOKEN) -
+# as one file per variable in /run/s6/container_environment, created 0755 /
+# 0644, i.e. readable by every user. with-contenv (s6-envdir) reads it as
+# root for the frpc and frp-mgr services; nothing else needs it. frpc itself
+# runs with a scrubbed process environment, but could still have read the
+# token from that directory - and with it changed the add-on's own options
+# (e.g. app_base) and restarted it, so that the next start sends the device
+# token elsewhere (review 2026-10-27, FRP-01). The directory is made
+# root-only here.
+#
+# Fails closed: if the directory cannot be restricted, this oneshot fails,
+# s6-rc does not start the services that depend on it, and the base image
+# (S6_BEHAVIOUR_IF_STAGE2_FAILS=2) stops the add-on.
+#
+# with-contenv (as root) only for TZ and LOG_LEVEL of the log line below.
+# ==============================================================================
+readonly CONTENV_DIR="/run/s6/container_environment"
+
+if [[ -L "${CONTENV_DIR}" ]]; then
+    bashio::exit.nok "${CONTENV_DIR} is a symbolic link - refusing to start."
+fi
+if [[ ! -e "${CONTENV_DIR}" ]]; then
+    # Only with S6_KEEP_ENV=1 (not set by this add-on): no directory, nothing
+    # to restrict.
+    bashio::log.debug "${CONTENV_DIR} does not exist - nothing to restrict."
+    exit 0
+fi
+
+chmod 0700 "${CONTENV_DIR}" \
+    || bashio::exit.nok "Could not restrict ${CONTENV_DIR} to root - refusing to start."
+mode="$(stat -c '%u %a' "${CONTENV_DIR}")"
+if [[ "${mode}" != "0 700" ]]; then
+    bashio::exit.nok "${CONTENV_DIR} is uid/mode ${mode}, not root 700 - refusing to start."
+fi
+bashio::log.info "Container environment restricted to root (frpc cannot read the Supervisor API token)."

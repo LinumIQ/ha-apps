@@ -63,7 +63,8 @@ PANEL="http://127.0.0.1:8099"
 SAME_ORIGIN=(-H "Sec-Fetch-Site: same-origin")
 
 # A stand-in for the Supervisor API token every add-on container gets: frpc
-# must never see it (it renders its config as a Go template with .Envs).
+# must never see it (it renders its config as a Go template with .Envs), and
+# user frpc must not be able to read it anywhere in the container.
 SUPERVISOR_DUMMY="e2e-dummy-supervisor-token-$$-${RANDOM}"
 
 PASS_COUNT=0
@@ -364,8 +365,10 @@ copy_into() {
 }
 
 CTR="frp-tunnel-e2e-$$-${RANDOM}"
-# SUPERVISOR_TOKEN: what Supervisor puts into every add-on's environment.
-create_args=(--name "${CTR}" -e "ALLOWED_INGRESS_IPS=${ALLOWED_IPS}" -e "SUPERVISOR_TOKEN=${SUPERVISOR_DUMMY}")
+# SUPERVISOR_TOKEN and its legacy name HASSIO_TOKEN (same value): what
+# Supervisor puts into every add-on's environment.
+create_args=(--name "${CTR}" -e "ALLOWED_INGRESS_IPS=${ALLOWED_IPS}"
+    -e "SUPERVISOR_TOKEN=${SUPERVISOR_DUMMY}" -e "HASSIO_TOKEN=${SUPERVISOR_DUMMY}")
 [[ -n "${NETWORK}" ]] && create_args+=(--network "${NETWORK}")
 # e.g. E2E_CREATE_ARGS="--security-opt apparmor=frp_tunnel" (profile loaded on the host)
 create_args+=("${CREATE_EXTRA[@]+"${CREATE_EXTRA[@]}"}")
@@ -623,6 +626,50 @@ env_scrubbed() {
     done
 }
 check "frpc environment is scrubbed (PATH, HOME, TZ only)" env_scrubbed
+# ... and user frpc cannot read the token anywhere else either (review
+# 2026-10-27, FRP-01): s6-overlay keeps the container environment, token
+# included, in /run/s6/container_environment, which the frp-init oneshot makes
+# root-only before frpc starts.
+contenv_denied() {
+    local err
+    # stdout (the token, should the read succeed) goes to /dev/null
+    if err="$("${DOCKER}" exec --user frpc "${CTR}" cat /run/s6/container_environment/SUPERVISOR_TOKEN 2>&1 >/dev/null)"; then
+        return 1
+    fi
+    [[ "${err}" == *"ermission denied"* ]]
+}
+check "user frpc cannot read /run/s6/container_environment/SUPERVISOR_TOKEN (permission denied)" contenv_denied
+# Every file user frpc can read under /run /var/run /tmp /etc /data is
+# searched for the Supervisor token and the device token. The patterns come
+# on stdin from files in the private work directory (never argv). /data is
+# searched last: finding the tunnel token in /data/frpc.toml, which frpc must
+# read, proves that the scan ran through. Under the add-on's own AppArmor
+# profile (E2E_CREATE_ARGS) /etc is left out: the profile denies most of it to
+# every process of the add-on, and the scan's reads would show up as denials.
+scan_roots=(/run /var/run /tmp /etc /data)
+case "$("${DOCKER}" inspect -f '{{.AppArmorProfile}}' "${CTR}" 2>/dev/null || true)" in
+    "" | unconfined | docker-default | containers-default*) ;;
+    *) scan_roots=(/run /var/run /tmp /data) ;;
+esac
+# frpc_readable_with <pattern-file>: the files user frpc can read that contain
+# one of the patterns (one path per line).
+frpc_readable_with() {
+    "${DOCKER}" exec -i --user frpc "${CTR}" timeout 120 grep -rlsF -f - "${scan_roots[@]}" \
+        <"$1" 2>/dev/null || true
+}
+token_patterns="${SUPERVISOR_DUMMY}"
+[[ -n "${DEVICE_TOKEN}" ]] && token_patterns+=$'\n'"${DEVICE_TOKEN}"
+copies="$(frpc_readable_with "$(secret_file frpc-scan.pattern "${token_patterns}")")"
+found="${copies//$'\n'/ }"
+check "no file readable by user frpc contains the Supervisor or device token (${scan_roots[*]}; found: ${found:-none})" \
+    test -z "${copies}"
+scan_control() {
+    local hits
+    [[ -n "${TOKEN}" ]] || return 1
+    hits="$(frpc_readable_with "$(secret_file frpc-scan-control.pattern "${TOKEN}")")"
+    grep -qx /data/frpc.toml <<<"${hits}"
+}
+check "the scan as user frpc reached /data (control: tunnel token found in /data/frpc.toml)" scan_control
 if wait_for "${FRPC_TIMEOUT}" logs_contain "start proxy success"; then
     pass "frps accepted the http proxy for ${EXPECTED_HOST}"
 else

@@ -236,8 +236,9 @@ frpc's environment variables) before it parses it. The add-on therefore never
 writes `{{`, `}}` or a backtick into it: every value is restricted to host
 name / token characters, and the renderer checks every field and the whole
 file once more before writing it. frpc is also started with an empty
-environment (`PATH`, `HOME` and `TZ` only), so it never sees the add-on's
-Supervisor API token.
+environment (`PATH`, `HOME` and `TZ` only), so the add-on's Supervisor API
+token is not in its environment - and the user `frpc` cannot read the token
+from a file either (see [Security notes](#security-notes)).
 
 ## Configuration Options
 
@@ -369,6 +370,24 @@ retire it).
   environment; the AppArmor profile (`apparmor.txt`) allows only the files,
   programs, capabilities (`chown`, `fowner`, `kill`, `setgid`, `setuid`) and
   signals the add-on needs; no host folders are mapped.
+- **frpc never sees the add-on's Supervisor API token.** Supervisor gives
+  every add-on a token for its API (`SUPERVISOR_TOKEN`, also as
+  `HASSIO_TOKEN`); this add-on uses it only to read Home Assistant's port,
+  in the panel and the renderer, which run as root. The token is kept from
+  the user `frpc` in two ways:
+  - frpc's process environment is scrubbed (`PATH`, `HOME` and `TZ` only);
+  - s6-overlay keeps the add-on's whole environment, the token included, as
+    one file per variable in `/run/s6/container_environment`. That directory
+    is made root-only (mode 700) by the start-up step `frp-init` before frpc
+    or the panel start, and the add-on does not start if that fails. Up to
+    2.3.0 the directory was readable by every user, so code running as
+    `frpc` could have read the token there and changed the add-on's own
+    options with it.
+
+  The E2E harness and the AppArmor smoke test check this as user `frpc`:
+  the token file cannot be opened, and no file that user can read (under
+  `/run`, `/tmp`, `/data` and, outside the AppArmor profile, `/etc`) holds the
+  Supervisor token or the device token.
 - **No template injection into frpc.** frpc expands Go template actions such
   as `{{ .Envs.NAME }}` anywhere in its configuration file. The tunnel token
   must consist of `A-Z a-z 0-9 . _ ~ -` (8-256 characters), host names and

@@ -33,7 +33,10 @@
 # script runs under with-contenv, i.e. with the add-on's full environment
 # incl. SUPERVISOR_TOKEN - and frpc renders its configuration file as a Go
 # template with the process environment available as {{ .Envs.NAME }}, so a
-# template in a config value would otherwise send that token to frps.
+# template in a config value would otherwise send that token to frps. The
+# copy of the environment that with-contenv reads (as root) from
+# /run/s6/container_environment is root-only (oneshot frp-init, which this
+# service depends on), so user frpc cannot read the token there either.
 #
 # frpc's console output goes through the log watcher (frpclog.py, run as a
 # coprocess): every line reaches the add-on log unchanged, and login results are recorded in

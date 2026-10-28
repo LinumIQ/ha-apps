@@ -18,7 +18,8 @@ to a remote frps server — by default the LinumIQ tunneling service at
   certificate authority provided by your LinumIQ account's server - and frpc
   is never started unverified once the server requires verification.
 - **Least privilege**: frpc runs as an unprivileged user with an empty
-  environment under a strict AppArmor profile; the panel answers only Home
+  environment under a strict AppArmor profile and cannot read the add-on's
+  Supervisor API token; the panel answers only Home
   Assistant's ingress proxy; pairing secrets are never put into Home
   Assistant backups.
 - **Stable public URL**: `https://<subdomain>.linumiq.net`.
