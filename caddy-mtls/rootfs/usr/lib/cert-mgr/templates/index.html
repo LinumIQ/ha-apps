@@ -1,25 +1,11 @@
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="color-scheme" content="light dark" />
-    <title>Caddy mTLS - Certificate Manager</title>
-    <link rel="stylesheet" href="static/style.css" />
-  </head>
-  <body>
-    <div class="container">
-      <header class="app-header">
-        <div class="app-header__icon" aria-hidden="true">🔐</div>
-        <div class="app-header__text">
-          <h1>Caddy mTLS</h1>
-          <p>
-            Manage the certificate authority and client certificates for this
-            add-on.
-          </p>
-        </div>
-      </header>
+{% extends "_layout.html" %}
+{% block title %}Caddy mTLS - Certificate Manager{% endblock %}
+{% block app_name %}Caddy mTLS{% endblock %}
+{% block app_subtitle -%}
+  Manage the certificate authority and client certificates for this add-on.
+{%- endblock %}
 
+{% block flashes %}
       {% if flash_error %}
       <div class="flash flash-error" role="alert">
         <strong>Error:</strong>&nbsp;{{ flash_error }}
@@ -27,7 +13,9 @@
       {% endif %} {% if flash_ok %}
       <div class="flash flash-ok" role="status">{{ flash_ok }}</div>
       {% endif %}
+{% endblock %}
 
+{% block content %}
       {% include "_public_cert.html" %}
 
       <section class="card" aria-labelledby="ca-heading">
@@ -71,9 +59,9 @@
         <p class="warn">No CA metadata in state file.</p>
         {% endif %}
 
-        <details class="danger-zone">
+        <details class="disclosure danger-zone">
           <summary>Regenerate CA (irreversible)</summary>
-          <div class="danger-zone__body">
+          <div class="disclosure__body danger-zone__body">
             <p>
               This wipes <strong>all</strong> existing certificates and issues a
               brand-new CA and new certificates for the <strong>active</strong>
@@ -207,11 +195,13 @@
         <p class="warn">CRL not yet generated.</p>
         {% endif %}
       </section>
+{% endblock %}
 
-      <footer>
+{% block footer_extra %}
         <p>state version {{ state.version }}</p>
-      </footer>
-    </div>
+{% endblock %}
+
+{% block scripts %}
     <script>
       // Reload the "Public certificate" card every 30 s (relative URL: it
       // stays inside the ingress path), so the result of a fixed port
@@ -231,5 +221,4 @@
         }, 30000);
       })();
     </script>
-  </body>
-</html>
+{% endblock %}

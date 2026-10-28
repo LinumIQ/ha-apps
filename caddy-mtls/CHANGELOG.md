@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-10-28
+
+The certificate manager in the LinumIQ look. Nothing else changes: no new
+options, the same state and certificates.
+
+### Changed
+
+- **LinumIQ look** for the web interface (certificate manager): the brand
+  colours (Anchor Blue for buttons and links, Spark Orange for warnings such
+  as "Renewal failing"), the brand fonts Roboto (headings) and Inter (text),
+  and a light and a dark mode that follow the device's light/dark setting
+  (`prefers-color-scheme`). The header shows the add-on's mark instead of an
+  emoji, the footer the LinumIQ logo (a link to linumiq.com, opens in a new
+  tab) above the state version. Fonts and logo are part of the add-on image
+  (the fonts under the SIL Open Font License 1.1, see NOTICE): the web
+  interface loads nothing from other hosts, it works offline in the LAN. The
+  "Public certificate" card keeps its colour per state (green, orange, red,
+  blue).
+- **Icon and logo**: new add-on icon and logo in the add-on store (the
+  LinumIQ ring with the add-on's symbol, in the brand colours, for light and
+  dark backgrounds), replacing the text placeholders.
+- One source for the look of both LinumIQ add-ons: `shared/ui` in the
+  repository (stylesheet, fonts, logo, page layout), copied into the add-on
+  by `scripts/sync-shared.sh` and checked in CI. The web interface's
+  `static/style.css` is now `static/shared/linumiq.css` (shared) plus
+  `static/app.css` (this add-on's own components), and
+  `templates/index.html` extends the shared `templates/_layout.html` (the
+  "Public certificate" card `_public_cert.html` stays a partial).
+- Layout details: the values in the CA and CRL cards are no longer indented
+  by the browser's default 40 px, the client buttons fill the width on
+  phones, and every control has a focus ring in the brand blue.
+
 ## [2.0.1] - 2026-10-28
 
 Fixes from the first real installation (Home Assistant OS 18.4, Supervisor

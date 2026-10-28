@@ -10,7 +10,8 @@
 # processes or the network: s6-overlay start-up, bashio, init-caddy (CA,
 # client certificates, CRL, Caddyfile, `caddy validate`), Caddy (admin API,
 # its ACME client against a closed local port), the cert-mgr panel (health,
-# dashboard, state, a .p12 download, a client add and a revocation, each
+# dashboard and the shared UI's static files, state, a .p12 download, a
+# client add and a revocation, each
 # with `openssl ca` and a forced `caddy reload`), the "Public certificate"
 # card (Caddy's acme.log, openssl x509 on Caddy's storage, the live probe of
 # port 443), the cert-monitor (sensors and the "no public certificate"
@@ -177,6 +178,17 @@ check "Public certificate card: ok (green) from Caddy's storage" wait_for 30 car
 check "cert-monitor: notification dismissed" wait_for 30 supervisor_got /persistent_notification/dismiss
 code="$(http_code GET /)"
 check "dashboard renders (got ${code})" test "${code}" == 200
+# The shared LinumIQ UI (stylesheets, a font, the footer logo, the app mark)
+# is readable under the profile.
+ui_files_served() {
+    local path code
+    for path in /static/shared/linumiq.css /static/app.css /static/shared/fonts/inter-latin.woff2 \
+        /static/shared/brand/linumiq-logo.png /static/brand/icon.svg; do
+        code="$(http_code GET "${path}")"
+        [[ "${code}" == 200 ]] || { log "GET ${path}: ${code}"; return 1; }
+    done
+}
+check "panel serves the shared UI files under ${PROFILE}" ui_files_served
 code="$(http_code GET /api/state)"
 check "/api/state answers (got ${code})" test "${code}" == 200
 code="$(http_code GET /download/client/alice)"
