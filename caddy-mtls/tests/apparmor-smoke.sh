@@ -11,11 +11,14 @@
 # client certificates, CRL, Caddyfile, `caddy validate`), Caddy (admin API,
 # its ACME client against a closed local port), the cert-mgr panel (health,
 # dashboard, state, a .p12 download, a client add and a revocation, each
-# with `openssl ca` and a forced `caddy reload`), the cert-monitor, a clean
-# `docker stop` and a restart as Supervisor does it (a new container with the
-# previous /data) with a new client name and a new client_cert_password
-# (issuance and .p12 re-encryption at start-up). Fails on any AppArmor denial
-# for the profile.
+# with `openssl ca` and a forced `caddy reload`), the "Public certificate"
+# card (Caddy's acme.log, openssl x509 on Caddy's storage, the live probe of
+# port 443), the cert-monitor (sensors and the "no public certificate"
+# notification at a fake Supervisor inside the container, then its
+# dismissal), a clean `docker stop` (< 10 s, exit 0, no s6 warnings) and a
+# restart as Supervisor does it (a new container with the previous /data)
+# with a new client name and a new client_cert_password (issuance and .p12
+# re-encryption at start-up). Fails on any AppArmor denial for the profile.
 #
 # No external network traffic: the container runs with --network none and
 # ACME_CA_URL points at a closed local port. A profile that was not loaded
@@ -29,6 +32,7 @@ set -euo pipefail
 IMAGE="${1:?usage: apparmor-smoke.sh <image> <apparmor.txt>}"
 PROFILE_FILE="${2:?usage: apparmor-smoke.sh <image> <apparmor.txt>}"
 DOCKER="${DOCKER:-docker}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROFILE="$(sed -n 's/^profile \([A-Za-z0-9_-]*\) .*/\1/p' "${PROFILE_FILE}" | head -n 1)"
 CTR1="caddy-mtls-aa-smoke-$$"
 CTR2="${CTR1}-restart"
@@ -116,11 +120,20 @@ chmod -R go+rX "${WORK}"
 # keep the runner's uid, which root could only read with CAP_DAC_OVERRIDE.
 copy_into() { tar -C "$1" --owner=0 --group=0 --numeric-owner -cf - . | "${DOCKER}" cp - "${CTR}:$2"; }
 
+# The cert-monitor talks to a fake Supervisor (tests/fake-supervisor.py,
+# started inside the container, i.e. under the profile too) and raises the
+# "no public certificate" notification after 5 s instead of 2 minutes.
+SUPERVISOR_LOG=/tmp/supervisor-requests.jsonl
 "${DOCKER}" create --name "${CTR}" --security-opt "apparmor=${PROFILE}" --network none \
-    -e ACME_CA_URL=http://127.0.0.1:9/directory -e TZ=Europe/Vienna "${IMAGE}" >/dev/null
+    -e ACME_CA_URL=http://127.0.0.1:9/directory -e TZ=Europe/Vienna \
+    -e SUPERVISOR_TOKEN=aa-smoke-token -e SUPERVISOR_URL=http://127.0.0.1:8765 \
+    -e CERT_MONITOR_PUBLIC_CERT_GRACE_SECONDS=5 -e CERT_MONITOR_FAST_INTERVAL_SECONDS=2 \
+    "${IMAGE}" >/dev/null
 copy_into "${WORK}/data" /data
 copy_into "${WORK}/tmp" /tmp
+tar -C "${SCRIPT_DIR}" --owner=0 --group=0 --numeric-owner -cf - fake-supervisor.py | "${DOCKER}" cp - "${CTR}:/tmp"
 "${DOCKER}" start "${CTR}" >/dev/null
+"${DOCKER}" exec -d "${CTR}" /usr/lib/cert-mgr/.venv/bin/python3 /tmp/fake-supervisor.py 8765 "${SUPERVISOR_LOG}"
 
 health() { [[ "$(cexec curl -fsS http://127.0.0.1:8099/_health 2>/dev/null)" == ok ]]; }
 admin_up() { cexec curl -fsS -o /dev/null http://127.0.0.1:2019/config/ 2>/dev/null; }
@@ -143,6 +156,25 @@ check "PID 1 confined by ${PROFILE} (enforce)" \
     test "$("${SUDO[@]}" cat "/proc/${pid1}/attr/current" 2>/dev/null)" == "${PROFILE} (enforce)"
 check "cert-monitor started" wait_for 30 logs_contain "cert-monitor starting"
 check "Caddy's ACME client ran (sinkhole refused)" wait_for 60 logs_contain "127.0.0.1:9"
+acme_log_has_error() { cexec grep -F '"level":"error"' /data/caddy/log/acme.log >/dev/null 2>&1; }
+check "Caddy writes its certificate events to /data/caddy/log/acme.log" wait_for 60 acme_log_has_error
+card_state() { cexec curl -fsS http://127.0.0.1:8099/public-cert 2>/dev/null | sed -n 's/.*data-state="\([a-z_]*\)".*/\1/p'; }
+card_state_is() { [[ "$(card_state)" == "$1" ]]; }
+check "Public certificate card: missing (red)" wait_for 30 card_state_is missing
+supervisor_got() { # supervisor_got <path suffix>
+    cexec sh -c 'test -f "$1" && jq -s -e --arg p "$0" "[.[] | select(.path | endswith(\$p))] | length > 0" "$1"' \
+        "$1" "${SUPERVISOR_LOG}" >/dev/null 2>&1
+}
+check "cert-monitor: notification raised at the fake Supervisor" \
+    wait_for 60 supervisor_got /persistent_notification/create
+# A certificate in Caddy's storage: openssl x509 on it and the live probe of
+# port 443 run under the profile; the monitor dismisses the notification.
+cexec sh -c 'd=/data/caddy/certificates/aa-smoke/home.example.com && mkdir -p "$d" &&
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 90 \
+        -subj "/O=AppArmor smoke CA/CN=AA R1" -keyout "$d/home.example.com.key" \
+        -out "$d/home.example.com.crt"' >/dev/null 2>&1 || true
+check "Public certificate card: ok (green) from Caddy's storage" wait_for 30 card_state_is ok
+check "cert-monitor: notification dismissed" wait_for 30 supervisor_got /persistent_notification/dismiss
 code="$(http_code GET /)"
 check "dashboard renders (got ${code})" test "${code}" == 200
 code="$(http_code GET /api/state)"
@@ -165,11 +197,19 @@ check "Caddy reloaded twice (forced reload)" wait_for 15 reloaded
 check "no 'config is unchanged' (reload was forced)" logs_lack "config is unchanged"
 check "no 'permission denied' in the log" logs_lack "ermission denied"
 
+# A stop as Supervisor does it: < 10 s, exit code 0, no s6 warnings.
 stop_container() {
-    "${DOCKER}" stop -t 30 "${CTR}" >/dev/null \
-        && [[ "$("${DOCKER}" inspect -f '{{.State.Status}}' "${CTR}")" == exited ]]
+    local t0 ms
+    t0="$(date +%s%N)"
+    "${DOCKER}" stop -t 30 "${CTR}" >/dev/null || return 1
+    ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+    log "${CTR}: docker stop took ${ms} ms"
+    [[ "$("${DOCKER}" inspect -f '{{.State.Status}} {{.State.ExitCode}}' "${CTR}")" == "exited 0" ]] \
+        && (( ms < 10000 )) \
+        && ! "${DOCKER}" logs "${CTR}" 2>&1 \
+            | grep -E 'finish script lifetime|unable to stop service|s6-ipcclient: fatal|sending it a SIGKILL' >/dev/null
 }
-check "clean docker stop" stop_container
+check "clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_container
 
 # Restart: a new container under the profile with the previous /data, a new
 # client name and a new client_cert_password.
@@ -196,7 +236,7 @@ check "restart: dave (new in client_names) issued" \
 check "restart: .p12 bundles re-encrypted with the new password" \
     logs_contain "Re-encrypted the .p12 bundle of client 'alice'"
 check "restart: no 'permission denied' in the log" logs_lack "ermission denied"
-check "restart: clean docker stop" stop_container
+check "restart: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_container
 sleep 1
 denials >"${WORK}/after"
 new="$(comm -13 "${WORK}/before" "${WORK}/after" || true)"

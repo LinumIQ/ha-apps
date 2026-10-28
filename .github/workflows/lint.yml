@@ -207,9 +207,12 @@ jobs:
           python -m py_compile
           caddy-mtls/rootfs/usr/lib/cert-mgr/app.py
           caddy-mtls/rootfs/usr/lib/cert-mgr/monitor.py
+          caddy-mtls/rootfs/usr/lib/cert-mgr/public_cert.py
 
-      # The expiry monitor (standard library only): entity-id slugs against
-      # Home Assistant's entity id rule, notification thresholds.
+      # The expiry monitor and public_cert.py (standard library only):
+      # entity-id slugs against Home Assistant's entity id rule, notification
+      # thresholds, the public certificate state (Caddy's ACME log events,
+      # storage, checklist) and its notification with a mocked Supervisor.
       - name: Unit tests
         run: python -m unittest discover -s caddy-mtls/tests/unit -v
 

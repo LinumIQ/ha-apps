@@ -11,14 +11,17 @@
 #              the panel (health, dashboard, //, /api/state), the CA and the
 #              seeded clients (files, modes, state.json), the Caddyfile and
 #              Caddy's admin API (leaf verifier), the plain-HTTP site (CRL,
-#              308 to https), real mTLS handshakes, client add / revoke /
+#              301 to https), real mTLS handshakes, client add / revoke /
 #              regenerate through the panel (CRL, active/, Caddy reloaded: a
 #              revoked certificate is rejected at once), revoking without the
 #              CA database's copy or without the .crt (M2), invalid names
 #              (L1), "Regenerate CA" (only active clients re-issued, revoked
 #              ones stay revoked: M3), the .p12 download, the ingress
 #              allow-list (crafted Host header), the host-port log line and no
-#              secrets in the log.
+#              secrets in the log; the "Public certificate" card (green: Caddy's
+#              internal certificate, served on 443); log hygiene (no access
+#              log, no admin.api / uvicorn lines for health probes and panel
+#              requests, no "not formatted" warning, no openssl dump).
 #   restart    two restarts as Supervisor does them (a new container with the
 #              previous /data): new and invalid names in client_names (issued
 #              resp. skipped at every start, revoked names skipped: M5, L1), a
@@ -26,7 +29,17 @@
 #              once, also in the /config mirror: M7).
 #   no-mtls    mtls_enabled: false renders and validates (public domain);
 #              upstream_port unset: Home Assistant Core's port from the
-#              (seeded) Supervisor info.
+#              (seeded) Supervisor info; log_level debug turns the access logs
+#              on.
+#   access-log access_log: true: Caddy's "handled request" lines; a SIGTERM to
+#              Caddy alone restarts it (exit 0); `kill -9` of Caddy stops the
+#              add-on with exit code 137 within 10 s, without s6 warnings.
+#   acme       public domain with the ACME sinkhole and a fake Supervisor
+#              (tests/fake-supervisor.py, via SUPERVISOR_URL): acme.log fills
+#              with errors, the card is red (error text, host ports), the
+#              monitor raises the notification; a certificate placed in
+#              Caddy's storage turns the card green and dismisses it; a
+#              failed renewal turns it yellow.
 #   dns-*      one boot per DNS provider (cloudflare, route53, hetzner, dummy
 #              tokens, public domain): the rendered `dns` directive passes
 #              `caddy validate` and Caddy runs with it (the module syntax at the
@@ -39,6 +52,9 @@
 # No external network traffic: every container runs with --network none and
 # ACME_CA_URL points at a closed local port (http://127.0.0.1:9/directory);
 # the checks also assert that no ACME issuer points elsewhere.
+#
+# Every case ends with a `docker stop` that must take less than 10 s, exit 0
+# and leave no s6 warnings in the log.
 #
 # Prints one PASS/FAIL line per check. Exit status: 0 all checks passed,
 # 1 a check failed, 2 usage error. Containers are removed on exit.
@@ -59,6 +75,7 @@ command -v "${DOCKER}" >/dev/null || { printf 'container CLI %s not found\n' "${
 
 PREFIX="caddy-mtls-smoke-$$"
 WORK="$(mktemp -d)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ACME_SINKHOLE="http://127.0.0.1:9/directory"
 INGRESS_PREFIX="/api/hassio_ingress/smoke-token"
 P12_PASSWORD="smoke-p12-$$-${RANDOM}${RANDOM}"
@@ -69,6 +86,8 @@ R53_SECRET="smoke/route53+secret-$$-${RANDOM}${RANDOM}"
 CTR=""
 CORE_INFO=""
 CONTAINERS=()
+# Extra `docker create` arguments of the next boot (e.g. environment).
+EXTRA_CREATE_ARGS=()
 PASS_COUNT=0
 FAIL_COUNT=0
 
@@ -141,9 +160,21 @@ issuers_only_sinkhole() {
     cexec sh -c 'curl -fsS --max-time 5 http://127.0.0.1:2019/config/ | jq -e --arg ca "$1" "$0"' \
         "${ISSUERS_ONLY_SINKHOLE}" "${ACME_SINKHOLE}" >/dev/null 2>&1
 }
+# s6 complaints of an unclean stop (2.0.0: cert-monitor's 5 s finish script
+# was SIGKILLed, caddy/finish tore down the supervision tree while s6-rc was
+# still stopping the services, so init-caddy could not be stopped).
+S6_STOP_WARNINGS='finish script lifetime|unable to stop service|s6-ipcclient: fatal|sending it a SIGKILL'
+# A stop as Supervisor does it (docker stop): done in less than 10 s, exit
+# code 0, no s6 warnings in the log.
 stop_cleanly() {
-    "${DOCKER}" stop -t 30 "${CTR}" >/dev/null 2>&1 \
-        && [[ "$("${DOCKER}" inspect -f '{{.State.Status}}' "${CTR}")" == exited ]]
+    local t0 ms
+    t0="$(date +%s%N)"
+    "${DOCKER}" stop -t 30 "${CTR}" >/dev/null 2>&1 || return 1
+    ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+    log "${CTR}: docker stop took ${ms} ms, exit code $("${DOCKER}" inspect -f '{{.State.ExitCode}}' "${CTR}")"
+    [[ "$("${DOCKER}" inspect -f '{{.State.Status}} {{.State.ExitCode}}' "${CTR}")" == "exited 0" ]] \
+        && (( ms < 10000 )) \
+        && ! "${DOCKER}" logs "${CTR}" 2>&1 | grep -E -- "${S6_STOP_WARNINGS}" >/dev/null
 }
 
 # boot <name> <options-json> [<data.tar>]: create, seed and start a container
@@ -169,7 +200,8 @@ boot() {
     chmod -R go+rX "${dir}"
     CONTAINERS+=("${CTR}")
     "${DOCKER}" create --name "${CTR}" --network none \
-        -e ACME_CA_URL="${ACME_SINKHOLE}" -e TZ=Europe/Vienna "${IMAGE}" >/dev/null
+        -e ACME_CA_URL="${ACME_SINKHOLE}" -e TZ=Europe/Vienna \
+        "${EXTRA_CREATE_ARGS[@]+"${EXTRA_CREATE_ARGS[@]}"}" "${IMAGE}" >/dev/null
     if [[ -n "${3:-}" ]]; then
         "${DOCKER}" cp - "${CTR}:/" <"$3"
         mkdir -p "${dir}/root/config"
@@ -189,23 +221,31 @@ show_log_on_failure() {
 }
 # options <domain> <mtls_enabled> <provider> <token> [<upstream_host> [<upstream_port>]]
 # (upstream default 127.0.0.1:8123; an empty port leaves upstream_port unset;
-# client_names and client_cert_password from OPT_CLIENT_NAMES / OPT_PASSWORD)
+# client_names, client_cert_password, log_level and access_log from
+# OPT_CLIENT_NAMES / OPT_PASSWORD / OPT_LOG_LEVEL / OPT_ACCESS_LOG)
 OPT_CLIENT_NAMES='["alice", "bob"]'
 OPT_PASSWORD="${P12_PASSWORD}"
+OPT_LOG_LEVEL=info
+OPT_ACCESS_LOG=false
 options() {
     jq -n --arg domain "$1" --argjson mtls "$2" --arg provider "$3" --arg token "$4" \
         --arg uhost "${5:-127.0.0.1}" --arg uport "${6-8123}" \
-        --arg pass "${OPT_PASSWORD}" --argjson names "${OPT_CLIENT_NAMES}" '{
+        --arg pass "${OPT_PASSWORD}" --argjson names "${OPT_CLIENT_NAMES}" \
+        --arg level "${OPT_LOG_LEVEL}" --argjson access "${OPT_ACCESS_LOG}" '{
         domain: $domain, email: "smoke@example.com",
         upstream_host: $uhost, mtls_enabled: $mtls,
         ca_country: "AT", ca_state: "Styria", ca_locality: "Graz",
         ca_organization: "LinumIQ", ca_common_name: "Caddy mTLS smoke CA",
         client_names: $names, client_cert_password: $pass,
         acme_dns_provider: $provider, dns_api_token: $token,
-        log_level: "info", cert_expiry_warn_days: [30, 14, 7, 1],
+        log_level: $level, access_log: $access, cert_expiry_warn_days: [30, 14, 7, 1],
         cert_check_interval_hours: 6}
         + (if $uport == "" then {} else {upstream_port: ($uport | tonumber)} end)'
 }
+# The "Public certificate" card (GET /public-cert, as the dashboard reloads it).
+card() { cexec curl -fsS --max-time 15 http://127.0.0.1:8099/public-cert 2>/dev/null; }
+card_state_is() { [[ "$(card)" == *"data-state=\"$1\""* ]]; }
+card_contains() { local html; html="$(card)" && [[ "${html}" == *"$1"* ]]; }
 command -v jq >/dev/null || { printf 'jq is required\n' >&2; exit 2; }
 command -v tar >/dev/null || { printf 'tar is required\n' >&2; exit 2; }
 
@@ -518,12 +558,47 @@ check "allow-list: /api/state from a non-ingress address -> 403" \
 check "allow-list: crafted Host header does not bypass it" \
     eval 'code="$(code8098 -H "Host: x/_health?" http://127.0.0.1:8098/api/state)"; [[ "${code}" == 403 || "${code}" == 400 ]]'
 
+# --- "Public certificate" card ------------------------------------------------------
+# Caddy's internal issuer (a .localhost domain) stands in for Let's Encrypt.
+check "card: green (data-state ok) with Caddy's certificate for ${DOMAIN}" wait_for 30 card_state_is ok
+check "card: issuer and expiry shown" eval '
+    card_contains "Certificate for <strong>${DOMAIN}</strong> from Caddy Local Authority" &&
+    card_contains "days)."'
+check "card: the live probe sees the stored certificate on port 443 (despite mTLS)" \
+    card_contains "Caddy serves it on port 443."
+check "card: at the top of the dashboard" eval '
+    html="$(dashboard /)" && pre="${html%%id=\"public-cert\"*}" && [[ "${pre}" != "${html}" && "${pre}" != *"Certificate Authority"* ]]'
+check "card: the dashboard reloads it every 30 s" eval '[[ "$(dashboard /)" == *"fetch(\"public-cert\""*"30000"* ]]'
+check "panel: no /openapi.json (FastAPI schema) -> 404" \
+    test "$(cexec curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8099/openapi.json)" == 404
+
 # --- logs ---------------------------------------------------------------------------
 check "main: cert-monitor started" logs_contain "cert-monitor starting"
 check "main: client_cert_password not in the log" logs_lack_secret "${P12_PASS_FILE}"
 check "main: no 'permission denied' / Traceback in the log" \
     eval 'logs_lack "ermission denied" && logs_lack "Traceback"'
-check "main: clean docker stop" stop_cleanly
+# Log hygiene (owner's log 2026-10-28: 701 access-log lines, one admin.api and
+# one uvicorn line per health probe, the openssl dump, the fmt warning).
+check "log: no 'Caddyfile input is not formatted' warning" logs_lack "not formatted"
+check "log: no openssl 'Certificate Details' dump / progress lines (clients issued, CRLs made)" eval '
+    logs_lack "Certificate Details" && logs_lack "Using configuration from" && logs_lack "Database updated"'
+check "log: no Caddy access log ('handled request') by default, after the mTLS requests" logs_lack "handled request"
+probe_is_silent() {
+    local before
+    before="$(log_line_count)"
+    healthcheck_passes && sleep 1 &&
+        ! new_logs_contain "${before}" "admin.api" && ! new_logs_contain "${before}" "/_health"
+}
+check "log: a health probe (HEALTHCHECK command) passes and leaves no admin.api / uvicorn line" probe_is_silent
+check "log: no admin.api line at all (probes, panel reloads), no uvicorn access line" eval '
+    logs_lack "admin.api" && logs_lack "\"GET /_health" && logs_lack "\"POST /api/clients"'
+check "log: other Caddy loggers still log (Caddy's admin: stopped previous server)" \
+    logs_contain "stopped previous server"
+check "log: proxy errors still logged without the access log (http.log.error after a 502)" \
+    logs_contain "http.log.error"
+check "log: certificate events still in the add-on log (tls.obtain)" \
+    logs_contain "certificate obtained successfully"
+check "main: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
 show_log_on_failure "${before}"
 
 # ==============================================================================
@@ -586,7 +661,7 @@ if wait_for "${BOOT_TIMEOUT}" booted; then
     # For the second restart: the bundles and serials must stay as they are.
     bundles_before="$(cexec sh -c 'sha256sum /data/certs/*.p12' 2>/dev/null)"
     serials_before="$(state '[.clients[] | "\(.name)=\(.serial)"] | join(",")')"
-    check "restart: clean docker stop" stop_cleanly
+    check "restart: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
 else
     fail "restart: add-on booted (invalid client_names entries do not block the start)"
 fi
@@ -607,7 +682,7 @@ if wait_for "${BOOT_TIMEOUT}" booted; then
             test "$(state '[.clients[] | "\(.name)=\(.serial)"] | join(",")')" == "${serials_before}"
     }
     check "restart2: bundles and serials unchanged" unchanged_since_restart
-    check "restart2: clean docker stop" stop_cleanly
+    check "restart2: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
 else
     fail "restart2: add-on booted"
 fi
@@ -618,10 +693,12 @@ OPT_CLIENT_NAMES='["alice", "bob"]'
 # ==============================================================================
 # 2. no-mtls: mtls_enabled false (public domain, ACME sinkhole)
 # ==============================================================================
-log "no-mtls: booting (mtls_enabled: false)"
+log "no-mtls: booting (mtls_enabled: false, log_level debug)"
 before=${FAIL_COUNT}
 CORE_INFO='{"port": 80, "ssl": false}'
+OPT_LOG_LEVEL=debug
 boot no-mtls "$(options home.example.com false none "" homeassistant "")"
+OPT_LOG_LEVEL=info
 CORE_INFO=""
 if wait_for "${BOOT_TIMEOUT}" booted; then
     pass "no-mtls: add-on booted"
@@ -635,9 +712,152 @@ if wait_for "${BOOT_TIMEOUT}" booted; then
     check "no-mtls: upstream_port unset -> Core's port from the Supervisor info (homeassistant:80)" \
         eval 'logs_contain "Upstream:    homeassistant:80 (Home Assistant Core'"'"'s port from the Supervisor API)" &&
         cexec grep -F "reverse_proxy homeassistant:80 {" /etc/caddy/Caddyfile >/dev/null'
-    check "no-mtls: clean docker stop" stop_cleanly
+    check "no-mtls: log_level debug renders the site's access log, uvicorn logs requests" eval '
+        logs_contain "Access log:  on" && cexec grep -E "^[[:space:]]+log \{" /etc/caddy/Caddyfile >/dev/null &&
+        cexec curl -fsS -o /dev/null http://127.0.0.1:8099/_health && sleep 1 && logs_contain "\"GET /_health"'
+    check "no-mtls: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
 else
     fail "no-mtls: add-on booted"
+fi
+show_log_on_failure "${before}"
+
+# ==============================================================================
+# 2b. access-log: access_log true; Caddy restarted by s6 / crash stops the add-on
+# ==============================================================================
+log "access-log: booting (access_log: true)"
+before=${FAIL_COUNT}
+OPT_ACCESS_LOG=true
+boot access-log "$(options "${DOMAIN}" true none "")"
+OPT_ACCESS_LOG=false
+if wait_for "${BOOT_TIMEOUT}" booted; then
+    pass "access-log: add-on booted"
+    check "access-log: init logs 'Access log:  on'" logs_contain "Access log:  on"
+    check "access-log: a request is logged ('handled request')" eval '
+        http80 -o /dev/null "http://${DOMAIN}/access-log-check" && wait_for 10 logs_contain "handled request"'
+    check "access-log: still no admin.api / uvicorn access lines" eval '
+        cexec curl -fsS -o /dev/null http://127.0.0.1:8099/_health && sleep 1 &&
+        logs_lack "admin.api" && logs_lack "\"GET /_health"'
+    # Caddy exiting with 0 while s6 wants it up (here: SIGTERM to Caddy alone)
+    # is not a crash: s6 starts it again, the add-on keeps running.
+    caddy_pid="$(cexec pidof caddy 2>/dev/null || true)"
+    caddy_restarted() {
+        local pid
+        pid="$(cexec pidof caddy 2>/dev/null)" && [[ -n "${pid}" && "${pid}" != "${caddy_pid}" ]] && admin_up
+    }
+    check "access-log: SIGTERM to Caddy alone -> s6 restarts it (exit 0 is no crash)" eval '
+        [[ -n "${caddy_pid}" ]] && cexec kill -TERM "${caddy_pid}" && wait_for 20 caddy_restarted && running &&
+        logs_contain "Caddy exited with exit code 0; s6 starts it again."'
+    # A Caddy crash stops the add-on with Caddy's exit code (signal 9 -> 137),
+    # so Supervisor shows an error (and its Watchdog can restart it).
+    crash_stops_addon() {
+        local pid
+        pid="$(cexec pidof caddy 2>/dev/null)" && [[ -n "${pid}" ]] || return 1
+        cexec kill -9 "${pid}" || return 1
+        wait_for 10 exited &&
+            [[ "$("${DOCKER}" inspect -f '{{.State.ExitCode}}' "${CTR}")" == 137 ]]
+    }
+    check "crash: kill -9 of Caddy stops the add-on within 10 s with exit code 137" crash_stops_addon
+    check "crash: the log names the reason" \
+        logs_contain "Caddy stopped unexpectedly (killed by signal 9); stopping the add-on with exit code 137."
+    check "crash: no s6 warnings (finish script lifetime, unable to stop service)" \
+        eval '! "${DOCKER}" logs "${CTR}" 2>&1 | grep -E -- "${S6_STOP_WARNINGS}" >/dev/null'
+else
+    fail "access-log: add-on booted"
+fi
+show_log_on_failure "${before}"
+
+# ==============================================================================
+# 2c. acme: no certificate (ACME sinkhole) -> red card + notification; a
+#     certificate in Caddy's storage -> green card + dismissed
+# ==============================================================================
+# The fake Supervisor runs inside the container (--network none) on a free
+# port; the monitor reaches it through SUPERVISOR_URL, with short test
+# intervals (notification after 5 s instead of 2 minutes).
+FAKE_SUPERVISOR_PORT=8765
+SUPERVISOR_LOG=/tmp/supervisor-requests.jsonl
+SMOKE_SUPERVISOR_TOKEN="smoke-supervisor-token-$$"
+ACME_DOMAIN="home.example.com"
+log "acme: booting (${ACME_DOMAIN}, ACME sinkhole, fake Supervisor)"
+before=${FAIL_COUNT}
+EXTRA_CREATE_ARGS=(
+    -e "SUPERVISOR_TOKEN=${SMOKE_SUPERVISOR_TOKEN}"
+    -e "SUPERVISOR_URL=http://127.0.0.1:${FAKE_SUPERVISOR_PORT}"
+    -e CERT_MONITOR_PUBLIC_CERT_GRACE_SECONDS=5
+    -e CERT_MONITOR_FAST_INTERVAL_SECONDS=2
+)
+boot acme "$(options "${ACME_DOMAIN}" true none "")"
+EXTRA_CREATE_ARGS=()
+tar -C "${SCRIPT_DIR}" --owner=0 --group=0 --numeric-owner -cf - fake-supervisor.py | "${DOCKER}" cp - "${CTR}:/tmp"
+"${DOCKER}" exec -d "${CTR}" /usr/lib/cert-mgr/.venv/bin/python3 /tmp/fake-supervisor.py \
+    "${FAKE_SUPERVISOR_PORT}" "${SUPERVISOR_LOG}"
+# supervisor_got <jq filter>: a request the fake Supervisor received matches.
+supervisor_got() {
+    cexec sh -c 'test -f "$1" && jq -s -e "$0" "$1"' "[.[] | select($1)] | length > 0" "${SUPERVISOR_LOG}" >/dev/null 2>&1
+}
+# supervisor_count <jq filter>: how many requests matched.
+supervisor_count() {
+    cexec sh -c 'jq -s "$0" "$1"' "[.[] | select($1)] | length" "${SUPERVISOR_LOG}" 2>/dev/null
+}
+NOTE_CREATE='.method == "POST" and .path == "/core/api/services/persistent_notification/create"
+    and .body.notification_id == "caddy_mtls_public_certificate"'
+if wait_for "${BOOT_TIMEOUT}" booted; then
+    pass "acme: add-on booted"
+    acme_error_logged() { cexec sh -c 'grep -F "\"logger\":\"tls.obtain\"" /data/caddy/log/acme.log | grep -F "\"level\":\"error\""' >/dev/null 2>&1; }
+    check "acme: Caddy's certificate events in /data/caddy/log/acme.log (JSON), with errors" \
+        wait_for 60 acme_error_logged
+    check "acme: acme.log 600, its folder 700" eval '
+        file_mode_is /data/caddy/log/acme.log 600 && file_mode_is /data/caddy/log 700'
+    check "acme: the errors are in the add-on log as well (could not get certificate from issuer)" \
+        logs_contain "could not get certificate from issuer"
+    check "card: red (data-state missing): No public certificate yet" eval '
+        wait_for 30 card_state_is missing && card_contains "<strong>No public certificate yet</strong>"'
+    check "card: shows the last ACME error (connection refused at the sinkhole)" \
+        card_contains "connect: connection refused"
+    check "card: checklist with the real host ports (80 -> 8080, 443 -> 8443) and the restart hint" eval '
+        card_contains "external TCP port 80 to this Home Assistant host, port 8080" &&
+        card_contains "external TCP port 443 to this Home Assistant host, port 8443" &&
+        card_contains "${ACME_DOMAIN} resolves to your public IP address" &&
+        card_contains "restart the app to retry immediately"'
+    check "card: /api/public-cert = missing, host ports 8080/8443" test \
+        "$(cexec sh -c 'curl -fsS http://127.0.0.1:8099/api/public-cert |
+            jq -r "[.state, .http_host_port, .https_host_port, (.last_error != null)] | map(tostring) | join(\" \")"')" \
+        == "missing 8080 8443 true"
+    check "notify: the monitor raised the notification at the (fake) Supervisor" \
+        wait_for 60 supervisor_got "${NOTE_CREATE}"
+    check "notify: title, token, message with the error, host ports and restart hint" supervisor_got "${NOTE_CREATE}
+        and .authorization == \"Bearer ${SMOKE_SUPERVISOR_TOKEN}\"
+        and .body.title == \"Caddy mTLS: no public certificate for ${ACME_DOMAIN}\"
+        and (.body.message | contains(\"connection refused\") and contains(\"port 8080\")
+             and contains(\"port 8443\") and contains(\"restart the app to retry immediately\"))"
+    sleep 5
+    check "notify: one log line for the state change, one notification (no repeats)" eval '
+        test "$("${DOCKER}" logs "${CTR}" 2>&1 | grep -c "No public certificate for ${ACME_DOMAIN}")" == 1 &&
+        test "$(supervisor_count "${NOTE_CREATE}")" == 1'
+    # Success, simulated: a certificate in Caddy's storage, as Caddy stores
+    # one it obtained (any issuer folder).
+    cexec sh -c 'd=/data/caddy/certificates/smoke-acme/home.example.com && mkdir -p "$d" &&
+        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 90 \
+            -subj "/O=Smoke ACME CA/CN=Smoke R1" -keyout "$d/home.example.com.key" \
+            -out "$d/home.example.com.crt"' >/dev/null 2>&1 || true
+    check "card: green (data-state ok) after the certificate appeared in Caddy's storage" \
+        wait_for 30 card_state_is ok
+    check "card: issuer and expiry of the stored certificate" eval '
+        card_contains "from Smoke ACME CA (Smoke R1)" && card_contains "(89 days)."'
+    check "notify: dismissed at the (fake) Supervisor" wait_for 30 supervisor_got \
+        '.path == "/core/api/services/persistent_notification/dismiss" and .body.notification_id == "caddy_mtls_public_certificate"'
+    check "notify: one log line for the certificate" eval '
+        wait_for 10 logs_contain "Public certificate for ${ACME_DOMAIN}: Smoke ACME CA (Smoke R1)" &&
+        test "$("${DOCKER}" logs "${CTR}" 2>&1 | grep -c "Public certificate for ${ACME_DOMAIN}")" == 1'
+    # A failed renewal after the certificate was stored: yellow.
+    cexec sh -c 'printf "%s\n" "{\"level\":\"error\",\"ts\":$(( $(date +%s) + 2 )),\"logger\":\"tls.renew\",\"msg\":\"could not get certificate from issuer\",\"identifier\":\"home.example.com\",\"error\":\"HTTP 400 urn:ietf:params:acme:error:connection - 192.0.2.1: Timeout during connect (likely firewall problem)\"}" >> /data/caddy/log/acme.log' || true
+    check "card: yellow (data-state renewal_failing) after a failed renewal, with its error" eval '
+        card_state_is renewal_failing && card_contains "renewing it" &&
+        card_contains "connection: 192.0.2.1: Timeout during connect (likely firewall problem)"'
+    check "acme: no admin.api / TLS handshake error lines from the panel's probes" eval '
+        logs_lack "admin.api" && logs_lack "TLS handshake error"'
+    check "acme: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
+else
+    fail "acme: add-on booted"
 fi
 show_log_on_failure "${before}"
 
@@ -662,7 +882,7 @@ dns_case() { # dns_case <provider> <token> <env-var=value...>
     fi
     pass "dns-${provider}: add-on booted (Caddy runs with the dns directive)"
     check "dns-${provider}: Caddyfile renders 'dns ${provider}' with {env.*} placeholders" \
-        eval "cexec grep -E '^ +dns ${provider} ' /etc/caddy/Caddyfile >/dev/null && cexec grep -F '{env.' /etc/caddy/Caddyfile >/dev/null"
+        eval "cexec grep -E '^[[:space:]]+dns ${provider} ' /etc/caddy/Caddyfile >/dev/null && cexec grep -F '{env.' /etc/caddy/Caddyfile >/dev/null"
     check "dns-${provider}: token not in the Caddyfile" \
         eval '! "${DOCKER}" exec -i "${CTR}" grep -F -f /dev/stdin /etc/caddy/Caddyfile <"${secret_file_path}" >/dev/null'
     # Explicit validation with the credentials exported exactly as the caddy
@@ -682,7 +902,7 @@ dns_case() { # dns_case <provider> <token> <env-var=value...>
     check "dns-${provider}: upstream_port unset, no Supervisor API -> homeassistant:8123" \
         eval 'logs_contain "Upstream:    homeassistant:8123 (Core'"'"'s port unknown" &&
         cexec grep -F "reverse_proxy homeassistant:8123 {" /etc/caddy/Caddyfile >/dev/null'
-    check "dns-${provider}: clean docker stop" stop_cleanly
+    check "dns-${provider}: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
     show_log_on_failure "${before}"
 }
 dns_case cloudflare "${CF_TOKEN}" "DNS_API_TOKEN=${CF_TOKEN}"
