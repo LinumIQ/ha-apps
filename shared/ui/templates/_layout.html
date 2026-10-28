@@ -1,0 +1,76 @@
+{#- LinumIQ panel layout - the Jinja2 base template of the add-on ingress panels.
+    Source: shared/ui/templates/_layout.html; scripts/sync-shared.sh copies it to
+    <add-on>/rootfs/usr/lib/<panel>/templates/_layout.html.
+
+    A panel's index.html extends it and fills these blocks:
+      title         <title> (default: the app name)
+      head_extra    extra <head> content
+      app_name      the <h1> of the default header
+      app_subtitle  the paragraph under it
+      header        the whole header (default: the app mark static/brand/icon.svg,
+                    app_name, app_subtitle)
+      flashes       banners above the content
+      content       the page
+      footer_extra  app lines under the LinumIQ logo in the footer
+      scripts       scripts at the end of <body>
+
+    Every URL is relative (static/...): the panels are served under Home
+    Assistant's ingress path. Nothing is loaded from another host; the only
+    absolute URL is the footer's link to linumiq.com. Autoescaping stays on:
+    nothing in the layout is marked safe. -#}
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>{% block title %}{{ self.app_name() }}{% endblock %}</title>
+    <link rel="icon" href="static/brand/icon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="static/shared/linumiq.css" />
+    <link rel="stylesheet" href="static/app.css" />
+    {%- block head_extra %}{% endblock %}
+  </head>
+  <body>
+    <div class="container">
+      {% block header -%}
+      <header class="app-header">
+        <img
+          class="app-header__mark"
+          src="static/brand/icon.svg"
+          alt=""
+          width="48"
+          height="48"
+        />
+        <div class="app-header__text">
+          <h1>{% block app_name %}{% endblock %}</h1>
+          <p>{% block app_subtitle %}{% endblock %}</p>
+        </div>
+      </header>
+      {%- endblock %}
+
+      <main>
+        {% block flashes %}{% endblock %}
+        {% block content %}{% endblock %}
+      </main>
+
+      <footer class="app-footer">
+        <a
+          class="app-footer__brand"
+          href="https://linumiq.com"
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          <img
+            src="static/shared/brand/linumiq-logo.png"
+            alt="LinumIQ"
+            width="180"
+            height="50"
+          />
+          <span class="visually-hidden">(opens in a new tab)</span>
+        </a>
+        {%- block footer_extra %}{% endblock %}
+      </footer>
+    </div>
+    {%- block scripts %}{% endblock %}
+  </body>
+</html>

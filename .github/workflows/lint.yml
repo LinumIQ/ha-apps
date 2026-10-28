@@ -84,6 +84,24 @@ jobs:
         with:
           strict: true
 
+  shared-ui:
+    name: Shared UI in sync
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The panels' shared LinumIQ UI (shared/ui: stylesheet, fonts, logo,
+      # layout template) and each add-on's mark (shared/brand/<add-on>/icon.svg)
+      # are copied into both add-ons, because an add-on's build context is its
+      # own directory. The committed copies must equal a fresh sync.
+      - name: Check the copies
+        run: bash scripts/sync-shared.sh --check
+
   addon-config:
     name: Add-on configuration (${{ matrix.addon }})
     runs-on: ubuntu-latest

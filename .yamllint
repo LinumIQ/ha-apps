@@ -3,6 +3,7 @@ extends: default
 
 ignore: |
   .git/
+  node_modules/
 
 rules:
   document-start: disable

@@ -1,0 +1,3 @@
+# Maintainer tools (npm install in shared/ui) and preview output.
+node_modules/
+preview/out/

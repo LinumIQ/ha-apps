@@ -1,25 +1,12 @@
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="color-scheme" content="light dark" />
-    <title>FRP Tunnel - Pairing Panel</title>
-    <link rel="stylesheet" href="static/style.css" />
-  </head>
-  <body>
-    <div class="container">
-      <header class="app-header">
-        <div class="app-header__icon" aria-hidden="true">🔗</div>
-        <div class="app-header__text">
-          <h1>FRP Tunnel</h1>
-          <p>
-            Pair your Home Assistant instance with your LinumIQ account
-            to make it reachable on the public internet.
-          </p>
-        </div>
-      </header>
+{% extends "_layout.html" %}
+{% block title %}FRP Tunnel - Pairing Panel{% endblock %}
+{% block app_name %}FRP Tunnel{% endblock %}
+{% block app_subtitle -%}
+  Pair your Home Assistant instance with your LinumIQ account to make it
+  reachable on the public internet.
+{%- endblock %}
 
+{% block flashes %}
       {#- Every value below is HTML-escaped (autoescape; nothing is marked safe). Values
           embedded in JavaScript use |tojson. Pairing values (user code,
           link, interval) were validated by config.parse_pairing_response. #}
@@ -61,7 +48,9 @@
         Restart the add-on to stop it.
       </div>
       {% endif %}
+{% endblock %}
 
+{% block content %}
       {# --- STATE: Unpaired (pairing not started) --- #}
       {% if not paired and not pairing_active and not approved_no_tunnel %}
       <section class="card" aria-labelledby="pair-heading">
@@ -70,7 +59,7 @@
           This add-on uses a secure browser-based pairing flow. No manual
           tokens or configuration files are needed.
         </p>
-        <ol class="steps">
+        <ol class="steps" role="list">
           <li>Click <strong>Start Pairing</strong> below.</li>
           <li>
             Open the link shown on screen in your browser (or scan the QR
@@ -84,7 +73,7 @@
           <li>Come back here — your tunnel will be live!</li>
         </ol>
         <form method="post" action="./pair/start">
-          <button class="btn" type="submit">Start Pairing</button>
+          <button class="btn-cta" type="submit">Start Pairing</button>
         </form>
       </section>
       {% endif %}
@@ -112,7 +101,7 @@
             href="{{ verification_uri_complete }}"
             target="_blank"
             rel="noopener noreferrer"
-            class="btn"
+            class="btn-cta"
           >
             Open pairing page &nearr;
           </a>
@@ -383,6 +372,4 @@
         </div>
       </section>
       {% endif %}
-    </div>
-  </body>
-</html>
+{% endblock %}

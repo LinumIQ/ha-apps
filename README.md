@@ -65,10 +65,44 @@ What users get depends on the add-on's `config.yaml`:
   update whose image pull fails (see
   [frp-tunnel/DOCS.md](frp-tunnel/DOCS.md#maintainers-publishing-to-ghcr)).
 
+## Development
+
+Both add-ons' ingress panels share one look (the LinumIQ brand: colours,
+Roboto and Inter, light and dark mode) from one source in this repository:
+
+- [`shared/ui/`](shared/ui) - the shared panel UI: `static/linumiq.css`
+  (design tokens and every generic component), `static/fonts/` (self-hosted
+  Roboto and Inter, latin + latin-ext, licences and `SOURCES.md`),
+  `static/brand/linumiq-logo.png` (the footer logo) and
+  `templates/_layout.html` (the Jinja2 base template of both panels). Each
+  panel keeps its own `static/app.css` and `templates/index.html`. Tools for
+  maintainers (logo rendering, font download, offline previews and
+  screenshots of every panel state) are described in
+  [`shared/ui/README.md`](shared/ui/README.md).
+- [`shared/brand/`](shared/brand) - the brand sources of the add-ons' icons
+  and logos (SVG, with the script that renders `icon.png` / `logo.png`); see
+  [`shared/brand/README.md`](shared/brand/README.md). Each add-on's
+  `shared/brand/<add-on>/icon.svg` is also the mark in its panel header.
+
+An add-on image is built from its own directory only, so the shared files are
+**copied** into the add-ons by [`scripts/sync-shared.sh`](scripts/sync-shared.sh):
+`shared/ui/static/` to `<add-on>/rootfs/usr/lib/<panel>/static/shared/`,
+`shared/ui/templates/_layout.html` to `.../templates/_layout.html` and
+`shared/brand/<add-on>/icon.svg` to `.../static/brand/icon.svg` (`<panel>` is
+`frp-mgr` resp. `cert-mgr`). Never edit the copies (they start with a
+`GENERATED` comment): edit `shared/`, run `scripts/sync-shared.sh` and commit
+the source and the copies together. CI ("Shared UI in sync") runs
+`scripts/sync-shared.sh --check`, which fails and lists the stale files when
+a copy differs.
+
 ## License
 
 Source code in this repository is licensed under the [Apache License 2.0](LICENSE).
-See the [NOTICE](NOTICE) file for required attributions.
+See the [NOTICE](NOTICE) file for required attributions; the bundled fonts
+Roboto and Inter are licensed under the SIL Open Font License 1.1.
+
+The LinumIQ name and logo and the add-on icons are trademarks of LinumIQ and
+not covered by the code licence.
 
 ## Contributing
 

@@ -8,7 +8,8 @@
 # Loads the add-on's profile in enforce mode, boots the image confined by it
 # (like Supervisor does) and exercises every code path that touches files,
 # processes or the network without a LinumIQ backend: s6-overlay start-up,
-# bashio, the panel (health, status, a same-origin POST), the renderer writing
+# bashio, the panel (health, status, a same-origin POST, the page and the
+# shared UI's static files), the renderer writing
 # frpc.toml + the pinned frps CA (root:frpc 0640) and reading Home Assistant's
 # port from a fake Supervisor API (a second, unconfined container reachable
 # as `supervisor`), frpc started as user frpc
@@ -269,6 +270,17 @@ check "frpc log watcher recorded the failed connection" wait_for 30 watcher_saw_
 check "no 'permission denied' in the log" logs_lack "ermission denied"
 code="$(http_code GET /)"
 check "panel page renders (paired, pinned CA; got ${code})" test "${code}" == 200
+# The shared LinumIQ UI (stylesheets, a font, the footer logo, the app mark)
+# is readable under the profile.
+ui_files_served() {
+    local path code
+    for path in /static/shared/linumiq.css /static/app.css /static/shared/fonts/inter-latin.woff2 \
+        /static/shared/brand/linumiq-logo.png /static/brand/icon.svg; do
+        code="$(http_code GET "${path}")"
+        [[ "${code}" == 200 ]] || { log "GET ${path}: ${code}"; return 1; }
+    done
+}
+check "panel serves the shared UI files under ${PROFILE}" ui_files_served
 code="$(http_code POST /unpair -H 'Sec-Fetch-Site: same-origin')"
 gone() { ! cexec test -e /data/frp-state.json && ! cexec test -e /data/frps-ca.pem; }
 check "unpair answered (got ${code})" test "${code}" == 303

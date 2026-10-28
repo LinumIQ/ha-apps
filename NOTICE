@@ -16,3 +16,18 @@ Home Assistant Community Add-ons base image
 Copyright Franck Nijhof and contributors
 Licensed under the MIT License
 https://github.com/hassio-addons/addon-base
+
+Roboto (font, bundled with both add-on panels: shared/ui/static/fonts)
+Copyright 2011 The Roboto Project Authors
+Licensed under the SIL Open Font License, Version 1.1
+(shared/ui/static/fonts/OFL-Roboto.txt)
+https://github.com/googlefonts/roboto-classic
+
+Inter (font, bundled with both add-on panels: shared/ui/static/fonts)
+Copyright (c) 2016 The Inter Project Authors
+Licensed under the SIL Open Font License, Version 1.1
+(shared/ui/static/fonts/OFL-Inter.txt)
+https://github.com/rsms/inter
+
+The LinumIQ name and logo and the add-on icons and logos are trademarks of
+LinumIQ and are not covered by the Apache License of this repository.

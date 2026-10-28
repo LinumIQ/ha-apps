@@ -8,7 +8,9 @@
 # bashio's option cache, as Supervisor would provide them) and checks:
 #   main       mTLS on, domain caddy-mtls-smoke.localhost (Caddy's internal
 #              issuer: a server certificate without any ACME traffic):
-#              the panel (health, dashboard, //, /api/state), the CA and the
+#              the panel (health, dashboard, //, /api/state; the shared
+#              LinumIQ UI: stylesheets, fonts, logo and app mark with their
+#              content types, the layout, no external URLs), the CA and the
 #              seeded clients (files, modes, state.json), the Caddyfile and
 #              Caddy's admin API (leaf verifier), the plain-HTTP site (CRL,
 #              301 to https), real mTLS handshakes, client add / revoke /
@@ -337,7 +339,46 @@ confirm_uses_data_attribute() {
 check "L1: Revoke confirm() takes the client name from a data attribute" confirm_uses_data_attribute
 check "main: GET // (doubled ingress slash) serves the dashboard" \
     eval '[[ "$(dashboard //)" == *"Certificate Authority"* ]]'
-check "main: static stylesheet served" eval 'dashboard /static/style.css >/dev/null'
+# The shared LinumIQ UI (static/shared, static/brand and templates/_layout.html,
+# copied from shared/ by scripts/sync-shared.sh) and the app's stylesheet.
+content_type_is() { # content_type_is <path> <type>
+    [[ "$(cexec curl -fsS --max-time 10 -o /dev/null -w '%{content_type}' "http://127.0.0.1:8099$1" 2>/dev/null)" == "$2"* ]]
+}
+check "main: shared stylesheet served (text/css)" content_type_is /static/shared/linumiq.css text/css
+check "main: app stylesheet served (text/css)" content_type_is /static/app.css text/css
+check "main: app mark served (image/svg+xml)" content_type_is /static/brand/icon.svg image/svg+xml
+check "main: footer logo served (image/png)" content_type_is /static/shared/brand/linumiq-logo.png image/png
+fonts_served() { # every font the shared stylesheet names, as font/woff2
+    local css font n=0
+    css="$(dashboard /static/shared/linumiq.css)" || return 1
+    while IFS= read -r font; do
+        n=$((n + 1))
+        content_type_is "/static/shared/${font}" font/woff2 || { log "font ${font}: not served as font/woff2"; return 1; }
+    done < <(printf '%s\n' "${css}" | grep -oE 'url\("fonts/[^"]+\.woff2"\)' | sed -E 's/^url\("(.*)"\)$/\1/' | sort -u)
+    (( n == 4 ))
+}
+check "main: the 4 fonts of the shared stylesheet served (font/woff2)" fonts_served
+uses_shared_layout() {
+    local html
+    html="$(dashboard /)" || return 1
+    [[ "${html}" == "<!doctype html>"* \
+        && "${html}" == *'href="static/shared/linumiq.css"'*'href="static/app.css"'* \
+        && "${html}" == *'<header class="app-header">'*'src="static/brand/icon.svg"'*'<h1>Caddy mTLS</h1>'* \
+        && "${html}" == *'<footer class="app-footer">'*'href="https://linumiq.com"'*'src="static/shared/brand/linumiq-logo.png"'*"state version"* ]]
+}
+check "main: dashboard uses the shared layout (stylesheets, app mark, footer logo)" uses_shared_layout
+# Nothing is loaded from another host (no Google Fonts, no CDN): the only
+# absolute URL in an attribute is the footer's link to linumiq.com.
+no_external_resources() {
+    local html css urls
+    html="$(dashboard /)$(card)" || return 1
+    css="$(dashboard /static/shared/linumiq.css)$(dashboard /static/app.css)" || return 1
+    urls="$(printf '%s\n' "${html}" | grep -oE '(href|src|srcset|action|poster|data)="([a-zA-Z][a-zA-Z0-9+.-]*:|//)[^"]*"' | sort -u || true)"
+    [[ -z "${urls}" || "${urls}" == 'href="https://linumiq.com"' ]] || { log "absolute URLs: ${urls//$'\n'/ }"; return 1; }
+    ! printf '%s\n' "${html}${css}" | grep -Ei 'fonts\.googleapis|gstatic|@import' >/dev/null \
+        && ! printf '%s\n' "${css}" | grep -E 'https?:|url\(["'"'"']?//' >/dev/null
+}
+check "main: no external resources (dashboard, card, stylesheets)" no_external_resources
 check "main: /api/state lists alice + bob active, CA present" \
     test "$(cexec sh -c 'curl -fsS http://127.0.0.1:8099/api/state | jq -r "([.clients[] | select(.status == \"active\") | .name] | sort | join(\",\")), (.ca != null)"' 2>/dev/null | tr '\n' ' ')" == "alice,bob true "
 
