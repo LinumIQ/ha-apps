@@ -52,7 +52,8 @@ NOW = datetime(2026, 10, 28, 12, 0, tzinfo=timezone.utc).timestamp()
 
 
 # ---------------------------------------------------------------------------
-# frp-tunnel (keys as frp-mgr's app._view_model() returns them)
+# frp-tunnel (keys as frp-mgr's app._view_model() returns them, plus what
+# app.index() adds: the flash texts and the CSRF token)
 # ---------------------------------------------------------------------------
 
 def frp_base(**overrides):
@@ -89,6 +90,7 @@ def frp_base(**overrides):
         "updated_at": "",
         "flash_error": None,
         "flash_ok": None,
+        "csrf_token": "preview-csrf-token",
     }
     ctx.update(overrides)
     return ctx

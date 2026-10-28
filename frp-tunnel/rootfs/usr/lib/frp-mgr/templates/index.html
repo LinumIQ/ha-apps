@@ -9,7 +9,9 @@
 {% block flashes %}
       {#- Every value below is HTML-escaped (autoescape; nothing is marked safe). Values
           embedded in JavaScript use |tojson. Pairing values (user code,
-          link, interval) were validated by config.parse_pairing_response. #}
+          link, interval) were validated by config.parse_pairing_response.
+          Every form carries the panel's CSRF token (hidden field _csrf), the
+          poll script sends it as X-CSRF-Token (app.IngressGuard). #}
       {% if option_errors %}
       <div class="flash flash-error" role="alert">
         <strong>Invalid add-on configuration.</strong>
@@ -73,6 +75,7 @@
           <li>Come back here — your tunnel will be live!</li>
         </ol>
         <form method="post" action="./pair/start">
+          <input type="hidden" name="_csrf" value="{{ csrf_token }}" />
           <button class="btn-cta" type="submit">Start Pairing</button>
         </form>
       </section>
@@ -118,6 +121,7 @@
         </div>
 
         <form method="post" action="./pair/start" class="pairing-reset">
+          <input type="hidden" name="_csrf" value="{{ csrf_token }}" />
           <button class="btn-secondary" type="submit">Restart Pairing</button>
         </form>
       </section>
@@ -127,11 +131,20 @@
           var polling = true;
           var interval = {{ interval | int(5) | tojson }} * 1000;
           var base = ".";
+          // The panel's CSRF token (see the hidden _csrf fields of the forms).
+          var csrf = {{ csrf_token | tojson }};
 
           function poll() {
             if (!polling) return;
-            fetch(base + "/pair/poll", { method: "POST" })
+            fetch(base + "/pair/poll", { method: "POST", headers: { "X-CSRF-Token": csrf } })
               .then(function (r) {
+                if (r.status === 403) {
+                  // Outdated token (the add-on restarted since this page was loaded).
+                  return {
+                    status: "error",
+                    error: "Forbidden: cross-site request. Reload the panel and try again",
+                  };
+                }
                 return r.json();
               })
               .then(function (data) {
@@ -205,6 +218,7 @@
         <p>Paired with <strong>{{ account_email_masked }}</strong>.</p>
         {% endif %}
         <form method="post" action="./subdomain/change" class="form-inline">
+          <input type="hidden" name="_csrf" value="{{ csrf_token }}" />
           <div class="field">
             <label for="first-subdomain">Subdomain</label>
             <input
@@ -222,6 +236,7 @@
         </form>
         <div class="btn-row">
           <form method="post" action="./tunnel/refresh">
+            <input type="hidden" name="_csrf" value="{{ csrf_token }}" />
             <button class="btn-secondary" type="submit">Refresh</button>
           </form>
           <form
@@ -229,6 +244,7 @@
             action="./unpair"
             onsubmit="return confirm('Unpair this device?')"
           >
+            <input type="hidden" name="_csrf" value="{{ csrf_token }}" />
             <button class="btn-danger" type="submit">Unpair</button>
           </form>
         </div>
@@ -325,6 +341,7 @@
             Change Subdomain
           </button>
           <form method="post" action="./tunnel/refresh">
+            <input type="hidden" name="_csrf" value="{{ csrf_token }}" />
             <button
               class="btn-secondary"
               type="submit"
@@ -338,6 +355,7 @@
             action="./unpair"
             onsubmit="return confirm('Unpair this device? The tunnel will stop immediately.')"
           >
+            <input type="hidden" name="_csrf" value="{{ csrf_token }}" />
             <button class="btn-danger" type="submit">Unpair</button>
           </form>
         </div>
@@ -354,6 +372,7 @@
             <code>https://&lt;subdomain&gt;.{{ domain_base }}</code>.
           </p>
           <form method="post" action="./subdomain/change" class="form-inline">
+            <input type="hidden" name="_csrf" value="{{ csrf_token }}" />
             <div class="field">
               <label for="subdomain">New subdomain</label>
               <input
