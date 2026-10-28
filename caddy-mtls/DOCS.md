@@ -12,6 +12,7 @@ This add-on provides a Caddy reverse proxy with mutual TLS (mTLS) authentication
 - 🛠️ **Web Certificate Manager** - add, revoke and regenerate certificates from the ingress UI
 - ♻️ **Certificate Revocation List (CRL)** - revoked clients are rejected on the next handshake without restarts
 - 📅 **Expiration Notifications** - per-cert sensors and persistent notifications as expiry approaches
+- 🚦 **Public certificate status** - the web UI shows whether the Let's Encrypt certificate exists; if not, the last error and a port-forwarding checklist (plus a Home Assistant notification)
 
 ## Requirements
 
@@ -120,7 +121,8 @@ network.
 | `mtls_enabled`              | `true`           | Enable client certificate authentication                                                                                |
 | `client_names`              | `["user"]`       | Client certificate names; a name the add-on does not know yet gets a certificate at every start (see [Adding New Users](#adding-new-users)) |
 | `client_cert_password`      | `LinumIQ`        | Password for .p12 files - set your own; changing it re-encrypts the existing bundles at the next start (see [Changing the certificate password](#changing-the-certificate-password)) |
-| `log_level`                 | `info`           | Add-on / Caddy log verbosity (`trace`, `debug`, `info`, `notice`, `warning`, `error`, `fatal`)                          |
+| `log_level`                 | `info`           | Add-on / Caddy log verbosity (`trace`, `debug`, `info`, `notice`, `warning`, `error`, `fatal`); `debug` and `trace` also turn the access logs on |
+| `access_log`                | `false`          | Log every proxied request (Caddy's access log, ~1.5 KB per request); see [Logs](#logs)                                  |
 | `cert_expiry_warn_days`     | `[30, 14, 7, 1]` | List of days-before-expiry thresholds at which to fire a notification (one notification per crossed threshold per cert) |
 | `cert_check_interval_hours` | `6`              | How often the `cert-monitor` service polls certificate metadata and publishes sensor states (`1`-`168`)                 |
 
@@ -287,11 +289,59 @@ Certificates are also available at:
 3. Click **Import** and select the .p12 file
 4. Enter the certificate password
 
+## Public certificate status (since 2.0.1)
+
+The first card of the web interface shows the state of the server
+certificate that Caddy gets from Let's Encrypt for your `domain` (the one
+browsers see; not the mTLS client certificates). It reloads itself every
+30 seconds:
+
+- **Valid** (green): issuer, expiry date and days left, and whether Caddy
+  serves this certificate on port 443 right now. Caddy renews it
+  automatically.
+- **Requesting** (blue): the add-on has just started and Caddy is asking
+  Let's Encrypt for a certificate - usually less than a minute.
+- **Missing** (red): no certificate yet (or the stored one expired) -
+  `<domain>` is not reachable over HTTPS. The card shows Let's Encrypt's
+  last error with its time (for example `connection: 203.0.113.7: Fetching
+  http://<domain>/.well-known/acme-challenge/...: Connection refused` when
+  the router does not forward port 80 yet), the result of each challenge
+  type, and a checklist with **this add-on's real host ports**: the router
+  forwards external TCP 80 to `<HA host>:8080` and TCP 443 to
+  `<HA host>:8443` (or the ports you set in the Network settings), the domain
+  resolves to your public IP address, no other device answers on those
+  ports, Home Assistant itself does not use host ports 80/443 if you gave
+  them to the add-on, and the connection has a public IPv4 address (no
+  carrier-grade NAT / DS-Lite). Caddy retries on its own with growing delays
+  (1, 2, 2, 5, 10 minutes, ...); **after fixing the forwarding, restart the
+  add-on to retry immediately**.
+- **Renewal failing** (yellow): the certificate is still valid, but Caddy
+  could not renew it - the same error and checklist; fix it before the
+  certificate expires.
+
+While there is no certificate, the `cert-monitor` service checks every
+minute (also during the first 30 minutes after every start) and, after two
+minutes without a certificate, raises a Home Assistant notification **"Caddy
+mTLS: no public certificate for `<domain>`"** with the last error and the
+same checklist. It dismisses the notification as soon as the certificate
+exists. The add-on log gets one line when the state changes, e.g. `No public
+certificate for <domain> after 2 minutes - last error: ...` and later
+`Public certificate for <domain>: Let's Encrypt (E7), valid until ...`.
+
+Sources: the certificate in Caddy's storage
+(`/data/caddy/certificates/<issuer>/<domain>/<domain>.crt`) and Caddy's
+certificate events, which it also writes to `/data/caddy/log/acme.log` (JSON,
+readable only inside the add-on, rotated at 1 MB). Only events since the
+current start count.
+
 ## Web Certificate Manager
 
 The ingress panel exposes a dashboard with the following capabilities (all
 require an authenticated Home Assistant admin session and are restricted to
 the Supervisor ingress IP):
+
+- **Public certificate** - the card described in
+  [Public certificate status](#public-certificate-status-since-201).
 
 - **Add a client** - issues a new client certificate, adds it to the
   active allowlist and reloads Caddy in-place. A name has 1-64 characters
@@ -390,6 +440,58 @@ the state.
 
 ## Troubleshooting
 
+### No public certificate / "not reachable over HTTPS"
+
+Open the add-on's web interface: the **Public certificate** card shows the
+last error from Let's Encrypt and a checklist with the host ports to forward
+(see [Public certificate status](#public-certificate-status-since-201)).
+`connection` errors such as `Connection refused` or `Timeout during connect`
+mean Let's Encrypt could not reach the add-on through the router; `dns`
+errors mean the domain does not resolve to your public IP address. Restart
+the add-on after fixing it - Caddy would otherwise wait for its next retry.
+
+### The add-on shows "Start" although it is running / restarts by itself
+
+Home Assistant offers **Stop** only while the add-on is in the state
+`started`. It derives the state from Docker:
+
+- `startup` right after every (re)start, until the first successful health
+  check - the add-on page shows **Start** during this time. The health check
+  probes Caddy's admin API and the web interface; during the first two
+  minutes Docker runs it every 5 seconds, so this normally lasts 5 seconds.
+- `started` after the first successful health check. A failing health check
+  (since 2.0.1: 5 failures in a row, checked once a minute) leaves the state
+  at `started`, but marks the add-on **unhealthy**.
+- `stopped` (exit code 0) or `error` (any other exit code) when the
+  container has ended.
+
+So a page that switches between Start and Stop means that the add-on really
+restarts. The usual reason is the **Watchdog** switch on the add-on's Info
+page: the Supervisor restarts an add-on that is unhealthy or has stopped on
+its own. Look at **Settings > System > Logs > Supervisor** for lines such as
+
+- `Watchdog found app Caddy mTLS Proxy is unhealthy, restarting...`
+- `Watchdog found app Caddy mTLS Proxy exited with code 137, restarting...`
+  and `App Caddy mTLS Proxy exited with non-zero exit code 137` (a crash)
+- `Watchdog found app Caddy mTLS Proxy is stopped, restarting...` (the
+  container ended with exit code 0 without a stop request - up to 2.0.0 also
+  after a Caddy crash)
+
+and at the add-on log for the reason (a new start begins with the banner
+`App: Caddy mTLS Proxy`). Since 2.0.1 a Caddy crash ends the add-on with
+Caddy's exit code (128 + signal number when it was killed, e.g. 137), so
+the Supervisor shows `error` instead of a normal stop; before, a crash looked
+like a stop (exit code 0) and was restarted silently by the Watchdog.
+
+### Stopping takes long or logs s6 warnings
+
+A stop takes a few seconds: s6 stops Caddy (which gives open requests up to
+10 seconds), the web interface and the monitor, then the init service. The
+Supervisor waits up to 60 seconds (`timeout` in the add-on configuration)
+before it kills the container. Warnings such as `finish script lifetime
+reached maximum value` or `unable to stop service init-caddy: command exited
+111` appeared on every stop up to 2.0.0 and are fixed in 2.0.1.
+
 ### "Connection refused" errors
 
 - Ensure the external ports 80 and 443 are forwarded to the add-on's host
@@ -439,6 +541,13 @@ The image can be started without Supervisor (this is what the smoke tests in
   test CA such as Pebble. Only plain `http(s)://` URLs are accepted.
 - `ALLOWED_INGRESS_IPS` (environment variable, default `172.30.32.2,127.0.0.1`):
   the client addresses the certificate manager panel answers.
+- `SUPERVISOR_URL` (environment variable, test-only, default
+  `http://supervisor`): where the `cert-monitor` sends sensors and
+  notifications; with `SUPERVISOR_TOKEN` the smoke tests point it at a fake
+  Supervisor inside the container (`tests/fake-supervisor.py`).
+  `CERT_MONITOR_PUBLIC_CERT_GRACE_SECONDS` (default 120) and
+  `CERT_MONITOR_FAST_INTERVAL_SECONDS` (default 60) shorten the public
+  certificate notification's delay and check interval for the tests.
 
 Tests (both need docker; run them against an image built from this directory):
 
@@ -458,16 +567,23 @@ python3 -m unittest discover -s caddy-mtls/tests/unit -v
   does them (a new container with the previous `/data`: new and invalid
   `client_names`, a changed `client_cert_password`), `mtls_enabled: false`,
   one start per DNS provider (dummy tokens; the rendered `dns` directive must
-  pass `caddy validate` and Caddy must run with it) and the log hygiene.
+  pass `caddy validate` and Caddy must run with it), the log hygiene (no
+  access log by default, silent health probes, `access_log: true`), the
+  "Public certificate" card in all states and its notification at a fake
+  Supervisor, clean stops (< 10 s, exit code 0, no s6 warnings) and a Caddy
+  crash (the add-on ends with exit code 137).
   Prints PASS/FAIL per check; exit 0 = all passed, 1 = a check failed,
   2 = usage error.
 - `tests/apparmor-smoke.sh <image> <apparmor.txt>` (needs root or sudo and an
   AppArmor kernel) loads the profile in enforce mode, boots the image under
-  it, adds and revokes a client, restarts it with a new client name and a new
-  `client_cert_password` and fails on any AppArmor denial (kernel log and,
-  if auditd runs, the audit log).
+  it, adds and revokes a client, shows the "Public certificate" card, raises
+  and dismisses the notification at a fake Supervisor, restarts it with a new
+  client name and a new `client_cert_password` and fails on any AppArmor
+  denial (kernel log and, if auditd runs, the audit log).
 - `tests/unit/` (standard library only, also run by CI): the expiry
-  monitor's entity ids and notification thresholds.
+  monitor's entity ids and notification thresholds, the public certificate
+  state (Caddy's log events, storage, checklist) and the notification's
+  state machine with a mocked Supervisor.
 
 ## Maintainers: Python dependencies
 
@@ -486,6 +602,22 @@ View add-on logs in Home Assistant:
 
 1. Go to **Settings → Add-ons → Caddy mTLS Proxy**
 2. Click the **Log** tab
+
+What the log shows with the default `log_level: info` (since 2.0.1):
+
+- the start-up (options, certificates, the published host ports), Caddy's
+  messages including every certificate event (obtaining, renewing, errors),
+  warnings and errors, and one line per change of the public certificate
+  state;
+- **not** every request: Caddy's access log (`handled request`, about
+  1.5 KB per request - opening the Home Assistant frontend through the proxy
+  makes several hundred) is off unless `access_log: true`; the health checks
+  (Caddy's admin API, the web interface) and the web interface's own
+  requests are not logged; `openssl` no longer prints each issued client
+  certificate.
+
+`log_level: debug` (or `trace`) turns all of these on again, including the
+access logs.
 
 ## Support
 

@@ -9,7 +9,8 @@ A Home Assistant add-on that provides a Caddy reverse proxy with mutual TLS (mTL
 
 - 🔒 **Automatic HTTPS** - Let's Encrypt certificates with automatic renewal
 - 🔐 **mTLS Authentication** - Require client certificates for access
-- 📱 **Easy Distribution** - Web interface with QR codes for mobile certificate download
+- 📱 **Easy Distribution** - certificate downloads in the add-on's web interface (Home Assistant sidebar, administrators only)
+- 🚦 **Certificate status** - the web interface shows whether the Let's Encrypt certificate exists, and if not, the last error and what to check in the router; a Home Assistant notification while it is missing
 - 🌐 **DNS Challenge Support** - Cloudflare, Route53, and Hetzner for when port 80 is unavailable
 - 👥 **Multiple Users** - Generate individual certificates for each user/device
 - 🏠 **Home Assistant Native** - Full integration with HA add-on system
@@ -58,6 +59,10 @@ ca_common_name: Home Assistant mTLS CA
 # DNS challenge (optional, for when port 80 is blocked)
 acme_dns_provider: none # or: cloudflare, route53, hetzner
 dns_api_token: ""
+
+# Logging: Caddy's access log (one line per request) is off by default
+log_level: info
+access_log: false
 ```
 
 ## Network Requirements
