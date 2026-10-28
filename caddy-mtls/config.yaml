@@ -94,8 +94,10 @@ schema:
   ca_locality: str
   ca_organization: str
   ca_common_name: str
+  # 1-64 characters (letters, digits, ".", "_", "-"), not starting with a
+  # dot - the same rule as init-caddy and the certificate manager panel.
   client_names:
-    - str
+    - "match(^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$)"
   client_cert_password: password
   acme_dns_provider: list(none|cloudflare|route53|hetzner)
   dns_api_token: password?

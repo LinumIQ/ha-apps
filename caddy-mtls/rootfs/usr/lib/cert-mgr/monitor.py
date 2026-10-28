@@ -13,13 +13,22 @@ certificate, and:
 
 Failure to reach the Supervisor never crashes the loop - we log and try
 again on the next iteration.
+
+Entity ids: Home Assistant accepts only ``[a-z0-9_]`` object ids without a
+leading / trailing ``_`` and without ``__``, so a client's sensor is
+``sensor.caddy_mtls_client_<slug>_expiry`` with ``<slug>`` from
+``client_entity_slugs`` (e.g. ``alice-phone`` -> ``alice_phone``); the raw
+client name stays in the friendly name.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import re
 import time
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -47,6 +56,52 @@ THRESHOLDS = sorted(
 NOTIFIED_FILE = Path(
     os.environ.get("CERT_MONITOR_NOTIFIED_FILE", "/data/cert-monitor.notified.json")
 )
+
+
+_SLUG_SEPARATORS = re.compile(r"[^a-z0-9]+")
+
+
+def entity_slug(name: str) -> str:
+    """Object-id slug of a client name for a Home Assistant entity id.
+
+    Lowercase; every run of characters other than ``[a-z0-9]`` becomes one
+    ``_`` (so ``__`` cannot occur); no leading or trailing ``_``. May be
+    empty (e.g. for ``"_"``) - see ``client_entity_slugs``.
+    """
+    return _SLUG_SEPARATORS.sub("_", name.lower()).strip("_")
+
+
+def client_entity_slugs(names: Iterable[str]) -> dict[str, str]:
+    """A unique entity-id slug per client name.
+
+    Names are taken in the given order (state.json order, revoked clients
+    included, so a client's sensor keeps its id when another one is revoked
+    or added later): the first name with a slug gets the plain slug; a later
+    name with the same slug, or a name without any ``[a-z0-9]`` character,
+    gets a short hash of the raw name appended (``alice-phone`` after
+    ``alice.phone``: ``alice_phone_66287d``).
+    """
+    slugs: dict[str, str] = {}
+    used: set[str] = set()
+    for name in names:
+        if name in slugs:
+            continue
+        base = entity_slug(name)
+        slug = base
+        if not slug or slug in used:
+            digest = hashlib.sha256(name.encode("utf-8", "surrogatepass")).hexdigest()
+            prefix = f"{base}_" if base else ""
+            slug = next(
+                (
+                    candidate
+                    for candidate in (prefix + digest[:n] for n in range(6, len(digest) + 1))
+                    if candidate not in used
+                ),
+                f"{prefix}{digest}_{len(used)}",
+            )
+        used.add(slug)
+        slugs[name] = slug
+    return slugs
 
 
 def _read_state() -> dict[str, Any]:
@@ -178,15 +233,24 @@ def _process_once() -> bool:
     notified = _read_notified()
     any_published = False
 
-    items: list[tuple[str, str, dict[str, Any]]] = []
+    # (key, entity-id slug, friendly name, metadata). The key (raw client
+    # name) identifies the certificate in the notified file.
+    items: list[tuple[str, str, str, dict[str, Any]]] = []
     if state.get("ca"):
-        items.append(("ca", "CA", state["ca"]))
-    for c in state.get("clients", []):
+        items.append(("ca", "ca", "CA", state["ca"]))
+    clients = [
+        c
+        for c in state.get("clients", [])
+        if isinstance(c, dict) and isinstance(c.get("name"), str) and c["name"]
+    ]
+    slugs = client_entity_slugs(c["name"] for c in clients)
+    for c in clients:
         if c.get("status") == "active":
-            items.append((f"client_{c['name']}", f"client {c['name']}", c))
+            name = c["name"]
+            items.append((f"client_{name}", f"client_{slugs[name]}", f"client {name}", c))
 
     new_notified = dict(notified)
-    for slug, friendly, meta in items:
+    for key, slug, friendly, meta in items:
         days_left = _days_until(meta.get("not_after"))
         if days_left is None:
             continue
@@ -194,7 +258,7 @@ def _process_once() -> bool:
             any_published = True
 
         # Identify cert by serial so rotation resets the notification state.
-        identity = f"{slug}:{meta.get('serial','')}"
+        identity = f"{key}:{meta.get('serial','')}"
         last = notified.get(identity)
         threshold = _crossed_threshold(days_left, last)
         if threshold is not None:
@@ -211,7 +275,7 @@ def _process_once() -> bool:
             new_notified[identity] = threshold
 
     # Drop entries whose identity is no longer present (cert rotated/removed).
-    current_ids = {f"{slug}:{meta.get('serial','')}" for slug, _, meta in items}
+    current_ids = {f"{key}:{meta.get('serial','')}" for key, _, _, meta in items}
     new_notified = {k: v for k, v in new_notified.items() if k in current_ids}
     if new_notified != notified:
         _write_notified(new_notified)

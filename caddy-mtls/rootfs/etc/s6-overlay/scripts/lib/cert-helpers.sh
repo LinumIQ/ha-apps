@@ -98,7 +98,6 @@ generate_client_cert() {
     local client_csr="${CERT_DIR}/mTLS-client-${client_name}.csr"
     local client_crt="${CERT_DIR}/mTLS-client-${client_name}.crt"
     local client_p12="${CERT_DIR}/mTLS-client-${client_name}.p12"
-    local ca_crt="${CERT_DIR}/mTLS-CA.crt"
 
     init_ca_db
 
@@ -122,14 +121,7 @@ generate_client_cert() {
         -out "${client_crt}" \
         || _ch_die "Failed to sign client certificate for '${client_name}'"
 
-    if ! openssl pkcs12 -export \
-            -out "${client_p12}" \
-            -inkey "${client_key}" \
-            -in "${client_crt}" \
-            -certfile "${ca_crt}" \
-            -name "${client_name}" \
-            -passout "pass:${CLIENT_CERT_PASSWORD}" \
-            -legacy; then
+    if ! _ch_export_p12 "${client_name}" "${client_p12}"; then
         _ch_die "Failed to export PKCS#12 for '${client_name}'"
     fi
 
@@ -140,38 +132,143 @@ generate_client_cert() {
 }
 
 ###############################################################################
-# Revoke a certificate by serial number (hex, no 0x prefix, uppercase).
+# Export a client's PKCS#12 bundle (key + certificate + CA certificate),
+# encrypted with CLIENT_CERT_PASSWORD. openssl reads the password from the
+# environment, never from its command line (visible in /proc). `-legacy`
+# (RC2/3DES): older Apple / Android importers need it; OpenSSL 3 opens such
+# a bundle only with `-legacy` as well.
+# Arguments:
+#   $1 - client name
+#   $2 - output file
 ###############################################################################
-revoke_cert_by_serial() {
-    local serial="$1"
-    local reason="${2:-unspecified}"
-    local newcert_pem="${CERT_DIR}/ca-db/newcerts/${serial}.pem"
+_ch_export_p12() {
+    local client_name="$1" out="$2"
+    CLIENT_CERT_PASSWORD="${CLIENT_CERT_PASSWORD:-}" openssl pkcs12 -export \
+        -out "${out}" \
+        -inkey "${CERT_DIR}/mTLS-client-${client_name}.key" \
+        -in "${CERT_DIR}/mTLS-client-${client_name}.crt" \
+        -certfile "${CERT_DIR}/mTLS-CA.crt" \
+        -name "${client_name}" \
+        -passout env:CLIENT_CERT_PASSWORD \
+        -legacy
+}
 
-    # Normalize CRL reason: openssl wants camelCase RFC 5280 names.
-    case "${reason}" in
-        unspecified|keyCompromise|CACompromise|affiliationChanged|superseded|cessationOfOperation|certificateHold|removeFromCRL)
-            : ;;
-        key_compromise|key-compromise) reason="keyCompromise" ;;
-        ca_compromise|ca-compromise) reason="CACompromise" ;;
-        affiliation_changed|affiliation-changed) reason="affiliationChanged" ;;
-        cessation_of_operation|cessation-of-operation) reason="cessationOfOperation" ;;
-        certificate_hold|certificate-hold) reason="certificateHold" ;;
-        remove_from_crl|remove-from-crl) reason="removeFromCRL" ;;
-        *) reason="unspecified" ;;
-    esac
+###############################################################################
+# Does the client's .p12 bundle exist and open with the current
+# CLIENT_CERT_PASSWORD? (Without `-legacy`, OpenSSL 3 cannot decrypt the
+# RC2-40 certificate bag even with the right password.)
+# Arguments:
+#   $1 - client name
+###############################################################################
+client_p12_opens() {
+    local client_p12="${CERT_DIR}/mTLS-client-$1.p12"
+    [[ -s "${client_p12}" ]] || return 1
+    CLIENT_CERT_PASSWORD="${CLIENT_CERT_PASSWORD:-}" openssl pkcs12 -legacy -noout \
+        -in "${client_p12}" -passin env:CLIENT_CERT_PASSWORD >/dev/null 2>&1
+}
 
-    if [[ ! -f "${newcert_pem}" ]]; then
-        _ch_log "WARNING: newcerts file '${newcert_pem}' missing; cannot revoke serial ${serial}"
+###############################################################################
+# Re-export a client's .p12 bundle from its key and certificate with the
+# current CLIENT_CERT_PASSWORD (replaced atomically, mode 600). Returns 1 and
+# leaves the bundle as it was if the key or certificate is missing or the
+# export fails.
+# Arguments:
+#   $1 - client name
+###############################################################################
+reencrypt_client_p12() {
+    local client_name="$1"
+    local client_key="${CERT_DIR}/mTLS-client-${client_name}.key"
+    local client_crt="${CERT_DIR}/mTLS-client-${client_name}.crt"
+    local client_p12="${CERT_DIR}/mTLS-client-${client_name}.p12"
+    local tmp="${client_p12}.tmp"
+
+    [[ -s "${client_key}" && -s "${client_crt}" ]] || return 1
+    rm -f "${tmp}"
+    if ! _ch_export_p12 "${client_name}" "${tmp}" >/dev/null 2>&1; then
+        rm -f "${tmp}"
         return 1
     fi
+    chmod 600 "${tmp}"
+    mv -f "${tmp}" "${client_p12}"
+}
 
-    local out
+###############################################################################
+# Is this a valid client name? 1-64 characters: letters, digits, '.', '_'
+# and '-', not starting with a dot (no "." / ".." / hidden files). The same
+# rule as the client_names option's schema (config.yaml) and the panel
+# (app.py, CLIENT_NAME_RE).
+# Arguments:
+#   $1 - client name
+###############################################################################
+client_name_valid() {
+    local LC_ALL=C
+    [[ "$1" =~ ^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$ ]]
+}
+
+###############################################################################
+# Is a serial (uppercase hex) marked revoked in the CA database?
+###############################################################################
+cert_serial_revoked() {
+    local index="${CERT_DIR}/ca-db/index.txt"
+    [[ -f "${index}" ]] || return 1
+    awk -F '\t' -v serial="$1" \
+        '$1 == "R" && toupper($4) == serial { found = 1 } END { exit !found }' "${index}"
+}
+
+###############################################################################
+# Can a client certificate found on disk be adopted as it is (a client the
+# state file does not know, e.g. after an interrupted issuance)? Its key and
+# certificate exist, the certificate verifies against the current CA and it
+# is not revoked in the CA database. (The .p12 bundle is checked separately,
+# see client_p12_opens / reencrypt_client_p12.)
+# Arguments:
+#   $1 - client name
+###############################################################################
+client_cert_reusable() {
+    local client_crt="${CERT_DIR}/mTLS-client-$1.crt"
+    local serial
+    [[ -s "${client_crt}" && -s "${CERT_DIR}/mTLS-client-$1.key" ]] || return 1
+    openssl verify -CAfile "${CERT_DIR}/mTLS-CA.crt" "${client_crt}" >/dev/null 2>&1 || return 1
+    serial="$(cert_serial_hex "${client_crt}")" || return 1
+    ! cert_serial_revoked "${serial}"
+}
+
+###############################################################################
+# Normalise a CRL reason: openssl wants the camelCase RFC 5280 names.
+###############################################################################
+_ch_crl_reason() {
+    case "$1" in
+        unspecified|keyCompromise|CACompromise|affiliationChanged|superseded|cessationOfOperation|certificateHold|removeFromCRL)
+            printf '%s' "$1" ;;
+        key_compromise|key-compromise) printf 'keyCompromise' ;;
+        ca_compromise|ca-compromise) printf 'CACompromise' ;;
+        affiliation_changed|affiliation-changed) printf 'affiliationChanged' ;;
+        cessation_of_operation|cessation-of-operation) printf 'cessationOfOperation' ;;
+        certificate_hold|certificate-hold) printf 'certificateHold' ;;
+        remove_from_crl|remove-from-crl) printf 'removeFromCRL' ;;
+        *) printf 'unspecified' ;;
+    esac
+}
+
+###############################################################################
+# Revoke a certificate file in the CA database. `openssl ca -revoke` also
+# takes a certificate whose serial the database does not hold (no
+# ca-db/newcerts copy, e.g. issued before the CA database existed): it adds
+# the entry and revokes it in one step.
+# Arguments:
+#   $1 - certificate file (PEM) issued by this CA
+#   $2 - CRL reason (default: unspecified)
+###############################################################################
+revoke_cert_file() {
+    local cert="$1" reason serial out
+    reason="$(_ch_crl_reason "${2:-unspecified}")"
+    serial="$(cert_serial_hex "${cert}")" || serial="?"
     if ! out="$(SAN_DNS="DNS:none" CRL_DOMAIN="none" \
             openssl ca -batch \
                 -config "${OPENSSL_CA_CNF}" \
-                -revoke "${newcert_pem}" \
+                -revoke "${cert}" \
                 -crl_reason "${reason}" 2>&1)"; then
-        if printf '%s' "${out}" | grep -qi 'Already revoked'; then
+        if [[ "${out}" == *"lready revoked"* ]]; then
             _ch_log "Serial ${serial} already revoked"
             return 0
         fi
@@ -180,6 +277,27 @@ revoke_cert_by_serial() {
     fi
     _ch_log "Revoked serial ${serial} (reason: ${reason})"
     return 0
+}
+
+###############################################################################
+# Revoke a certificate by serial number (uppercase hex, no 0x prefix) through
+# the CA database's copy in ca-db/newcerts - the fallback when the client's
+# own certificate file is gone.
+###############################################################################
+revoke_cert_by_serial() {
+    local serial="$1"
+    local reason="${2:-unspecified}"
+    local newcert_pem="${CERT_DIR}/ca-db/newcerts/${serial}.pem"
+
+    if [[ ! "${serial}" =~ ^[0-9A-F]+$ ]]; then
+        _ch_log "WARNING: invalid serial '${serial}'"
+        return 1
+    fi
+    if [[ ! -f "${newcert_pem}" ]]; then
+        _ch_log "WARNING: newcerts file '${newcert_pem}' missing; cannot revoke serial ${serial}"
+        return 1
+    fi
+    revoke_cert_file "${newcert_pem}" "${reason}"
 }
 
 ###############################################################################
@@ -212,26 +330,33 @@ cert_serial_hex() {
 }
 
 ###############################################################################
-# Revoke a client certificate by name.
+# Revoke a client certificate by name and remove it from the active/
+# allowlist. The client's own certificate file is revoked; without it, the
+# CA database's copy of the given serial (ca-db/newcerts). With neither, the
+# serial cannot be added to the CRL: a warning is logged and the client is
+# still removed from the allowlist (which is what Caddy enforces).
+# Arguments:
+#   $1 - client name
+#   $2 - CRL reason (default: unspecified)
+#   $3 - the client's serial from state.json (optional; used only when the
+#        certificate file is missing)
 ###############################################################################
 revoke_client_by_name() {
     local client_name="$1"
     local reason="${2:-unspecified}"
+    local serial="${3:-}"
     local client_crt="${CERT_DIR}/mTLS-client-${client_name}.crt"
     local active_pem="${CERT_DIR}/active/mTLS-client-${client_name}.pem"
     local active_crt_legacy="${CERT_DIR}/active/mTLS-client-${client_name}.crt"
 
-    if [[ ! -f "${client_crt}" ]]; then
-        _ch_log "Client cert '${client_name}' not found, removing from active dir if present"
-        rm -f "${active_pem}" "${active_crt_legacy}"
-        return 0
+    if [[ -f "${client_crt}" ]]; then
+        revoke_cert_file "${client_crt}" "${reason}" || return 1
+    elif [[ "${serial}" =~ ^[0-9A-F]+$ && -f "${CERT_DIR}/ca-db/newcerts/${serial}.pem" ]]; then
+        _ch_log "Client cert '${client_name}' not found, revoking serial ${serial} via the CA database copy"
+        revoke_cert_by_serial "${serial}" "${reason}" || return 1
+    else
+        _ch_log "WARNING: no certificate file for client '${client_name}' (serial ${serial:-unknown}): it cannot be added to the CRL; removing it from the active allowlist"
     fi
-
-    local serial
-    serial="$(cert_serial_hex "${client_crt}")" \
-        || { _ch_log "Could not parse serial of '${client_crt}'"; return 1; }
-
-    revoke_cert_by_serial "${serial}" "${reason}" || return 1
     rm -f "${active_pem}" "${active_crt_legacy}"
     return 0
 }

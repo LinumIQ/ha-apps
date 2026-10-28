@@ -118,8 +118,8 @@ network.
 | `upstream_host`             | `homeassistant`  | Backend service hostname                                                                                                |
 | `upstream_port`             | (unset)          | Backend service port. Unset with `upstream_host: homeassistant`: Home Assistant Core's own port, read from the Supervisor (80 on new Home Assistant OS installations since 2026.8, 8123 on older ones). Required for any other `upstream_host` |
 | `mtls_enabled`              | `true`           | Enable client certificate authentication                                                                                |
-| `client_names`              | `["user"]`       | List of client certificate names                                                                                        |
-| `client_cert_password`      | `LinumIQ`        | Password for .p12 files                                                                                                 |
+| `client_names`              | `["user"]`       | Client certificate names; a name the add-on does not know yet gets a certificate at every start (see [Adding New Users](#adding-new-users)) |
+| `client_cert_password`      | `LinumIQ`        | Password for .p12 files - set your own; changing it re-encrypts the existing bundles at the next start (see [Changing the certificate password](#changing-the-certificate-password)) |
 | `log_level`                 | `info`           | Add-on / Caddy log verbosity (`trace`, `debug`, `info`, `notice`, `warning`, `error`, `fatal`)                          |
 | `cert_expiry_warn_days`     | `[30, 14, 7, 1]` | List of days-before-expiry thresholds at which to fire a notification (one notification per crossed threshold per cert) |
 | `cert_check_interval_hours` | `6`              | How often the `cert-monitor` service polls certificate metadata and publishes sensor states (`1`-`168`)                 |
@@ -294,44 +294,71 @@ require an authenticated Home Assistant admin session and are restricted to
 the Supervisor ingress IP):
 
 - **Add a client** - issues a new client certificate, adds it to the
-  active allowlist and reloads Caddy in-place. Names must match
-  `[A-Za-z0-9._-]+`. Duplicate names are rejected with HTTP 409.
+  active allowlist and reloads Caddy in-place. A name has 1-64 characters
+  (letters, digits, `.`, `_`, `-`) and does not start with a dot - the same
+  rule as for `client_names`. A name that already exists (also a revoked
+  one) is rejected with an error message.
 - **Revoke a client** - revokes the cert in the CA database, regenerates
   the CRL, removes the client from the active allowlist and reloads
   Caddy. Subsequent handshakes from that client are rejected.
 - **Regenerate a client** - revokes the old serial (it remains in the
   CRL) and issues a fresh certificate under the same name.
-- **Regenerate the CA** - destructive: invalidates every existing
-  client certificate. Requires you to type `REGENERATE-CA` in the
-  confirmation field; any other value returns HTTP 400.
+- **Regenerate the CA** - destructive: a new CA, new certificates for the
+  active clients; every existing client bundle stops working. Revoked
+  clients stay revoked (they stay in the list as history and are not
+  re-issued). Requires you to type `REGENERATE-CA` in the confirmation
+  field; any other value is rejected with an error message.
 - **Downloads** - CA certificate, CRL and per-client `.p12` bundles.
 
 ## Adding New Users
 
-The recommended path is the Web Certificate Manager (above). The legacy
-`client_names` option is still honoured: any name listed there is
-ensured at start-up. To add a user permanently via configuration:
+The recommended path is the Web Certificate Manager (above): no restart is
+needed. The `client_names` option works as well - at every start, the
+add-on issues a certificate for each listed name it does not know yet:
 
 1. Go to the add-on configuration
 2. Add new names to the `client_names` list
 3. Restart the add-on
 4. Download the new certificates from the web interface
 
+Names have 1-64 characters (letters, digits, `.`, `_`, `-`) and do not
+start with a dot; Supervisor refuses the configuration otherwise. The
+option never revokes anything: removing a name keeps its certificate valid
+(use **Revoke** in the panel), and a listed name whose client was revoked
+is skipped with a warning in the log - a revoked name is never issued
+again, so pick a new name for a replacement device.
+
+## Changing the certificate password
+
+`client_cert_password` protects the `.p12` bundles (the default `LinumIQ` is
+public - set your own). After you change it, the add-on checks at the next
+start whether each active client's bundle opens with the new password and
+re-encrypts every one that does not (the log shows one line per bundle);
+the copies in the add-on's `certs` folder in `/addon_configs/` are refreshed
+too. Download the bundles again and give your users the new password -
+bundles they downloaded before keep the old one.
+
 ## Certificate Revocation
 
 ### Revoking a single client (recommended)
 
-Use the **Revoke** button in the Web Certificate Manager. The client's
-serial is added to the CRL served at
-`http://<your-domain>/mTLS-CA.crl` and Caddy is reloaded immediately.
+Use the **Revoke** button in the Web Certificate Manager. The client is
+removed from the allowlist of accepted certificates and Caddy is reloaded
+immediately, so its next connection is refused; its serial is added to the
+CRL served at `http://<your-domain>/mTLS-CA.crl`.
 
 ### Revoking all client certificates
 
 If you have lost control of the CA itself (e.g. compromised key), use
 **Regenerate CA** in the Web Certificate Manager (typed confirmation
-required). This rotates the CA, invalidates every existing client
-certificate, and re-issues fresh certs for
-client bundles.
+required). This creates a new CA, invalidates every existing client
+bundle and issues new certificates for the **active** clients - download
+and distribute them again. Revoked clients stay revoked; revoke the clients
+you want to drop for good before regenerating the CA.
+
+Deleting files in the add-on's `certs` folder in `/addon_configs/` or
+removing names from `client_names` revokes nothing: that folder only holds
+copies for download.
 
 ## Expiration Notifications
 
@@ -340,7 +367,16 @@ sensor entity per certificate to Home Assistant via the Supervisor
 proxy:
 
 - `sensor.caddy_mtls_ca_expiry`
-- `sensor.caddy_mtls_client_<name>_expiry`
+- `sensor.caddy_mtls_client_<slug>_expiry` for each active client
+
+Home Assistant entity ids allow only lowercase letters, digits and single
+underscores, so `<slug>` is the client name in lowercase with every run of
+other characters replaced by `_` (no `_` at the start or end): `alice-phone`
+and `Alice.Phone` become `alice_phone`, i.e.
+`sensor.caddy_mtls_client_alice_phone_expiry`. If two clients end up with the
+same slug, the one created later gets a short hash of its name appended
+(`Alice.Phone` after `alice-phone`: `alice_phone_1dbb0f`). The friendly name
+shows the client name as it is.
 
 The sensor value is the number of days remaining until the certificate
 expires (`unit_of_measurement: d`), with the exact `not_after` timestamp
@@ -411,20 +447,27 @@ docker build --build-arg BUILD_FROM=ghcr.io/hassio-addons/base:21.0.10 \
     --build-arg BUILD_ARCH=amd64 -t caddy-mtls-test caddy-mtls
 caddy-mtls/tests/smoke.sh caddy-mtls-test
 caddy-mtls/tests/apparmor-smoke.sh caddy-mtls-test caddy-mtls/apparmor.txt
+python3 -m unittest discover -s caddy-mtls/tests/unit -v
 ```
 
 - `tests/smoke.sh <image>` boots the image several times with
   `--network none` (no external traffic): the panel, the CA and client
   certificates, real mTLS handshakes before and after adding, revoking and
-  regenerating clients, the CRL, the plain-HTTP site, `mtls_enabled: false`,
+  regenerating clients (also without the CA database's copy or the `.crt`),
+  "Regenerate CA", the CRL, the plain-HTTP site, two restarts as Supervisor
+  does them (a new container with the previous `/data`: new and invalid
+  `client_names`, a changed `client_cert_password`), `mtls_enabled: false`,
   one start per DNS provider (dummy tokens; the rendered `dns` directive must
   pass `caddy validate` and Caddy must run with it) and the log hygiene.
   Prints PASS/FAIL per check; exit 0 = all passed, 1 = a check failed,
   2 = usage error.
 - `tests/apparmor-smoke.sh <image> <apparmor.txt>` (needs root or sudo and an
   AppArmor kernel) loads the profile in enforce mode, boots the image under
-  it, adds and revokes a client and fails on any AppArmor denial (kernel log
-  and, if auditd runs, the audit log).
+  it, adds and revokes a client, restarts it with a new client name and a new
+  `client_cert_password` and fails on any AppArmor denial (kernel log and,
+  if auditd runs, the audit log).
+- `tests/unit/` (standard library only, also run by CI): the expiry
+  monitor's entity ids and notification thresholds.
 
 ## Maintainers: Python dependencies
 

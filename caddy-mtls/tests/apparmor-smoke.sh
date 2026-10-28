@@ -11,8 +11,11 @@
 # client certificates, CRL, Caddyfile, `caddy validate`), Caddy (admin API,
 # its ACME client against a closed local port), the cert-mgr panel (health,
 # dashboard, state, a .p12 download, a client add and a revocation, each
-# with `openssl ca` and a forced `caddy reload`), the cert-monitor and a
-# clean `docker stop`. Fails on any AppArmor denial for the profile.
+# with `openssl ca` and a forced `caddy reload`), the cert-monitor, a clean
+# `docker stop` and a restart as Supervisor does it (a new container with the
+# previous /data) with a new client name and a new client_cert_password
+# (issuance and .p12 re-encryption at start-up). Fails on any AppArmor denial
+# for the profile.
 #
 # No external network traffic: the container runs with --network none and
 # ACME_CA_URL points at a closed local port. A profile that was not loaded
@@ -27,7 +30,9 @@ IMAGE="${1:?usage: apparmor-smoke.sh <image> <apparmor.txt>}"
 PROFILE_FILE="${2:?usage: apparmor-smoke.sh <image> <apparmor.txt>}"
 DOCKER="${DOCKER:-docker}"
 PROFILE="$(sed -n 's/^profile \([A-Za-z0-9_-]*\) .*/\1/p' "${PROFILE_FILE}" | head -n 1)"
-CTR="caddy-mtls-aa-smoke-$$"
+CTR1="caddy-mtls-aa-smoke-$$"
+CTR2="${CTR1}-restart"
+CTR="${CTR1}"
 WORK="$(mktemp -d)"
 INGRESS_PREFIX="/api/hassio_ingress/aa-smoke"
 FAILED=0
@@ -44,7 +49,7 @@ check() { # check <name> <command...>
     if "$@"; then ok "${name}"; else bad "${name}"; fi
 }
 cleanup() {
-    "${DOCKER}" rm -f "${CTR}" >/dev/null 2>&1 || true
+    "${DOCKER}" rm -f "${CTR1}" "${CTR2}" >/dev/null 2>&1 || true
     if [[ "${UNLOAD}" == true ]]; then
         "${SUDO[@]}" apparmor_parser -R -K "${PROFILE_FILE}" >/dev/null 2>&1 || true
     fi
@@ -165,6 +170,33 @@ stop_container() {
         && [[ "$("${DOCKER}" inspect -f '{{.State.Status}}' "${CTR}")" == exited ]]
 }
 check "clean docker stop" stop_container
+
+# Restart: a new container under the profile with the previous /data, a new
+# client name and a new client_cert_password.
+"${DOCKER}" cp "${CTR}:/data" - >"${WORK}/data.tar"
+sed -e 's/"client_names": \["alice", "bob"\]/"client_names": ["alice", "bob", "dave"]/' \
+    -e 's/"aa-smoke-password"/"aa-smoke-password-2"/' "${WORK}/data/options.json" >"${WORK}/options.json"
+mv "${WORK}/options.json" "${WORK}/data/options.json"
+cp "${WORK}/data/options.json" "${WORK}/tmp/.bashio/addons.self.options.config.cache"
+chmod -R go+rX "${WORK}"
+"${DOCKER}" create --name "${CTR2}" --security-opt "apparmor=${PROFILE}" --network none \
+    -e ACME_CA_URL=http://127.0.0.1:9/directory -e TZ=Europe/Vienna "${IMAGE}" >/dev/null
+CTR="${CTR2}"
+"${DOCKER}" cp - "${CTR}:/" <"${WORK}/data.tar"
+copy_into "${WORK}/data" /data
+copy_into "${WORK}/tmp" /tmp
+"${DOCKER}" start "${CTR}" >/dev/null
+check "restart: panel healthy under ${PROFILE}" wait_for 90 health
+pid1="$("${DOCKER}" inspect -f '{{.State.Pid}}' "${CTR}")"
+check "restart: PID 1 confined by ${PROFILE} (enforce)" \
+    test "$("${SUDO[@]}" cat "/proc/${pid1}/attr/current" 2>/dev/null)" == "${PROFILE} (enforce)"
+check "restart: init-caddy completed" wait_for 30 logs_contain "Init complete:"
+check "restart: dave (new in client_names) issued" \
+    test "$(state '.clients[] | select(.name == "dave") | .status')" == active
+check "restart: .p12 bundles re-encrypted with the new password" \
+    logs_contain "Re-encrypted the .p12 bundle of client 'alice'"
+check "restart: no 'permission denied' in the log" logs_lack "ermission denied"
+check "restart: clean docker stop" stop_container
 sleep 1
 denials >"${WORK}/after"
 new="$(comm -13 "${WORK}/before" "${WORK}/after" || true)"

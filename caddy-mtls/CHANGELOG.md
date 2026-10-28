@@ -9,8 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Dependency refresh (base image, Python, Caddy and its DNS modules), new
 default host ports, the upstream port taken from Home Assistant Core, and
-fixes for DNS-01 challenges and for client certificate changes that did not
-reach the running proxy (review 2026-10-27: H1, H2).
+fixes for DNS-01 challenges, for client certificate changes that did not
+reach the running proxy and for the client certificate management - revoking,
+"Regenerate CA", `client_names`, `client_cert_password`, expiry sensors and
+client names (review 2026-10-27: H1, H2, M2-M7, L1).
 
 ### Breaking - what a 1.2.x user must know
 
@@ -69,6 +71,61 @@ reach the running proxy (review 2026-10-27: H1, H2).
   Changed: `upstream_port`.
 - `init-caddy` no longer aborts when `hostname -i` fails (no container
   network; bashio enables `pipefail`) - relevant for tests only.
+- **Revoke and Regenerate failed for a certificate without the CA
+  database's copy** (review 2026-10-27 M2). The panel revoked
+  `ca-db/newcerts/<serial>.pem` and gave up ("Failed to revoke client") when
+  that copy was missing, e.g. for certificates issued before 1.2.0. It now
+  revokes the client's own `.crt` (`openssl ca -revoke` also takes a serial
+  the database does not know yet); the database copy of the serial recorded
+  in `state.json` is only the fallback when the `.crt` is missing. Without
+  either, the client is still removed from the allowlist and marked revoked,
+  with a warning that its serial cannot be listed in the CRL. Revoking a
+  client that is already revoked is refused with a message.
+- **"Regenerate CA" brought revoked clients back** (review 2026-10-27 M3).
+  It re-issued every client in `state.json` - revoked ones included - as
+  active, with a new valid bundle. Only active clients are re-issued now;
+  revoked clients stay in the list as history (status, serial and reason
+  under the old CA; their files are wiped with the rest), and their names
+  stay taken.
+- **README: the "Revoking Access" steps revoked nothing** (review 2026-10-27
+  M4). Deleting the `/config` copy of the certificates and removing names
+  from `client_names` left every certificate valid (the CA and the allowlist
+  live in the add-on's own storage). The README now describes the panel:
+  Revoke for one client, Regenerate CA to invalidate every bundle.
+- **`client_names` was honoured only on the very first start** (review
+  2026-10-27 M5), although the documentation and the option text say that
+  new names are created at start-up. At every start, a listed name that
+  `state.json` does not know now gets a client certificate. Removing a name
+  revokes nothing (the panel revokes), and a name whose client was revoked
+  is skipped with a warning - a revoked name is never issued again.
+- **Client names are validated** (review 2026-10-27 L1). The option accepted
+  any string: a space dropped the client from the allowlist (unquoted word
+  splitting), a `/` stopped the start, a quote reached the inline JavaScript
+  of the panel's Revoke button, and the panel accepted `.` and `..`, which
+  browsers remove from URLs (such a client could never be revoked). The rule
+  is now the same everywhere - 1-64 characters (letters, digits, `.`, `_`,
+  `-`), not starting with a dot: the option's schema
+  (`match(^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$)`), `init-caddy` (an invalid
+  name is skipped with a warning instead of stopping the start) and the
+  panel. The allowlist is rebuilt from a quoted array, and the Revoke
+  confirmation reads the client name from a data attribute.
+- **No expiry sensors for client names with `-` or `.`** (review 2026-10-27
+  M6), e.g. the panel's own example `alice-phone`: the entity id contained
+  the raw name, which Home Assistant rejects (400 "Invalid entity ID"), so
+  the monitor logged a warning every interval instead. The entity id now
+  uses a slug of the name - lowercase, every run of other characters
+  becomes `_`: `alice-phone` -> `sensor.caddy_mtls_client_alice_phone_expiry`;
+  names with the same slug are told apart by a short hash suffix. The
+  friendly name keeps the raw client name.
+- **Changing `client_cert_password` did not re-encrypt existing bundles**
+  (security; review 2026-10-27 M7). A `.p12` kept the password it was
+  issued with - for the clients created at the first start the public
+  default `LinumIQ` - also in the `/config/certs` copy. At every start, the
+  bundle of each active client that does not open with the current password
+  is now re-exported from the client's key and certificate (one log line per
+  bundle, never the password), and the `/config/certs` copy follows.
+  openssl gets the password through its environment instead of its command
+  line.
 
 ### Security
 
@@ -144,6 +201,11 @@ build gets.)
   every start (from the Supervisor API; warnings when `80/tcp` or `443/tcp`
   is disabled; silent outside Supervisor).
 - `HEALTHCHECK` in exec form (hadolint 2.15, DL3025); same probes.
+- `client_names` entries must match
+  `^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$` (see Fixed, L1); Supervisor refuses
+  options with any other name.
+- Expiry sensors of clients whose name is not already a valid object id
+  have a new entity id (see Fixed, M6).
 - The libcrypto3/libssl3 lines stay: with base 21.0.10 they are a no-op
   today (the base image pins 3.5.9-r0, the current repository version), but
   keep the build working once Alpine ships a newer OpenSSL than the base
@@ -159,12 +221,19 @@ build gets.)
 - `tests/smoke.sh <image>`: boots the image outside Supervisor without any
   network (panel, certificates and modes, `state.json`, Caddyfile and admin
   API, CRL over plain HTTP and the redirect, mTLS handshakes before and after
-  client add / revoke / regenerate, the `.p12` download, the ingress
-  allow-list, `mtls_enabled: false`, one start per DNS provider, log
-  hygiene).
+  client add / revoke / regenerate, revoking without the CA database's copy
+  or without the `.crt`, "Regenerate CA" with revoked clients, invalid
+  names, the `.p12` download, the ingress allow-list, two restarts as
+  Supervisor does them - new and invalid `client_names`, a changed
+  `client_cert_password` - `mtls_enabled: false`, one start per DNS
+  provider, log hygiene).
 - `tests/apparmor-smoke.sh <image> <apparmor.txt>`: boots the image confined
-  by the profile in enforce mode, adds and revokes a client, and fails on any
+  by the profile in enforce mode, adds and revokes a client, restarts it with
+  a new client name and a new `client_cert_password`, and fails on any
   AppArmor denial (kernel log and audit log).
+- `tests/unit/test_monitor.py` (standard library only): entity-id slugs
+  checked against Home Assistant's entity id rule, collisions, the
+  notification thresholds, one monitor pass against a mocked Supervisor API.
 - `requirements.in` / `requirements.txt` (hashes, generated with
   `pip-compile` on CPython 3.14) and a `.dockerignore`.
 - DOCS.md: ports section, "Running outside Home Assistant (tests)",

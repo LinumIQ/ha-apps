@@ -70,7 +70,11 @@ configuration:
       List of client names for certificate generation.
       Each name will get its own .p12 certificate file.
       Use descriptive names like 'john-phone', 'mary-laptop', etc.
-      Add new entries to create additional client certificates.
+      (1-64 characters: letters, digits, '.', '_', '-'; not starting with a dot).
+      At every start, a name the add-on does not know yet gets a certificate.
+      Removing a name does not revoke its certificate (use Revoke in the
+      add-on's web interface), and the name of a revoked client is never
+      issued again.
 
   client_cert_password:
     name: Client Certificate Password
@@ -78,6 +82,8 @@ configuration:
       Password to protect the .p12 certificate files.
       Users will need this password when importing the certificate.
       Choose a strong password and share it securely with your users.
+      After a change, the existing certificate files are re-encrypted with
+      the new password at the next start - download them again.
 
   acme_dns_provider:
     name: ACME DNS Provider
