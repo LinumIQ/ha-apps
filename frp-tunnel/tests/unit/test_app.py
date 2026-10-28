@@ -75,18 +75,21 @@ def device_code_response(**extra):
     return body
 
 
-def asgi_call(app, method, path, headers=(), client=INGRESS, body=b"", host="panel.test"):
-    """Drive the ASGI app like uvicorn would; returns (status, headers, body)."""
+def asgi_call(app, method, path, headers=(), client=INGRESS, body=b"", host="panel.test", query=b""):
+    """Drive the ASGI app like uvicorn would; returns (status, headers, body).
+    ``body`` is bytes or a list of chunks (one ``http.request`` message each)."""
     sent = []
     raw_headers = [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers]
     if host is not None and not any(k == b"host" for k, _ in raw_headers):
         raw_headers.append((b"host", host.encode("latin-1")))
     scope = {
         "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": method,
-        "scheme": "http", "path": path, "raw_path": path.encode(), "query_string": b"",
+        "scheme": "http", "path": path, "raw_path": path.encode(), "query_string": query,
         "root_path": "", "headers": raw_headers, "client": client, "server": ("127.0.0.1", 8099),
     }
-    messages = [{"type": "http.request", "body": body, "more_body": False}]
+    chunks = body if isinstance(body, list) else [body]
+    messages = [{"type": "http.request", "body": chunk, "more_body": i < len(chunks) - 1}
+                for i, chunk in enumerate(chunks)]
 
     async def receive():
         if messages:
@@ -102,6 +105,44 @@ def asgi_call(app, method, path, headers=(), client=INGRESS, body=b"", host="pan
     start = next(m for m in sent if m["type"] == "http.response.start")
     payload = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
     return start["status"], {k.decode().lower(): v.decode() for k, v in start["headers"]}, payload
+
+
+def asgi_websocket(app, path="/", headers=(), client=INGRESS):
+    """Open a websocket like uvicorn would; returns the messages the app sent."""
+    sent = []
+    raw_headers = [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers]
+    scope = {"type": "websocket", "asgi": {"version": "3.0"}, "scheme": "ws", "path": path,
+             "raw_path": path.encode(), "query_string": b"", "root_path": "", "headers": raw_headers,
+             "client": client, "server": ("127.0.0.1", 8099), "subprotocols": []}
+    messages = [{"type": "websocket.connect"}]
+
+    async def receive():
+        if messages:
+            return messages.pop(0)
+        await asyncio.Event().wait()
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(app(scope, receive, send))
+    return sent
+
+
+def form(**fields) -> bytes:
+    return urlencode(fields).encode()
+
+
+#: What Home Assistant's ingress proxy forwards for a form POST from the panel
+#: opened over plain http:// (the owner's report, 2026-10-28): no Fetch Metadata
+#: (browsers send it to https:// and localhost only) and ``Origin: null``
+#: (Home Assistant serves the panel with ``Referrer-Policy: no-referrer``).
+HA_HTTP_FORM_POST = [
+    ("Host", "homeassistant.local:8123"), ("Origin", "null"),
+    ("X-Forwarded-Host", "homeassistant.local:8123"), ("X-Forwarded-Proto", "http"),
+    ("X-Forwarded-For", "192.168.0.50, 172.30.32.1"), ("X-Hass-Source", "core.ingress"),
+    ("X-Ingress-Path", "/api/hassio_ingress/tok-EN_1"),
+    ("Content-Type", "application/x-www-form-urlencoded"),
+]
 
 
 @unittest.skipIf(starlette is None, "panel dependencies not installed (run inside the add-on image)")
@@ -1062,6 +1103,214 @@ class PanelFlowTests(unittest.TestCase):
         status, headers, _ = asgi_call(self.app.app, "POST", "/subdomain/change", SAME_ORIGIN)
         self.assertEqual(status, 303)
         self.assertIn("error=Subdomain+is+required", headers["location"])
+
+    # -- CSRF token (2.4.1) ------------------------------------------------------
+
+    def test_form_token_passes_without_browser_headers(self):
+        """The owner's report: Start Pairing over http:// behind Home Assistant
+        (no Sec-Fetch-Site, Origin: null) was refused; the form token passes."""
+        token = self.app.CSRF_TOKEN
+        self.backend[("POST", "/api/device/code")] = (200, device_code_response())
+        with self.assertLogs("frp-mgr", "WARNING") as logs:
+            status, _, body = asgi_call(self.app.app, "POST", "//pair/start", HA_HTTP_FORM_POST, host=None)
+        self.assertEqual((status, body), (403, b"Forbidden: cross-site request. Reload the panel and try again."))
+        self.assertFalse(self.paths.pairing.exists())
+        self.assertEqual(logs.output, [
+            "WARNING:frp-mgr:Rejecting cross-site POST //pair/start: sec-fetch-site=absent origin=null "
+            "host=homeassistant.local:8123 x-forwarded-host=homeassistant.local:8123 x-forwarded-proto=http "
+            "token=absent"])
+        status, headers, _ = asgi_call(self.app.app, "POST", "//pair/start", HA_HTTP_FORM_POST,
+                                       body=form(_csrf=token), host=None)
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["location"], "/api/hassio_ingress/tok-EN_1/")
+        self.assertTrue(self.paths.pairing.exists())
+        self.assertEqual(self.calls[-1][:2], ("POST", "/api/device/code"))
+
+    def test_poll_passes_with_the_token_header(self):
+        """fetch() from the pairing page sends the token as X-CSRF-Token."""
+        self._start_pairing()
+        self.backend[("POST", "/api/device/token")] = (400, {"error": "authorization_pending"})
+        headers = [h for h in HA_HTTP_FORM_POST if h[0] not in ("Origin", "Content-Type")]
+        self.assertEqual(asgi_call(self.app.app, "POST", "/pair/poll", headers, host=None)[0], 403)
+        status, _, body = asgi_call(self.app.app, "POST", "/pair/poll",
+                                    headers + [("X-CSRF-Token", self.app.CSRF_TOKEN)], host=None)
+        self.assertEqual((status, json.loads(body)), (200, {"status": "pending"}))
+
+    def test_origin_may_name_the_forwarded_host(self):
+        """A reverse proxy in front of Home Assistant that rewrites Host: the
+        Origin then names X-Forwarded-Host (first value)."""
+        self._paired()
+        self.backend[("GET", "/api/device/tunnel")] = (200, self._tunnel())
+        cases = [
+            ([("Origin", "https://ha.example.org"), ("X-Forwarded-Host", "ha.example.org")], 303),
+            ([("Origin", "https://HA.example.org"), ("X-Forwarded-Host", "ha.EXAMPLE.org")], 303),
+            ([("Origin", "https://ha.example.org"), ("X-Forwarded-Host", "ha.example.org, internal:8123")], 303),
+            ([("Origin", "http://panel.test"), ("X-Forwarded-Host", "ha.example.org")], 303),  # = Host
+            ([("Origin", "https://ha.example.org"), ("X-Forwarded-Host", "internal:8123, ha.example.org")], 403),
+            ([("Origin", "https://evil.example"), ("X-Forwarded-Host", "ha.example.org")], 403),
+            ([("Origin", "https://ha.example.org.evil.example"), ("X-Forwarded-Host", "ha.example.org")], 403),
+            ([("Origin", "null"), ("X-Forwarded-Host", "null")], 403),
+            ([("Origin", "https://ha.example.org")], 403),
+            # An explicit Fetch Metadata verdict is not overridden by Origin.
+            ([("Sec-Fetch-Site", "same-site"), ("Origin", "https://ha.example.org"),
+              ("X-Forwarded-Host", "ha.example.org")], 403),
+        ]
+        for headers, expected in cases:
+            with self.subTest(headers=headers):
+                self.assertEqual(asgi_call(self.app.app, "POST", "/tunnel/refresh", headers)[0], expected)
+        self.assertTrue(self.paths.state.exists())
+
+    def test_wrong_or_absent_token_is_refused(self):
+        self._paired()
+        self.backend[("DELETE", "/api/device/tunnel")] = (200, {"ok": True})
+        token = self.app.CSRF_TOKEN
+        urlencoded = [("Content-Type", "application/x-www-form-urlencoded")]
+        cases = [
+            ("no token", urlencoded, b"", "token=absent"),
+            ("empty form token", urlencoded, form(_csrf=""), "token=absent"),
+            ("wrong form token", urlencoded, form(_csrf="x" * len(token)), "token=wrong"),
+            ("token prefix", urlencoded, form(_csrf=token[:-1]), "token=wrong"),
+            ("token plus suffix", urlencoded, form(_csrf=token + "x"), "token=wrong"),
+            ("token in another field", urlencoded, form(csrf=token), "token=absent"),
+            ("wrong header token", [("X-CSRF-Token", "y" * len(token))], b"", "token=wrong"),
+            ("form token without the form content type", [("Content-Type", "text/plain")],
+             form(_csrf=token), "token=absent"),
+            ("form token in a multipart body", [("Content-Type", "multipart/form-data; boundary=b")],
+             b'--b\r\nContent-Disposition: form-data; name="_csrf"\r\n\r\n' + token.encode() + b"\r\n--b--\r\n",
+             "token=absent"),
+            ("body larger than 64 KiB", urlencoded, form(_csrf=token, pad="p" * 65536), "token=too-large"),
+            ("declared length larger than 64 KiB", urlencoded + [("Content-Length", "70000")],
+             form(_csrf=token), "token=too-large"),
+            ("too many fields", urlencoded, form(_csrf=token, **{f"f{i}": "1" for i in range(40)}), "token=absent"),
+            ("Sec-Fetch-Site cross-site, wrong token", urlencoded + [("Sec-Fetch-Site", "cross-site")],
+             form(_csrf="z" * len(token)), "token=wrong"),
+        ]
+        for name, headers, body, signal in cases:
+            with self.subTest(case=name):
+                with self.assertLogs("frp-mgr", "WARNING") as logs:
+                    status, _, _ = asgi_call(self.app.app, "POST", "/unpair", headers, body=body)
+                self.assertEqual(status, 403)
+                self.assertEqual(len(logs.output), 1, logs.output)
+                self.assertIn(signal, logs.output[0])
+                self.assertNotIn(token, logs.output[0])
+                self.assertNotIn("x" * 20, logs.output[0])  # nor the submitted value
+        # A token in the query string is never accepted (URLs end up in logs).
+        with self.assertLogs("frp-mgr", "WARNING") as logs:
+            status, _, _ = asgi_call(self.app.app, "POST", "/unpair", query=form(_csrf=token))
+        self.assertEqual(status, 403)
+        self.assertIn("token=absent", logs.output[0])
+        self.assertNotIn(token, logs.output[0])
+        self.assertTrue(self.paths.state.exists())
+        self.assertEqual(self.calls, [])
+
+    def test_token_is_accepted_even_when_fetch_metadata_says_cross_site(self):
+        """Documented in IngressGuard: a cross-site page cannot read the token,
+        so a correct one proves the request was built from the panel page
+        (e.g. a sandboxed, opaque-origin iframe sends cross-site + Origin: null)."""
+        self._paired()
+        self.backend[("GET", "/api/device/tunnel")] = (200, self._tunnel())
+        for site in ("cross-site", "same-site", "none"):
+            with self.subTest(site=site):
+                status, headers, _ = asgi_call(
+                    self.app.app, "POST", "/tunnel/refresh",
+                    [("Sec-Fetch-Site", site), ("Origin", "null"),
+                     ("Content-Type", "application/x-www-form-urlencoded")], body=form(_csrf=self.app.CSRF_TOKEN))
+                self.assertEqual(status, 303)
+                self.assertIn("ok=", headers["location"])
+                status, _, _ = asgi_call(self.app.app, "POST", "/tunnel/refresh",
+                                         [("Sec-Fetch-Site", site), ("X-CSRF-Token", self.app.CSRF_TOKEN)])
+                self.assertEqual(status, 303)
+
+    def test_form_body_read_by_the_guard_reaches_the_handler(self):
+        """The guard reads the body to find the token and replays it: the
+        subdomain field still arrives, also when the body comes in chunks."""
+        self._paired()
+        self.backend[("POST", "/api/device/tunnel")] = (200, self._tunnel(subdomain="newhome", token="d" * 64))
+        body = form(_csrf=self.app.CSRF_TOKEN, subdomain="NewHome")
+        for chunks in ([body], [body[:7], body[7:20], body[20:]], [b"", body, b""]):
+            with self.subTest(chunks=len(chunks)):
+                status, headers, _ = asgi_call(self.app.app, "POST", "//subdomain/change", HA_HTTP_FORM_POST,
+                                               body=chunks, host=None)
+                self.assertEqual(status, 303)
+                self.assertTrue(headers["location"].startswith("/api/hassio_ingress/tok-EN_1/?ok="),
+                                headers["location"])
+                self.assertEqual(self.calls[-1][2], {"subdomain": "newhome"})
+
+    def test_guard_still_refuses_non_ingress_clients_and_websockets_with_a_token(self):
+        self._paired()
+        token = self.app.CSRF_TOKEN
+        for client in (("10.1.2.3", 4000), ("127.0.0.1", 1)):
+            with self.subTest(client=client):
+                status, _, body = asgi_call(self.app.app, "POST", "/unpair", [("X-CSRF-Token", token)], client=client)
+                self.assertEqual((status, body), (403, b"Forbidden: frp-mgr is only reachable via Home Assistant ingress."))
+        for client in (INGRESS, ("10.1.2.3", 4000)):
+            with self.subTest(websocket=client):
+                sent = asgi_websocket(self.app.app, "/", [("X-CSRF-Token", token)], client=client)
+                self.assertEqual(sent, [{"type": "websocket.close", "code": 1008}])
+        self.assertTrue(self.paths.state.exists())
+        self.assertEqual(self.calls, [])
+
+    def test_every_page_embeds_the_token_in_every_form(self):
+        token = self.app.CSRF_TOKEN
+        self.assertRegex(token, r"^[A-Za-z0-9_-]{43,}$")
+        field = f'<input type="hidden" name="_csrf" value="{token}" />'
+        pages = self._pages()
+        for state, body in pages.items():
+            with self.subTest(state=state):
+                forms = re.findall(r"<form\b.*?</form>", body, re.S)
+                self.assertGreater(len(forms), 0)
+                for markup in forms:
+                    self.assertEqual(markup.count(field), 1, markup)
+                    self.assertIn('method="post"', markup)
+                self.assertEqual(body.count(token), len(forms) + (state == "pairing"))
+        script = pages["pairing"][pages["pairing"].index("<script>"):]
+        self.assertIn(f"var csrf = {json.dumps(token)};", script)
+        self.assertIn('fetch(base + "/pair/poll", { method: "POST", headers: { "X-CSRF-Token": csrf } })', script)
+        self.assertIn("r.status === 403", script)
+        # The page is never stored: after a restart it must carry the new token.
+        status, headers, body = asgi_call(self.app.app, "GET", "//")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["cache-control"], "no-store")
+        self.assertIn(token.encode(), body)
+
+    def test_token_appears_in_no_other_response(self):
+        token = self.app.CSRF_TOKEN.encode()
+        self._start_pairing()
+        self.backend[("POST", "/api/device/token")] = (400, {"error": "authorization_pending"})
+        responses = [asgi_call(self.app.app, "GET", path) for path in (
+            "/api/status", "/_health", "/nope", "/static/app.css", "/static/shared/linumiq.css",
+            "/static/brand/icon.svg", "/static/shared/brand/linumiq-logo.png")]
+        responses.append(asgi_call(self.app.app, "POST", "/pair/poll", [("X-CSRF-Token", token.decode())]))
+        responses.append(asgi_call(self.app.app, "POST", "/pair/poll"))  # 403
+        self.paths.pairing.unlink()
+        self._paired()
+        self.backend[("GET", "/api/device/tunnel")] = (200, self._tunnel())
+        responses.append(asgi_call(self.app.app, "POST", "/tunnel/refresh", HA_HTTP_FORM_POST,
+                                   body=form(_csrf=token.decode()), host=None))  # 303
+        statuses = [status for status, _, _ in responses]
+        self.assertEqual(statuses, [200, 200, 404, 200, 200, 200, 200, 200, 403, 303])
+        for status, headers, body in responses:
+            with self.subTest(status=status, headers=headers):
+                self.assertNotIn(token, body)
+                self.assertNotIn(token.decode(), json.dumps(headers))
+        self.assertNotIn(token.decode(), json.dumps(self.app.api_status()))
+        # ... and in no log line (neither the panel's nor uvicorn's access log,
+        # which logs the path: the token is never in a URL).
+        with self.assertLogs("frp-mgr", "DEBUG") as logs:
+            asgi_call(self.app.app, "POST", "/unpair", [("X-CSRF-Token", "w" * 43)])
+            self.app.LOG.debug("end")
+        self.assertNotIn(token.decode(), "\n".join(logs.output))
+
+    def test_rejection_log_line_is_sanitised(self):
+        headers = [("Sec-Fetch-Site", "cross\x1b[31m-site"), ("Origin", "https://evil.example/\x00x y"),
+                   ("Host", "a" * 300), ("X-Forwarded-Proto", "https")]
+        with self.assertLogs("frp-mgr", "WARNING") as logs:
+            asgi_call(self.app.app, "POST", "/unpair", headers, host=None)
+        line = logs.output[0]
+        self.assertTrue(line.isprintable(), line)
+        self.assertIn("sec-fetch-site=cross%20[31m-site origin=https://evil.example/%20x%20y ", line)
+        self.assertIn("host=" + "a" * 97 + "... ", line)
+        self.assertIn("x-forwarded-host=absent x-forwarded-proto=https token=absent", line)
 
     def test_invalid_ingress_path_is_never_used_for_redirects(self):
         for prefix in ("//evil.example", "https://evil.example", "/a/../b", "/x\\y", "/x y", "/a//b"):

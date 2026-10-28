@@ -58,8 +58,9 @@ EXPECT_SERVER_NAME="${E2E_FRPS_SERVER_NAME:-}"
 TLS_NEGATIVE="${E2E_TLS_NEGATIVE:-1}"
 EXPECT_ACCOUNT="${E2E_ACCOUNT_EMAIL_MASKED:-}"
 PANEL="http://127.0.0.1:8099"
-# The panel refuses state-changing requests that are not same-origin (CSRF
-# guard); a browser sends this header itself, the harness has to add it.
+# The panel refuses state-changing requests that are neither same-origin nor
+# carry its CSRF token (CSRF guard); the harness sends the Fetch Metadata
+# header a browser sends over https (one check uses the page's form token).
 SAME_ORIGIN=(-H "Sec-Fetch-Site: same-origin")
 
 # A stand-in for the Supervisor API token every add-on container gets: frpc
@@ -441,6 +442,9 @@ code="$(panel_code POST /pair/start)"
 check "CSRF: POST without Sec-Fetch-Site/Origin refused (HTTP ${code})" test "${code}" == 403
 code="$(panel_code POST /pair/start -H 'Sec-Fetch-Site: cross-site')"
 check "CSRF: cross-site POST refused (HTTP ${code})" test "${code}" == 403
+code="$(panel_code POST /pair/start -H 'Content-Type: application/x-www-form-urlencoded' \
+    --data-binary '_csrf=not-the-panel-token')"
+check "CSRF: POST with a wrong form token refused (HTTP ${code})" test "${code}" == 403
 check "CSRF: refused POSTs did not start a pairing" test "$(status_field pairing_active)" == false
 
 # ------------------------------------------------------------------------------
@@ -725,6 +729,22 @@ else
 fi
 check "refresh kept frpc.toml unchanged" \
     test "$(cexec sha256sum /data/frpc.toml 2>/dev/null | awk '{print $1}')" == "${HASH_BEFORE}"
+# Only the form token the page embeds - no Sec-Fetch-Site, Origin: null: what
+# a browser sends for a panel form over plain http:// behind Home Assistant's
+# "Referrer-Policy: no-referrer" (refused before 2.4.1). The token stays inside
+# the container (curl reads the form from stdin, printf is a shell builtin).
+# shellcheck disable=SC2016  # $0 / token are expanded by the inner sh
+read -r code location <<<"$(cexec sh -c '
+    token="$(curl -fsS "$0/" | grep -o "name=\"_csrf\" value=\"[A-Za-z0-9_-]*\"" | head -n 1 | cut -d "\"" -f 4)"
+    [ -n "${token}" ] || { printf "000 no-form-token-on-the-page"; exit 0; }
+    printf "_csrf=%s" "${token}" | curl -s -o /dev/null -w "%{http_code} %{redirect_url}" -X POST \
+        -H "Origin: null" -H "Content-Type: application/x-www-form-urlencoded" --data-binary @- \
+        "$0/tunnel/refresh"' "${PANEL}" 2>/dev/null || printf '000 -')"
+if [[ "${code}" == 303 && "${location}" == *ok=* ]]; then
+    pass "CSRF: refresh with only the page's form token (Origin: null, no Sec-Fetch-Site) -> 303 ok"
+else
+    fail "CSRF: refresh with only the page's form token" "HTTP ${code} ${location}"
+fi
 
 cexec rm -f /data/frpc.toml || true
 cexec s6-svc -r /run/service/frpc || true

@@ -76,7 +76,7 @@ never silently run against production.
 | `E2E_EXPECT` | first line of `http://LOCAL_HOST:LOCAL_PORT/` | Text the public page must contain (whoami: `Hostname: <id>`). |
 | `E2E_KEEP_PAIRED` | `0` | `1`: skip the final unpair (leaves a valid device token server-side). |
 | `E2E_KEEP_CONTAINER` | `0` | `1`: do not remove the add-on container (debugging). |
-| `E2E_ALLOWED_INGRESS_IPS` | `127.0.0.1` | Passed to the panel as `ALLOWED_INGRESS_IPS` (IPs/CIDRs). The harness drives the panel with `docker exec ... curl http://127.0.0.1:8099`, so loopback must be allowed explicitly (the add-on's default is the Supervisor ingress proxy `172.30.32.2` only - checked in a second container, see below). State-changing requests carry `Sec-Fetch-Site: same-origin` (the panel's CSRF guard refuses them otherwise). |
+| `E2E_ALLOWED_INGRESS_IPS` | `127.0.0.1` | Passed to the panel as `ALLOWED_INGRESS_IPS` (IPs/CIDRs). The harness drives the panel with `docker exec ... curl http://127.0.0.1:8099`, so loopback must be allowed explicitly (the add-on's default is the Supervisor ingress proxy `172.30.32.2` only - checked in a second container, see below). State-changing requests carry `Sec-Fetch-Site: same-origin` (the panel's CSRF guard refuses them otherwise; one check uses the form token from the page instead). |
 | `E2E_BOOT_TIMEOUT` / `E2E_PAIR_TIMEOUT` / `E2E_FRPC_TIMEOUT` / `E2E_PUBLIC_TIMEOUT` | `90` / `180` / `60` / `180` s | Timeouts. The public timeout covers on-demand certificate issuance for a new subdomain. |
 | `E2E_BUILD_ARCH`, `E2E_BUILD_FROM`, `E2E_BUILD_TAG` | auto / base 21.0.10 / `frp-tunnel-e2e` | Build knobs. |
 
@@ -103,8 +103,8 @@ Each check prints `PASS`, `FAIL` or `SKIP`:
    the same image with the **default** allow-list (no `ALLOWED_INGRESS_IPS`)
    must answer 403 on `127.0.0.1:8099` - to root and to the unprivileged user
    `frpc` (`GET /api/status`, same-origin `POST /unpair`). A POST without
-   `Sec-Fetch-Site`/`Origin` and a cross-site POST are refused (CSRF) and
-   start nothing.
+   `Sec-Fetch-Site`/`Origin`/token, a cross-site POST and a POST with a wrong
+   form token are refused (CSRF) and start nothing.
 3. `POST /pair/start` -> `user_code` from `GET /api/status` -> approval ->
    `POST /pair/poll` until `paired`. The user code appears neither in the
    redirect URL nor in the container log.
@@ -135,7 +135,10 @@ Each check prints `PASS`, `FAIL` or `SKIP`:
    last). `/etc` is left out when the container runs under the add-on's own
    AppArmor profile (`E2E_CREATE_ARGS`), which denies most of it anyway.
 7. `https://<sub>.<DOMAIN_BASE>/` returns the local service's content.
-8. **Refresh tunnel config** works and leaves `frpc.toml` unchanged; deleting
+8. **Refresh tunnel config** works and leaves `frpc.toml` unchanged, also when
+   the POST carries nothing but the CSRF token scraped from the page's form
+   (`Origin: null`, no `Sec-Fetch-Site`: a panel form over plain `http://`
+   behind Home Assistant's `Referrer-Policy: no-referrer`); deleting
    `frpc.toml` and restarting the frpc service re-renders it identically from
    the state. With `E2E_FRPS_CA_FILE` (and `E2E_TLS_NEGATIVE=1`): a wrong
    `serverName` is refused by frpc and the panel reports `tls_login=failed`,

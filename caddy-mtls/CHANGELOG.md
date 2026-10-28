@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.1] - 2026-10-28
+
+### Removed
+
+- The "state version N" line under the LinumIQ logo at the bottom of the web
+  interface (an internal detail of the add-on's state file, not useful in the
+  page). Nothing else changes.
+
 ## [2.1.0] - 2026-10-28
 
 The certificate manager in the LinumIQ look. Nothing else changes: no new

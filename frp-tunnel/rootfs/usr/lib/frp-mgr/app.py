@@ -4,8 +4,8 @@ FRP Tunnel - device pairing management web UI.
 Runs on the Home Assistant ingress port (8099), only reachable via the
 Supervisor's ingress proxy at 172.30.32.2 (IngressGuard: client IP from the
 TCP peer, never from headers - not even loopback by default, so the
-unprivileged frpc user cannot drive the panel; every POST must also be
-same-origin - CSRF).
+unprivileged frpc user cannot drive the panel; every POST must also carry
+the panel's CSRF token or be same-origin as the browser reports it - CSRF).
 Provides a browser-based device-authorization pairing flow so users never
 touch tokens or subdomains in the add-on configuration.
 
@@ -48,6 +48,7 @@ redirects (the device token must only ever go to app_base).
 """
 from __future__ import annotations
 
+import hmac
 import http.client
 import ipaddress
 import json
@@ -55,6 +56,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import subprocess
 import threading
 import time
@@ -62,7 +64,7 @@ from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional, Tuple
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, build_opener
 from urllib.request import Request as URLRequest
 
@@ -230,7 +232,7 @@ def _http_json(
     device codes / tokens); error texts are sanitised with the bearer token
     redacted.
     """
-    secrets = (bearer,) if bearer else ()
+    redact = (bearer,) if bearer else ()
     host = urlsplit(url).netloc
     data = None
     headers = {
@@ -272,7 +274,7 @@ def _http_json(
         except Exception:  # pragma: no cover - defensive
             raw = ""
     except (URLError, OSError, http.client.HTTPException) as exc:
-        reason = cfg.sanitize_text(getattr(exc, "reason", exc), 160, secrets) or type(exc).__name__
+        reason = cfg.sanitize_text(getattr(exc, "reason", exc), 160, redact) or type(exc).__name__
         LOG.error("HTTP %s %s failed: %s", method, cfg.sanitize_text(url, 200), reason)
         raise BackendUnavailable(f"Cannot reach {host}: {reason}") from None
     except ValueError:
@@ -662,29 +664,142 @@ def _client_allowed(host: str) -> bool:
 #: Methods that never change state (no CSRF check).
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
+#: Synchronizer token (CSRF) of this panel process: a new random value at
+#: every start (the panel restarts with the add-on). The dashboard embeds it
+#: in every form (field ``_csrf``) and the pairing page's poll script sends it
+#: as the ``X-CSRF-Token`` header. It is never logged and is part of no other
+#: response (not /api/status, not a redirect, not a static file).
+CSRF_TOKEN = secrets.token_urlsafe(32)
+CSRF_FIELD = "_csrf"
+CSRF_HEADER = "x-csrf-token"
+#: The only body type the guard looks into for the form token (the panel's
+#: forms are plain HTML forms), and the most it reads: the panel's forms send
+#: less than 200 bytes. The body is read only when neither the browser's
+#: headers nor X-CSRF-Token passed; a larger one is then refused.
+CSRF_FORM_TYPE = "application/x-www-form-urlencoded"
+CSRF_MAX_BODY = 64 * 1024
+#: Answer to a refused state-changing request. A page rendered before the
+#: last add-on restart posts an outdated token, hence the hint.
+CROSS_SITE_TEXT = "Forbidden: cross-site request. Reload the panel and try again."
+
+
+def _origin_netloc(raw: Optional[str]) -> Optional[str]:
+    """``host[:port]`` of an http(s) ``Origin`` header, lower-case; None
+    when it is absent, ``null`` or anything else."""
+    origin = (raw or "").strip()
+    if not origin or origin == "null":
+        return None
+    try:
+        parts = urlsplit(origin)
+    except ValueError:
+        return None
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return None
+    return parts.netloc.lower()
+
+
+def _request_hosts(headers: Headers) -> set:
+    """The hosts this request was addressed to: ``Host`` and the first
+    ``X-Forwarded-Host`` (lower-case, empty values dropped)."""
+    hosts = {
+        (headers.get("host") or "").strip().lower(),
+        (headers.get("x-forwarded-host") or "").split(",")[0].strip().lower(),
+    }
+    hosts.discard("")
+    return hosts
+
 
 def _same_origin(headers: Headers) -> bool:
-    """CSRF check for state-changing requests.
+    """The browser's own verdict that a request comes from the panel's
+    origin (rules 1 and 2 of the CSRF check, see IngressGuard).
 
-    Browsers send ``Sec-Fetch-Site`` (a forbidden header page scripts cannot
-    set) on every request; when it is present it must be ``same-origin``
-    (HA ingress keeps the panel on the Home Assistant origin). Browsers
-    without Fetch Metadata still send ``Origin`` on a POST: it must then
-    name the requested host. A request with neither (or ``Origin: null``)
-    is refused.
+    ``Sec-Fetch-Site`` (a forbidden header page scripts cannot set) is
+    decisive when present: it must be ``same-origin``; ``cross-site``,
+    ``same-site`` or ``none`` is not overridden by an ``Origin``. Without it,
+    an http(s) ``Origin`` must name the requested host: ``Host`` or the first
+    ``X-Forwarded-Host`` (Home Assistant's ingress proxy sets it from the
+    browser's Host unless a reverse proxy in front of Home Assistant already
+    did, so a proxy that rewrites Host is covered; a cross-site form cannot
+    set the header and a cross-site fetch() with it fails the CORS
+    preflight). ``Origin: null`` or no Origin is no verdict.
     """
     site = headers.get("sec-fetch-site")
     if site is not None:
         return site.strip().lower() == "same-origin"
-    origin = (headers.get("origin") or "").strip()
-    host = (headers.get("host") or "").strip().lower()
-    if not origin or origin == "null" or not host:
-        return False
+    origin = _origin_netloc(headers.get("origin"))
+    return origin is not None and origin in _request_hosts(headers)
+
+
+def _token_state(value: Optional[str]) -> str:
+    """"ok", "wrong" or "absent" for a submitted CSRF token (constant-time
+    comparison)."""
+    if not value:
+        return "absent"
+    ok = hmac.compare_digest(value.encode("utf-8", "replace"), CSRF_TOKEN.encode("ascii"))
+    return "ok" if ok else "wrong"
+
+
+async def _read_form_token(headers: Headers, receive) -> Tuple[str, Optional[bytes]]:
+    """Look for the form token (field ``_csrf``) in a urlencoded body of at
+    most CSRF_MAX_BODY bytes.
+
+    Returns ``(state, body)``: state as _token_state or "too-large"; body is
+    the complete body when it was read (the caller replays it to the
+    application), else None.
+    """
+    content_type = (headers.get("content-type") or "").split(";")[0].strip().lower()
+    if content_type != CSRF_FORM_TYPE:
+        return "absent", None
     try:
-        parts = urlsplit(origin)
+        declared = int(headers.get("content-length") or 0)
     except ValueError:
-        return False
-    return parts.scheme in ("http", "https") and parts.netloc.lower() == host
+        declared = 0
+    if declared > CSRF_MAX_BODY:
+        return "too-large", None
+    chunks, size = [], 0
+    while True:
+        message = await receive()
+        if message["type"] != "http.request":  # the client went away
+            return "absent", None
+        chunk = message.get("body", b"")
+        size += len(chunk)
+        if size > CSRF_MAX_BODY:
+            return "too-large", None
+        chunks.append(chunk)
+        if not message.get("more_body", False):
+            break
+    body = b"".join(chunks)
+    try:
+        fields = parse_qs(body.decode("latin-1"), keep_blank_values=True, max_num_fields=32)
+    except ValueError:  # too many fields
+        return "absent", body
+    return _token_state((fields.get(CSRF_FIELD) or [""])[0]), body
+
+
+def _replay_body(body: bytes, receive):
+    """An ASGI ``receive`` that hands out the already read body first."""
+    pending = [{"type": "http.request", "body": body, "more_body": False}]
+
+    async def replay():
+        if pending:
+            return pending.pop()
+        return await receive()
+
+    return replay
+
+
+def _csrf_signals(headers: Headers, token: str) -> str:
+    """One log line naming what a refused request carried (sanitised; never
+    a token value), so a report pinpoints which signal was missing."""
+    def show(name: str, limit: int = 100) -> str:
+        raw = headers.get(name)
+        if raw is None:
+            return "absent"
+        return cfg.sanitize_text(raw, limit).replace(" ", "%20") or "empty"
+
+    return (f"sec-fetch-site={show('sec-fetch-site', 20)} origin={show('origin')} "
+            f"host={show('host')} x-forwarded-host={show('x-forwarded-host')} "
+            f"x-forwarded-proto={show('x-forwarded-proto', 10)} token={token}")
 
 
 class IngressGuard:
@@ -694,8 +809,32 @@ class IngressGuard:
        + loopback) are served - decided from the TCP peer in ``scope``, never
        from ``Host``/``X-Forwarded-*`` headers, and with no path exemptions
        (Starlette rebuilds ``request.url`` from the ``Host`` header, so a
-       path check on it can be fooled: GHSA-86qp-5c8j-p5mr).
-    2. Every state-changing request must be same-origin (``_same_origin``).
+       path check on it can be fooled: GHSA-86qp-5c8j-p5mr). Websockets are
+       refused.
+    2. CSRF: every state-changing request (any method but GET/HEAD/OPTIONS)
+       passes with ONE of
+       a. ``Sec-Fetch-Site: same-origin``;
+       b. no ``Sec-Fetch-Site`` and an ``Origin`` naming ``Host`` or the first
+          ``X-Forwarded-Host`` (``_same_origin``);
+       c. this process's CSRF token: header ``X-CSRF-Token`` or form field
+          ``_csrf`` of a urlencoded body (read here, at most CSRF_MAX_BODY
+          bytes, and replayed to the application).
+       Anything else gets 403 ``CROSS_SITE_TEXT`` ("Forbidden: cross-site
+       request. ...") and one log line with the signals seen
+       (``_csrf_signals``).
+
+       Why the token: Home Assistant answers every request, the ingress panel
+       included, with ``Referrer-Policy: no-referrer``, under which browsers
+       send ``Origin: null`` with a form POST; and over plain http:// (a LAN
+       address) browsers send no Fetch Metadata at all. A form POST from the
+       panel then carries neither signal (2.2.0-2.4.0 refused it: "Rejecting
+       cross-site POST //pair/start"). The token is accepted even when
+       ``Sec-Fetch-Site`` says ``cross-site``: a cross-site page cannot read
+       it (same-origin policy: it is only in the panel's HTML, which another
+       origin cannot fetch or read from a frame), so a correct token proves
+       by itself that the request was built from the panel page. That also
+       covers a sandboxed (opaque-origin) iframe, should Home Assistant ever
+       use one.
     3. Repeated leading slashes are collapsed: Home Assistant's ingress
        proxy can forward ``GET //`` for the iframe root.
     """
@@ -718,15 +857,35 @@ class IngressGuard:
         if scope["type"] != "http":
             await self._deny(scope, receive, send, "Forbidden.")
             return
-        if scope.get("method", "GET") not in SAFE_METHODS and not _same_origin(Headers(scope=scope)):
-            LOG.warning("Rejecting cross-site %s %s (Sec-Fetch-Site/Origin missing or foreign).",
-                        cfg.sanitize_text(scope.get("method"), 10), cfg.sanitize_text(path, 120))
-            await self._deny(scope, receive, send, "Forbidden: cross-site request.")
-            return
+        if scope.get("method", "GET") not in SAFE_METHODS:
+            receive, signals = await self._csrf_check(scope, receive)
+            if signals is not None:
+                LOG.warning("Rejecting cross-site %s %s: %s",
+                            cfg.sanitize_text(scope.get("method"), 10), cfg.sanitize_text(path, 120),
+                            signals)
+                await self._deny(scope, receive, send, CROSS_SITE_TEXT)
+                return
         if path.startswith("//"):
             new_path = "/" + path.lstrip("/")
             scope = dict(scope, path=new_path, raw_path=new_path.encode("utf-8"))
         await self.app(scope, receive, send)
+
+    @staticmethod
+    async def _csrf_check(scope, receive):
+        """Rule 2. Returns ``(receive, None)`` when the request passes, else
+        ``(receive, signals)``; ``receive`` replays the body if it was read."""
+        headers = Headers(scope=scope)
+        if _same_origin(headers):
+            return receive, None
+        header_token = _token_state(headers.get(CSRF_HEADER))
+        if header_token == "ok":
+            return receive, None
+        form_token, body = await _read_form_token(headers, receive)
+        if body is not None:
+            receive = _replay_body(body, receive)
+        if form_token == "ok":
+            return receive, None
+        return receive, _csrf_signals(headers, header_token if header_token != "absent" else form_token)
 
     @staticmethod
     async def _deny(scope, receive, send, text: str) -> None:
@@ -943,7 +1102,14 @@ def index(request: Request) -> Response:
     # Query parameters are attacker-controllable text: sanitised + escaped.
     ctx["flash_error"] = cfg.sanitize_text(request.query_params.get("error") or "", 300) or None
     ctx["flash_ok"] = cfg.sanitize_text(request.query_params.get("ok") or "", 300) or None
-    return templates.TemplateResponse(request, "index.html", ctx)
+    # The CSRF token goes into this page only (its forms and the poll
+    # script) - never into _view_model(), so /api/status does not carry it.
+    ctx["csrf_token"] = CSRF_TOKEN
+    response = templates.TemplateResponse(request, "index.html", ctx)
+    # The page carries this process's token: no stored copy (HTTP cache,
+    # back/forward) with an outdated one after an add-on restart.
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 def api_status() -> Dict[str, Any]:
@@ -1196,7 +1362,8 @@ def _revoke_device_token(device_token: str) -> Optional[str]:
 # with a Request object. Starlette runs sync endpoints in its thread pool;
 # the thin endpoints below adapt them (JSON bodies, form parsing).
 
-#: Limits for the only form the panel accepts (subdomain change).
+#: Limits for the only form the panel parses (subdomain change: the
+#: subdomain and the CSRF token).
 _FORM_LIMITS = {"max_files": 0, "max_fields": 4, "max_part_size": 1024}
 
 

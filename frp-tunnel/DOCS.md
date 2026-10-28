@@ -354,12 +354,19 @@ retire it).
   exists only for running the image outside Supervisor, e.g. the E2E harness;
   the container environment cannot be set under Supervisor.)
 - **CSRF.** Every state-changing request (pairing, refresh, subdomain change,
-  unpair) must be same-origin: `Sec-Fetch-Site: same-origin`, or - for
-  browsers without Fetch Metadata - an `Origin` that names the requested host.
-  Home Assistant ingress keeps the panel on your Home Assistant origin, so
-  nothing changes for you; another web site can no longer make your browser
-  unpair or re-pair the add-on. Scripts that drive the panel (e.g. the E2E
-  harness) must send `Sec-Fetch-Site: same-origin`.
+  unpair) must come from the panel page itself, so another web site cannot
+  make your browser unpair or re-pair the add-on. The panel creates a random
+  token at every start and puts it into its forms (the pairing page's status
+  check sends it as the `X-CSRF-Token` header); other web sites cannot read
+  it. A request without the token is accepted only when the browser reports
+  it as same-origin: `Sec-Fetch-Site: same-origin`, or - when the browser
+  sends no Fetch Metadata - an `Origin` that names the requested host (`Host`
+  or the first `X-Forwarded-Host`). The token is what makes the panel work
+  over plain `http://`: Home Assistant serves its pages with
+  `Referrer-Policy: no-referrer`, so browsers send `Origin: null` with a
+  form, and over `http://` they send no `Sec-Fetch-Site` either. Scripts that
+  drive the panel (e.g. the E2E harness) send `Sec-Fetch-Site: same-origin`
+  or the form token from the page (hidden field `_csrf`).
 - **Pairing codes.** The pairing code is a short-lived approval credential:
   it is shown only in the panel page - never in a URL (browser history,
   access logs) or the add-on log. Approve a code only on `app.linumiq.net`
@@ -499,10 +506,20 @@ retire it).
   sent you). Click **Unpair** immediately and pair again.
 - **Add-on unpaired after restoring a backup**: expected - pairing data is not
   included in backups. Pair again (see [Backups and restore](#backups-and-restore)).
-- **"Forbidden: cross-site request"**: a POST to the panel did not come from
-  the panel page itself (missing `Sec-Fetch-Site: same-origin` / matching
-  `Origin`). Open the panel through Home Assistant (sidebar or the add-on's
-  *Open Web UI*); scripts must send `Sec-Fetch-Site: same-origin`.
+- **"Forbidden: cross-site request. Reload the panel and try again."**: a
+  button's request carried neither the panel's token nor a same-origin signal
+  from the browser. Usually the page was opened before the add-on restarted
+  (the token changes with every start): reload the panel (or the browser
+  page) and try again, and open the panel through Home Assistant (sidebar or
+  the add-on's *Open Web UI*). Versions 2.2.0 to 2.4.0 refused every button
+  when Home Assistant was opened over plain `http://` (for example
+  `http://homeassistant.local:8123` or an IP address): update to 2.4.1. The
+  add-on log names what the refused request carried, e.g.
+  `Rejecting cross-site POST //pair/start: sec-fetch-site=absent origin=null host=... x-forwarded-host=... x-forwarded-proto=http token=wrong`
+  (`token=absent|wrong|too-large`; token values are never logged) - include
+  that line when you report the problem. Scripts must send
+  `Sec-Fetch-Site: same-origin` or the form token (hidden field `_csrf` of
+  the page).
 - **frpc keeps reconnecting / "login to the server failed"**: check
   connectivity to the frps endpoint shown in the panel ("Tunnel server") and
   in the log line `frpc.toml rendered: server=...`. If the token was rotated

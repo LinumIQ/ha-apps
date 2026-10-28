@@ -51,8 +51,11 @@ class SharedLayoutTests(unittest.TestCase):
         self.assertIn('<meta name="color-scheme" content="light dark" />', layout)
         index = (TEMPLATES / "index.html").read_text()
         self.assertTrue(index.startswith('{% extends "_layout.html" %}'))
-        for block in ("title", "app_name", "app_subtitle", "flashes", "content", "footer_extra", "scripts"):
+        for block in ("title", "app_name", "app_subtitle", "flashes", "content", "scripts"):
             self.assertIn(f"{{% block {block}", index, block)
+        # The footer is the layout's alone: no "state version N" line (2.1.1).
+        self.assertNotIn("footer_extra", index)
+        self.assertNotIn("state.version", index)
         # The public certificate card stays a partial (GET public-cert renders it alone).
         self.assertNotIn("extends", (TEMPLATES / "_public_cert.html").read_text())
         self.assertNotIn("<html", (TEMPLATES / "_public_cert.html").read_text())
@@ -202,7 +205,9 @@ class RenderTests(unittest.TestCase):
                 self.assertIn("&lt;b&gt;x&lt;/b&gt;", html)
                 footer = html[html.index('<footer class="app-footer">'):]
                 self.assertIn('src="static/shared/brand/linumiq-logo.png"', footer)
-                self.assertIn("state version 2", footer)
+                self.assertNotIn("state version", html)
+                # Only the logo link is in the footer (2.1.1: no app lines).
+                self.assertNotIn("<p", footer[:footer.index("</footer>")])
                 self.assertIn('fetch("public-cert"', html[html.index("</footer>"):])
                 for url in ATTR_URL_RE.findall(html):
                     if ABSOLUTE_RE.match(url):
