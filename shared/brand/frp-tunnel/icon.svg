@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- LinumIQ ring (shared/brand/README.md) with a gap in the up-right wall -->
+  <g fill="none" stroke="#0883DA" stroke-width="9.42" stroke-linecap="round" stroke-linejoin="round" transform="translate(128 128) rotate(-45)">
+    <path d="M103.63 18V28.22A75.41 75.41 0 0 1 28.22 103.63H-28.22A75.41 75.41 0 0 1 -103.63 28.22V-28.22A75.41 75.41 0 0 1 -28.22 -103.63H28.22A75.41 75.41 0 0 1 103.63 -28.22V-18"/>
+    <path d="M77.37 18V28.26A49.11 49.11 0 0 1 28.26 77.37H-28.26A49.11 49.11 0 0 1 -77.37 28.26V-28.26A49.11 49.11 0 0 1 -28.26 -77.37H28.26A49.11 49.11 0 0 1 77.37 -28.26V-18"/>
+  </g>
+  <!-- route: Home Assistant (centre) out through the wall to the tunnel server -->
+  <g fill="none" stroke-width="9.42" stroke-linecap="round" transform="translate(128 128) rotate(-45)">
+    <circle cx="0" cy="0" r="16" stroke="#FF9D0B"/>
+    <path d="M16 0H118" stroke="#FF9D0B"/>
+    <circle cx="132" cy="0" r="14" stroke="#0883DA" stroke-opacity="0.7"/>
+  </g>
+</svg>

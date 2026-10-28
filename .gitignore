@@ -17,3 +17,6 @@ PRD.md.bak
 core.*
 __pycache__/
 *.pyc
+
+# Node dependencies of the brand render script (shared/brand/package.json)
+shared/brand/node_modules/
