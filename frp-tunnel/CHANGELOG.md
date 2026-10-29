@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.2] - 2026-10-29
+
+### Changed
+
+- **Buttons are blue in both modes, as on shop.linumiq.com**: the orange
+  call-to-action button of the pairing panel is gone - "Start Pairing" and
+  "Open pairing page" are blue like every other button. In dark mode the
+  buttons use the shop's lighter blue (`#60A4FA`, white text) instead of
+  Anchor Blue. Spark Orange stays for warnings. Nothing else changes; no
+  re-pairing needed.
+
 ## [2.4.1] - 2026-10-28
 
 Fixes the pairing panel's buttons when Home Assistant is opened over plain
