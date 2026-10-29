@@ -25,7 +25,16 @@ smoke tests check this). Theme: light by default, dark with
 `prefers-color-scheme: dark`; `data-theme="light"` / `"dark"` on `<html>`
 forces one. The header of `linumiq.css` lists the deliberate deviations from
 the brand specification (panel type scale, warning text colour, semantic
-colours) and the one contrast exception (white on Anchor Blue, 3.99:1).
+colours), the button rule and the contrast exceptions.
+
+Buttons are blue in both modes, as on https://shop.linumiq.com (the owner's
+rule of 2026-10-29): `.btn` is Anchor Blue `#0883DA` with white text in light
+mode and the shop's button blue `#60A4FA` with white text in dark mode;
+`.btn-secondary` (outlined) and `.btn-danger` (destructive, red) are the
+other two. No button is orange: Spark Orange is for highlights, warnings,
+badges and stripes. The white button text is the one contrast exception,
+3.99:1 on `#0883DA` (prescribed by the brand) and 2.56:1 on `#60A4FA` (the
+shop's colour, the owner's reference); every other text pair is >= 4.5:1.
 
 ## Tools (maintainers; not part of the images)
 
@@ -53,8 +62,9 @@ colours) and the one contrast exception (white on Anchor Blue, 3.99:1).
   ingress proxy lays it out and captures each state at 400 and 1100 px in
   light and dark as `<app>-<state>-<width>-<mode>.png`. It also checks every
   capture (no request leaves 127.0.0.1, Roboto and Inter loaded, no
-  horizontal scrolling, text contrast >= 4.5:1 / 3:1 for large text, the
-  `data-theme` switch) and writes `report.json`; exit 1 on a failed check.
+  horizontal scrolling, text contrast >= 4.5:1 / 3:1 for large text, no
+  orange button and every `.btn` in the mode's blue, the `data-theme`
+  switch) and writes `report.json`; exit 1 on a failed check.
 
 Run `scripts/sync-shared.sh` after every change here (the preview script
 refuses to run on stale copies).

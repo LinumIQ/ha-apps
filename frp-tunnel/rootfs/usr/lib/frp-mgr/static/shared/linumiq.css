@@ -25,8 +25,9 @@
      panels follow the browser's text size.
    - The brand's "Orange Text" #C77600 reaches only 3.5:1 on white, below
      the 4.5:1 needed for small text; warning TEXT in light mode uses
-     #975A00 (the same hue, 5.6:1). Spark Orange itself is used for the
-     call-to-action button, warning stripes, dots and borders.
+     #975A00 (the same hue, 5.6:1). Spark Orange itself is used for
+     highlights, warning stripes, dots, borders and badges - never for a
+     button (see Buttons).
    - Semantic colours outside the brand palette (necessary for status):
      success green and danger red, each as text, solid (dots, stripes,
      the destructive button) and soft (backgrounds) variants; warning is
@@ -35,9 +36,20 @@
    - Links: no underline (brand) except inside running text, where the
      colour alone does not set a link apart from the text.
 
+   Buttons (the owner's rule of 2026-10-29: blue buttons as on the shop,
+   shop.linumiq.com): buttons are blue in both modes, there is no orange
+   button. .btn is Anchor Blue #0883DA with white text in light mode
+   (hover and active #0668AD) and, in dark mode, the shop's button blue
+   #60A4FA (its --color-button 96,164,250) with white text (hover #7DB5FB,
+   active #4E93F8). .btn-secondary (outlined) and .btn-danger (red,
+   destructive) are the only other buttons.
+
    Contrast (WCAG 2.x): every text/background pair is >= 4.5:1 in both
-   modes, with one exception prescribed by the brand: white on Anchor Blue
-   (.btn) is 3.99:1 (3.5:1 on the dark-mode hover colour).
+   modes, with two exceptions, both the white text of .btn: on Anchor Blue
+   #0883DA 3.99:1 (light mode, prescribed by the brand) and on #60A4FA
+   2.56:1 (dark mode, the shop's button colour, the owner's reference;
+   2.13:1 on the hover colour #7DB5FB). Dark text on #60A4FA would reach
+   6.96:1 but would no longer match the shop.
 
    Theme: light by default; dark when the browser prefers it, unless the
    root element (<html>) has data-theme="light"; data-theme="dark" forces
@@ -85,8 +97,8 @@
   color-scheme: light;
 
   /* Brand */
-  --li-anchor-blue: #0883da;   /* Primary: logos, primary buttons */
-  --li-spark-orange: #ff9d0b;  /* Accent: the call to action, warnings */
+  --li-anchor-blue: #0883da;   /* Primary: logos, buttons */
+  --li-spark-orange: #ff9d0b;  /* Accent: highlights, warnings, badges; never buttons */
   --li-deep-navy: #052e4a;
 
   /* Surfaces and text */
@@ -101,12 +113,12 @@
 
   /* Actions */
   --color-primary: var(--li-anchor-blue);
-  --color-primary-hover: #0668ad;
   --color-primary-soft: #e6f3fb;   /* Anchor Blue 10 % on white */
-  --color-on-primary: #ffffff;
-  --color-accent: var(--li-spark-orange);
-  --color-accent-hover: #f08c00;
-  --color-on-accent: var(--li-deep-navy);
+  --color-button: var(--li-anchor-blue);   /* .btn, blue in both modes */
+  --color-button-hover: #0668ad;
+  --color-button-active: #0668ad;
+  --color-on-button: #ffffff;
+  --color-accent: var(--li-spark-orange);   /* highlights, stripes; never a button */
   --color-focus: var(--li-anchor-blue);
 
   /* Code */
@@ -170,9 +182,10 @@
     --color-link: #4eb5ff;
     --color-border: rgba(226, 232, 240, 0.12);
     --color-border-strong: rgba(226, 232, 240, 0.28);
-    --color-primary-hover: #1a8ddf;
     --color-primary-soft: #253d56;   /* #4EB5FF 14 % on the surface */
-    --color-accent-hover: #ffab33;
+    --color-button: #60a4fa;         /* the shop's dark-mode button blue */
+    --color-button-hover: #7db5fb;
+    --color-button-active: #4e93f8;
     --color-focus: #4eb5ff;
     --color-code-bg: #0b1120;
     --color-code-inline-bg: #0f172a;
@@ -203,9 +216,10 @@
   --color-link: #4eb5ff;
   --color-border: rgba(226, 232, 240, 0.12);
   --color-border-strong: rgba(226, 232, 240, 0.28);
-  --color-primary-hover: #1a8ddf;
   --color-primary-soft: #253d56;   /* #4EB5FF 14 % on the surface */
-  --color-accent-hover: #ffab33;
+  --color-button: #60a4fa;         /* the shop's dark-mode button blue */
+  --color-button-hover: #7db5fb;
+  --color-button-active: #4e93f8;
   --color-focus: #4eb5ff;
   --color-code-bg: #0b1120;
   --color-code-inline-bg: #0f172a;
@@ -405,10 +419,10 @@ img {
 }
 
 /* ---------- Buttons ---------- */
-/* .btn = primary (Anchor Blue), .btn-cta = the one call to action of a
-   flow (Spark Orange), .btn-secondary, .btn-danger = destructive. */
+/* .btn = primary (blue in both modes, as on shop.linumiq.com; see the
+   header), .btn-secondary = outlined, .btn-danger = destructive. No button
+   is orange. */
 .btn,
-.btn-cta,
 .btn-secondary,
 .btn-danger {
   display: inline-flex;
@@ -431,35 +445,28 @@ img {
 }
 
 .btn:hover,
-.btn-cta:hover,
 .btn-secondary:hover,
 .btn-danger:hover {
   text-decoration: none;
 }
 
 .btn:active,
-.btn-cta:active,
 .btn-secondary:active,
 .btn-danger:active {
   transform: translateY(1px);
 }
 
 .btn {
-  background: var(--color-primary);
-  color: var(--color-on-primary);
+  background: var(--color-button);
+  color: var(--color-on-button);
 }
 
 .btn:hover {
-  background: var(--color-primary-hover);
+  background: var(--color-button-hover);
 }
 
-.btn-cta {
-  background: var(--color-accent);
-  color: var(--color-on-accent);
-}
-
-.btn-cta:hover {
-  background: var(--color-accent-hover);
+.btn:active {
+  background: var(--color-button-active);
 }
 
 .btn-secondary {
@@ -883,7 +890,6 @@ details.disclosure[open] > summary {
   }
 
   .btn,
-  .btn-cta,
   .btn-secondary,
   .btn-danger {
     padding-inline: 1rem;

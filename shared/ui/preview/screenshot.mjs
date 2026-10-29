@@ -19,8 +19,13 @@
 //   - no horizontal scrolling (scrollWidth <= viewport width) and no
 //     element sticking out to the right;
 //   - text contrast: every visible text against its composited background,
-//     >= 4.5:1 (>= 3:1 for large text); the brand's white on Anchor Blue
-//     (.btn, 3.99:1) is reported separately as the documented exception;
+//     >= 4.5:1 (>= 3:1 for large text); the white text of the blue .btn is
+//     reported separately as the documented exception (on Anchor Blue
+//     3.99:1 in light mode, on the shop's #60A4FA 2.56:1 in dark mode);
+//   - buttons are blue, never orange (the owner's rule of 2026-10-29, as on
+//     shop.linumiq.com): no visible button has an orange background, and
+//     every .btn (not hovered or pressed) is Anchor Blue in light mode and
+//     #60A4FA in dark mode; orange is left to warnings, badges and stripes;
 //   - the theme switch: data-theme="light" on <html> wins over a dark
 //     preference, data-theme="dark" over a light one (first page only).
 import { createServer } from "node:http";
@@ -34,6 +39,8 @@ const OUT = path.join(here, "out");
 const target = path.resolve(process.argv[2] ?? path.join(OUT, "screenshots"));
 const WIDTHS = [400, 1100];
 const MODES = ["light", "dark"];
+// The background of .btn per mode (linumiq.css --color-button).
+const BUTTON_BLUE = { light: "rgb(8, 131, 218)", dark: "rgb(96, 164, 250)" };
 const TYPES = {
   ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml",
   ".png": "image/png", ".woff2": "font/woff2", ".txt": "text/plain; charset=utf-8", ".md": "text/plain; charset=utf-8",
@@ -130,6 +137,21 @@ function audit() {
       (el.closest(".btn") ? exceptions : low).push(entry);
     }
   }
+  // Buttons: blue in both modes, never orange (hue 15-50 degrees, saturated, bright).
+  const orange = ([r, g, b]) => {
+    const max = Math.max(r, g, b), min = Math.min(r, g, b);
+    if (max < 128 || max - min < 0.5 * max || max !== r) return false;
+    const hue = (60 * (g - b)) / (max - min);
+    return hue >= 15 && hue <= 50;
+  };
+  const buttons = [];
+  for (const el of document.querySelectorAll('button, input[type="submit"], .btn, .btn-secondary, .btn-danger')) {
+    if (!el.getClientRects().length || el.closest(".visually-hidden")) continue;
+    const bg = background(el);
+    buttons.push({ element: describe(el), text: el.textContent.trim().replace(/\s+/g, " ").slice(0, 40),
+                   background: `rgb(${bg.slice(0, 3).map(Math.round).join(", ")})`, orange: orange(bg),
+                   primary: el.matches(".btn") && !el.matches(":hover, :active") });
+  }
   const vw = document.documentElement.clientWidth;
   const sticking = [];
   for (const el of document.querySelectorAll("body *")) {
@@ -140,7 +162,7 @@ function audit() {
   }
   const faces = [...document.fonts].filter((f) => f.status === "loaded").map((f) => `${f.family} ${f.weight}`);
   return {
-    checked, low, exceptions, scrollWidth: document.documentElement.scrollWidth, viewport: vw,
+    checked, low, exceptions, buttons, scrollWidth: document.documentElement.scrollWidth, viewport: vw,
     sticking: sticking.slice(0, 10), faces: [...new Set(faces)],
     headingFont: getComputedStyle(document.querySelector("h1")).fontFamily,
   };
@@ -172,6 +194,10 @@ for (const page of manifest.pages) {
       if (result.scrollWidth > width) problems.push(`horizontal scrolling: ${result.scrollWidth} > ${width}`);
       if (result.sticking.length) problems.push(`elements beyond the right edge: ${result.sticking.join("; ")}`);
       if (result.low.length) problems.push(`low contrast: ${result.low.map((l) => `${l.element} "${l.text}" ${l.ratio}`).join("; ")}`);
+      const orangeButtons = result.buttons.filter((b) => b.orange);
+      if (orangeButtons.length) problems.push(`orange buttons: ${orangeButtons.map((b) => `${b.element} "${b.text}" ${b.background}`).join("; ")}`);
+      const offBlue = result.buttons.filter((b) => b.primary && b.background !== BUTTON_BLUE[mode]);
+      if (offBlue.length) problems.push(`.btn not ${BUTTON_BLUE[mode]}: ${offBlue.map((b) => `${b.element} "${b.text}" ${b.background}`).join("; ")}`);
       for (const face of ["Roboto", "Inter"]) {
         if (!result.faces.some((f) => f.includes(face))) problems.push(`${face} not loaded`);
       }
@@ -206,6 +232,10 @@ await browser.close();
 server.close();
 await writeFile(path.join(target, "report.json"), JSON.stringify({ screenshots: report, themes }, null, 2) + "\n");
 const exceptions = new Set(report.flatMap((r) => r.exceptions.map((e) => `${e.text} ${e.ratio}:1 on ${e.background}`)));
+const buttonCount = report.reduce((n, r) => n + r.buttons.length, 0);
+const blueCount = report.reduce((n, r) => n + r.buttons.filter((b) => b.primary).length, 0);
+const orangeCount = report.reduce((n, r) => n + r.buttons.filter((b) => b.orange).length, 0);
 console.log(`\n${report.length} screenshots in ${target}; ${failed} failed check(s).`);
-console.log(`Documented exception (white on Anchor Blue .btn): ${[...exceptions].join("; ") || "none"}`);
+console.log(`Buttons: ${buttonCount} visible, ${orangeCount} orange; ${blueCount} .btn checked against ${Object.values(BUTTON_BLUE).join(" / ")}.`);
+console.log(`Documented exceptions (white text on the blue .btn): ${[...exceptions].join("; ") || "none"}`);
 process.exit(failed ? 1 : 0);

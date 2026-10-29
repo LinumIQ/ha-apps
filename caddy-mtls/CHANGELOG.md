@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.2] - 2026-10-29
+
+### Changed
+
+- **Buttons are blue in both modes, as on shop.linumiq.com**: in dark mode
+  the buttons of the web interface use the shop's lighter blue (`#60A4FA`,
+  white text) instead of Anchor Blue; in light mode they stay Anchor Blue.
+  Spark Orange stays for warnings such as "Renewal failing". Nothing else
+  changes.
+
 ## [2.1.1] - 2026-10-28
 
 ### Removed
