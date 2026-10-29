@@ -76,7 +76,7 @@
         </ol>
         <form method="post" action="./pair/start">
           <input type="hidden" name="_csrf" value="{{ csrf_token }}" />
-          <button class="btn-cta" type="submit">Start Pairing</button>
+          <button class="btn" type="submit">Start Pairing</button>
         </form>
       </section>
       {% endif %}
@@ -104,7 +104,7 @@
             href="{{ verification_uri_complete }}"
             target="_blank"
             rel="noopener noreferrer"
-            class="btn-cta"
+            class="btn"
           >
             Open pairing page &nearr;
           </a>

@@ -154,6 +154,30 @@ class ThemeTests(unittest.TestCase):
         self.assertIn("@media (prefers-color-scheme: dark)", css)
         self.assertIn("@media (prefers-reduced-motion: reduce)", css)
 
+    def test_buttons_are_blue_in_both_modes(self):
+        """The owner's rule of 2026-10-29: buttons are blue as on
+        shop.linumiq.com - Anchor Blue in light mode, the shop's #60A4FA in
+        dark mode, white text in both - and no button is orange (the
+        call-to-action class .btn-cta is gone)."""
+        css = re.sub(r"/\*.*?\*/", "", (STATIC / "shared" / "linumiq.css").read_text(), flags=re.S)
+        light = re.search(r"^:root\s*\{(.*?)^\}", css, re.S | re.M)[1]
+        self.assertIn("--li-anchor-blue: #0883da;", light)
+        self.assertIn("--color-button: var(--li-anchor-blue);", light)
+        self.assertIn("--color-on-button: #ffffff;", light)
+        dark = re.search(r':root\[data-theme="dark"\]\s*\{(.*?)\}', css, re.S)[1]
+        self.assertIn("--color-button: #60a4fa;", dark)
+        self.assertNotIn("--color-on-button", dark)  # white text in both modes
+        btn = re.search(r"^\.btn\s*\{(.*?)\}", css, re.S | re.M)[1]
+        self.assertIn("background: var(--color-button);", btn)
+        self.assertIn("color: var(--color-on-button);", btn)
+        for sheet in css_files():
+            text = re.sub(r"/\*.*?\*/", "", sheet.read_text(), flags=re.S)
+            self.assertNotIn("btn-cta", text, sheet.name)
+            for selector, body in re.findall(r"([^{}]+)\{([^{}]*)\}", text):
+                if "btn" in selector or "button" in selector:
+                    with self.subTest(css=sheet.name, selector=selector.strip()):
+                        self.assertNotRegex(body, r"accent|orange|--color-warn|#ff9d0b|#f08c00")
+
 
 @unittest.skipIf(jinja2 is None, "Jinja2 not installed (run inside the add-on image)")
 class RenderTests(unittest.TestCase):

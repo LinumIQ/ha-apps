@@ -680,10 +680,16 @@ class PanelFlowTests(unittest.TestCase):
                 self.assertIn('rel="noopener noreferrer"', footer)
                 self.assertIn('src="static/shared/brand/linumiq-logo.png"', footer)
                 self.assertIn('alt="LinumIQ"', footer)
-        # The single call to action of the pairing flow is the orange button.
-        self.assertIn('<button class="btn-cta" type="submit">Start Pairing</button>', pages["unpaired"])
-        self.assertIn('class="btn-cta"', pages["pairing"])
-        self.assertNotIn("btn-cta", pages["paired"] + pages["approved_no_tunnel"])
+        # Buttons are blue (.btn) as on shop.linumiq.com (owner, 2026-10-29):
+        # the pairing flow's two buttons too, and the orange call-to-action
+        # class is gone from every state.
+        self.assertIn('<button class="btn" type="submit">Start Pairing</button>', pages["unpaired"])
+        self.assertRegex(pages["pairing"], r'<a\s[^>]*\bclass="btn"[^>]*>\s*Open pairing page')
+        for state, body in pages.items():
+            with self.subTest(state=state):
+                self.assertNotIn("btn-cta", body)
+        for css in sorted((FRP_MGR / "static").rglob("*.css")):
+            self.assertNotIn("btn-cta", css.read_text(), css.name)
 
     def test_no_external_resources(self):
         """Nothing is loaded from another host (no Google Fonts, no CDN): every
