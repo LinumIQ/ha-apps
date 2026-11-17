@@ -10,7 +10,7 @@ ARG BUILD_FROM=ghcr.io/hassio-addons/base:21.0.10
 # resulting image into the local Docker daemon and thus breaks the HA
 # builder's subsequent `docker tag` step.
 # golang 1.27.3-alpine3.24, multi-arch index digest 2026-10-27
-FROM golang:1.27.3-alpine3.24@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS caddy-builder
+FROM golang:1.27.3-alpine3.24@sha256:fa3d596898d9f126af7c01d14ee7597bab3f39cccf392ef36b69fe77cd681f18 AS caddy-builder
 
 # Caddy 2.11.7: 2.11.6 fixed GHSA-6365-7ppr-5r92, 2.11.7 fixed 2.11.6's
 # stream regressions. The DNS provider modules are pinned to release tags
