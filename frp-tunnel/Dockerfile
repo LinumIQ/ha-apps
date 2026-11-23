@@ -29,11 +29,15 @@ ARG FRP_SHA256_ARM64=02180b857480302fd934e9ddbd50fe2f73229f99062f88756abc6de9df5
 #     (set by the base image to Home Assistant's wheel index) is unset: only
 #     PyPI is consulted, exactly as when requirements.txt was generated.
 #   - libcrypto3 + libssl3 (OpenSSL, used by Python's ssl module for the
-#     panel's HTTPS calls to the LinumIQ server): the base image pins them in
-#     its apk world (`libcrypto3=<ver>`, 3.5.9-r0 in base 21.0.11), so
-#     `apk add python3` alone kept that version even after Alpine shipped a
-#     fixed one (3.5.9-r1). Naming them replaces the pin: every build installs
-#     the repository's current OpenSSL, as caddy-mtls does.
+#     panel's HTTPS calls to the LinumIQ server): the base image installs and
+#     pins them (`libcrypto3=<ver>` in its apk world, 3.5.9-r0 in base
+#     21.0.11), so `apk add python3` alone kept that version even after
+#     Alpine shipped a fixed one (3.5.9-r1). `apk add --upgrade` with their
+#     names replaces the pin and upgrades them to the repository's current
+#     OpenSSL on every build (a plain `apk add` of an installed package keeps
+#     its version unless a new dependency needs a newer one: that is what
+#     upgrades them in caddy-mtls, whose `openssl` needs the exact same
+#     version). The build prints the installed versions.
 # hadolint ignore=DL3003
 RUN set -eux; \
     case "${BUILD_ARCH}" in \
@@ -58,7 +62,8 @@ COPY requirements.txt /tmp/frp-mgr-requirements.txt
 # hadolint ignore=DL3018
 RUN set -eux; \
     unset PIP_EXTRA_INDEX_URL; \
-    apk add --no-cache libcrypto3 libssl3 python3; \
+    apk add --no-cache --upgrade libcrypto3 libssl3; \
+    apk add --no-cache python3; \
     apk info -e -v libcrypto3 libssl3; \
     python3 -m venv /usr/lib/frp-mgr/.venv; \
     /usr/lib/frp-mgr/.venv/bin/pip install --no-cache-dir --disable-pip-version-check \
