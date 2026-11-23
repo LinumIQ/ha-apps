@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.3] - 2026-11-24
+
+Security and dependency update. No re-pairing needed; the panel and the
+tunnel work as before.
+
+### Security
+
+- **OpenSSL is updated with the image.** The add-on kept the base image's
+  pinned OpenSSL (`libcrypto3`/`libssl3` 3.5.9-r0) even after Alpine had
+  shipped a fixed one; it now installs the current version, 3.5.9-r1
+  (CVE-2026-88822, CVE-2026-88823, CVE-2026-95691, CVE-2026-95692,
+  CVE-2026-107496: QUIC, AES-GCM-SIV and CMS - none of which the add-on
+  uses for its HTTPS calls to the LinumIQ server).
+- frpc 0.72.0 is built by upstream with Go 1.26.10 (0.71.1: Go 1.26.8),
+  which fixes flaws in Go's standard library (net/http, crypto/tls,
+  crypto/x509). None is on the path frpc uses here: a TLS client pinned to
+  the LinumIQ certificate authority, without an HTTP server.
+
+### Changed
+
+- **frpc 0.72.0** (was 0.71.1): fixes a 100 % CPU loop after a tunnel
+  session ends (which could also delay reconnecting) and a data race that
+  could crash frpc while logging. Nothing changes in what the add-on writes
+  to `frpc.toml`, in the certificate pinning (`trustedCaFile`; frpc's new
+  `useSystemCa` option stays off) or in the log lines the panel evaluates.
+  frp's compatibility policy covers frpc 0.72 with frps 0.64 - 0.80; the
+  LinumIQ server runs frps 0.72.0.
+
+| Component | 2.4.2 | 2.4.3 |
+| --- | --- | --- |
+| Base image `ghcr.io/hassio-addons/base` | 21.0.10 | 21.0.11 |
+| Alpine | 3.24.3 | 3.24.4 |
+| OpenSSL (`libcrypto3`/`libssl3`) | 3.5.9-r0 | 3.5.9-r1 |
+| libexpat | 2.9.0 | 2.10.0 |
+| tzdata | 2026e | 2026f |
+| frpc (fatedier/frp) | 0.71.1 | 0.72.0 |
+| python-multipart | 0.0.32 | 0.0.34 |
+| anyio, click | 4.15.1, 8.5.0 | 4.16.0, 8.5.1 |
+| CPython, Starlette, uvicorn, Jinja2 | 3.14.10, 1.10.0, 0.54.0, 3.1.6 | unchanged |
+
 ## [2.4.2] - 2026-10-29
 
 ### Changed

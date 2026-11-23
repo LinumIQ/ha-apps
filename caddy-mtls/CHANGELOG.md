@@ -5,6 +5,59 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.3] - 2026-11-24
+
+Security update. Nothing changes in the configuration, the certificates or
+the web interface.
+
+### Security
+
+- **Caddy 2.11.9** (was 2.11.7) with golang.org/x/net 0.60.0: fixes four
+  denial-of-service flaws in the HTTP/2 server that serves the add-on's
+  HTTPS port (GO-2026-6603: memory exhaustion through trailers,
+  GO-2026-6611: CPU load through repeated window updates, GO-2026-6612:
+  flow-control accounting, GO-2026-6617: a crash from an HPACK race). With
+  `mtls_enabled: true` (the default) only clients with a valid client
+  certificate could reach them; with `mtls_enabled: false` anyone could.
+  The security fixes in Caddy 2.11.8 and 2.11.9 themselves (PHP/FastCGI,
+  `{host}`-based roots, the file matcher, rewrites) do not affect the
+  add-on's configuration.
+- Go 1.27.4 for the Caddy build: fixes in net/http and in the Go toolchain;
+  none is on a path the add-on uses, the binary is rebuilt with it.
+- **FastAPI 0.163.2** (was 0.162.0): GHSA-f56c-v883-vx8r, quadratic
+  processing of form parameters. The web interface's forms were affected;
+  only Home Assistant administrators reach them (through ingress), and
+  Starlette already limited a form to 1,000 fields.
+- pydantic 2.14.3 (GHSA-qpmf-fgh3-ff25, GHSA-3r8g-cqwr-jr29) and
+  opentelemetry-api 1.45.2 (GHSA-mf5v-w3w3-f6cg): the affected features
+  are not used by the add-on.
+- OpenSSL 3.5.9-r1 (CVE-2026-88822, CVE-2026-88823, CVE-2026-95691,
+  CVE-2026-95692, CVE-2026-107496: QUIC, AES-GCM-SIV and CMS - not used by
+  the add-on's certificate operations).
+
+### Changed
+
+| Component | 2.1.2 | 2.1.3 |
+| --- | --- | --- |
+| Base image `ghcr.io/hassio-addons/base` | 21.0.10 | 21.0.11 |
+| Alpine | 3.24.3 | 3.24.4 |
+| OpenSSL | 3.5.9-r0 | 3.5.9-r1 |
+| libexpat | 2.9.0 | 2.10.0 |
+| tzdata | 2026e | 2026f |
+| Caddy | v2.11.7 | v2.11.9 |
+| Go (Caddy build stage) | 1.27.3 | 1.27.4 |
+| golang.org/x/net (in Caddy) | 0.59.0 | 0.60.0 |
+| `caddy-dns/route53` | v1.6.2 | v1.6.3 (libdns/route53 v1.6.3) |
+| `caddy-dns/cloudflare`, `caddy-dns/hetzner/v2` | v0.2.4, v2.0.1 | unchanged |
+| FastAPI | 0.162.0 | 0.163.2 |
+| pydantic / pydantic-core | 2.14.1 / 2.50.1 | 2.14.3 / 2.50.4 |
+| python-multipart | 0.0.32 | 0.0.34 |
+| opentelemetry-api, anyio, click | 1.45.1, 4.15.1, 8.5.0 | 1.45.2, 4.16.0, 8.5.1 |
+
+- The image's build log now lists the complete build information of the
+  Caddy binary (Go version and every linked module), so each release can be
+  checked against advisories.
+
 ## [2.1.2] - 2026-10-29
 
 ### Changed
