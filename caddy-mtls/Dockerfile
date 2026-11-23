@@ -1,5 +1,4 @@
 # shellcheck shell=bash disable=SC2034
-# syntax=docker/dockerfile:1.7
 ARG BUILD_FROM=ghcr.io/hassio-addons/base:21.0.11
 
 # ---- Stage 1: Build a custom Caddy with DNS provider modules via xcaddy ----
