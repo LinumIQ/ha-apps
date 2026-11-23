@@ -10,7 +10,7 @@
 # it is unset so that only PyPI is consulted, as in the image build):
 #
 #   docker run --rm -v "$PWD/caddy-mtls:/w" -w /w --entrypoint sh \
-#       ghcr.io/hassio-addons/base:21.0.10 -c 'unset PIP_EXTRA_INDEX_URL &&
+#       ghcr.io/hassio-addons/base:21.0.11 -c 'unset PIP_EXTRA_INDEX_URL &&
 #       apk add --no-cache python3 >/dev/null &&
 #       python3 -m venv /tmp/v && /tmp/v/bin/pip -q install pip-tools==7.6.2 &&
 #       /tmp/v/bin/pip-compile -q --generate-hashes --allow-unsafe --strip-extras

@@ -552,7 +552,7 @@ The image can be started without Supervisor (this is what the smoke tests in
 Tests (both need docker; run them against an image built from this directory):
 
 ```sh
-docker build --build-arg BUILD_FROM=ghcr.io/hassio-addons/base:21.0.10 \
+docker build --build-arg BUILD_FROM=ghcr.io/hassio-addons/base:21.0.11 \
     --build-arg BUILD_ARCH=amd64 -t caddy-mtls-test caddy-mtls
 caddy-mtls/tests/smoke.sh caddy-mtls-test
 caddy-mtls/tests/apparmor-smoke.sh caddy-mtls-test caddy-mtls/apparmor.txt

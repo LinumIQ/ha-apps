@@ -166,7 +166,7 @@ jobs:
         with:
           persist-credentials: false
 
-      # Same CPython minor version as the add-on image (base 21.0.10 =
+      # Same CPython minor version as the add-on image (base 21.0.11 =
       # Alpine 3.24: 3.14).
       - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -210,7 +210,7 @@ jobs:
       - name: Build the amd64 image
         run: >-
           docker build
-          --build-arg BUILD_FROM=ghcr.io/hassio-addons/base:21.0.10
+          --build-arg BUILD_FROM=ghcr.io/hassio-addons/base:21.0.11
           --build-arg BUILD_ARCH=amd64
           -t frp-tunnel-test
           frp-tunnel
@@ -244,7 +244,7 @@ jobs:
         with:
           persist-credentials: false
 
-      # Same CPython minor version as the add-on image (base 21.0.10 =
+      # Same CPython minor version as the add-on image (base 21.0.11 =
       # Alpine 3.24: 3.14).
       - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -281,7 +281,7 @@ jobs:
       - name: Build the amd64 image
         run: >-
           docker build
-          --build-arg BUILD_FROM=ghcr.io/hassio-addons/base:21.0.10
+          --build-arg BUILD_FROM=ghcr.io/hassio-addons/base:21.0.11
           --build-arg BUILD_ARCH=amd64
           -t caddy-mtls-test
           caddy-mtls

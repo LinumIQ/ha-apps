@@ -3,11 +3,11 @@
 # requirements.txt is generated from this file with hashes and installed in
 # the image with `pip install --require-hashes --only-binary=:all:` into a
 # virtualenv (/usr/lib/frp-mgr/.venv). Regenerate it - with the Python
-# version of the image (base 21.0.10 = Alpine 3.24, CPython 3.14) - after
+# version of the image (base 21.0.11 = Alpine 3.24, CPython 3.14) - after
 # changing a pin (podman works the same way):
 #
 #   docker run --rm -v "$PWD/frp-tunnel:/w" -w /w --entrypoint sh \
-#       ghcr.io/hassio-addons/base:21.0.10 -c 'unset PIP_EXTRA_INDEX_URL &&
+#       ghcr.io/hassio-addons/base:21.0.11 -c 'unset PIP_EXTRA_INDEX_URL &&
 #       apk add --no-cache python3 >/dev/null &&
 #       python3 -m venv /tmp/v && /tmp/v/bin/pip -q install pip-tools==7.6.2 &&
 #       /tmp/v/bin/pip-compile -q --generate-hashes --allow-unsafe --strip-extras

@@ -14,7 +14,7 @@ updates:
   # <add-on>/requirements.in (direct pins) -> requirements.txt
   # (pip-compile --generate-hashes; Dependabot re-runs pip-compile with the
   # options recorded in the file's header, so the hashes stay complete). The
-  # images run CPython 3.14 (base 21.0.10 = Alpine 3.24): a Dependabot lock
+  # images run CPython 3.14 (base 21.0.11 = Alpine 3.24): a Dependabot lock
   # made with another Python must be re-checked with the command in the
   # requirements.in header before merging.
   - package-ecosystem: "pip"
@@ -33,7 +33,7 @@ updates:
 
   # FROM lines with a literal image (e.g. caddy-mtls' golang builder stage).
   # The Home Assistant base image (currently ghcr.io/hassio-addons/base
-  # 21.0.10) comes in through build.yaml / ARG BUILD_FROM, which Dependabot
+  # 21.0.11) comes in through build.yaml / ARG BUILD_FROM, which Dependabot
   # does not resolve - bump it by hand in build.yaml, the Dockerfiles' ARG
   # defaults, the CI/E2E build commands (lint.yml, frp-tunnel/tests/e2e) and
   # the requirements.in headers, and re-lock requirements.txt with it.

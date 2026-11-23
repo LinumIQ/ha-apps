@@ -1,6 +1,6 @@
 # shellcheck shell=bash disable=SC2034
 # syntax=docker/dockerfile:1.7
-ARG BUILD_FROM=ghcr.io/hassio-addons/base:21.0.10
+ARG BUILD_FROM=ghcr.io/hassio-addons/base:21.0.11
 
 # ---- Stage 1: Build a custom Caddy with DNS provider modules via xcaddy ----
 # The Home Assistant builder runs this under QEMU for non-native target
@@ -67,13 +67,12 @@ ARG BUILD_VERSION
 #   - openssl: cert generation / CRL management
 #   - libcap:  setcap on the Caddy binary
 #   - libcrypto3 + libssl3: the base image pins them in its apk world
-#     (`libcrypto3=<ver>`, 3.5.9-r0 in base 21.0.10). Naming them here
+#     (`libcrypto3=<ver>`, 3.5.9-r0 in base 21.0.11). Naming them here
 #     replaces that pin, so they are upgraded together with `openssl`, which
 #     always requires the exactly matching libraries from the current
-#     repository. Today the pin equals the repository version (a no-op); the
-#     names keep the build working once Alpine ships a newer OpenSSL than the
-#     base image was built with (otherwise: "unable to select packages ...
-#     breaks: openssl").
+#     repository (3.5.9-r1 since 2026-11-18, newer than the base image).
+#     Without the names the build would fail with "unable to select
+#     packages ... breaks: openssl".
 #   - python3 + a virtualenv with the cert-mgr panel's dependencies (FastAPI,
 #     Starlette, uvicorn, Jinja2, python-multipart), installed by pip from
 #     requirements.txt with --require-hashes (wheels only, no compiler; pip
