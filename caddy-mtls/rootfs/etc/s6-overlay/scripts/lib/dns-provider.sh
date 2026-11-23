@@ -15,7 +15,7 @@
 # Syntax per module (UnmarshalCaddyfile at the pinned versions):
 #   cloudflare v0.2.4      dns cloudflare <api_token>     (positional or block)
 #   hetzner/v2 v2.0.1      dns hetzner <api_token>        (positional or block)
-#   route53 v1.6.2         dns route53 { access_key_id <id>
+#   route53 v1.6.3         dns route53 { access_key_id <id>
 #                                        secret_access_key <secret> }
 #                          (a positional argument is rejected; the option
 #                          value ACCESS_KEY_ID:SECRET_ACCESS_KEY is split at

@@ -13,16 +13,19 @@ ARG BUILD_FROM=ghcr.io/hassio-addons/base:21.0.11
 # security fixes in net/http and the toolchain, 2026-11-10)
 FROM golang:1.27.4-alpine3.24@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 AS caddy-builder
 
-# Caddy 2.11.7: 2.11.6 fixed GHSA-6365-7ppr-5r92, 2.11.7 fixed 2.11.6's
-# stream regressions. The DNS provider modules are pinned to release tags
-# (Go's checksum database verifies their contents); all three implement the
-# libdns v1 API that Caddy >= 2.10 requires. hetzner v2 is a new major
-# version (module path .../hetzner/v2) for the Hetzner Console's Cloud DNS
-# API; v1 implemented the deprecated DNS Console API (dns.hetzner.com).
-ARG CADDY_VERSION=v2.11.7
+# Caddy 2.11.9: its security fixes (2.11.8, 2.11.9) are in features this
+# add-on's Caddyfile does not use, but it brings golang.org/x/net 0.60.0,
+# which fixes four denial-of-service flaws in the HTTP/2 server Caddy serves
+# HTTPS with (GO-2026-6603, -6611, -6612, -6617). The DNS provider modules
+# are pinned to release tags (Go's checksum database verifies their
+# contents); all three implement the libdns v1 API that Caddy >= 2.10
+# requires. hetzner v2 is a new major version (module path .../hetzner/v2)
+# for the Hetzner Console's Cloud DNS API; v1 implemented the deprecated DNS
+# Console API (dns.hetzner.com).
+ARG CADDY_VERSION=v2.11.9
 ARG XCADDY_VERSION=v0.4.7
 ARG CADDY_DNS_CLOUDFLARE=github.com/caddy-dns/cloudflare@v0.2.4
-ARG CADDY_DNS_ROUTE53=github.com/caddy-dns/route53@v1.6.2
+ARG CADDY_DNS_ROUTE53=github.com/caddy-dns/route53@v1.6.3
 ARG CADDY_DNS_HETZNER=github.com/caddy-dns/hetzner/v2@v2.0.1
 
 ENV CGO_ENABLED=0
@@ -35,8 +38,11 @@ SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
 # Install xcaddy and immediately use it to build a custom Caddy binary
 # (kept in a single RUN layer to satisfy hadolint DL3059 and because the
 # intermediate xcaddy binary is not needed in the final builder image).
-# The build fails unless the binary reports the pinned version and lists
-# every DNS provider module (one grep per module, each must match).
+# The build fails unless the binary reports the pinned version, lists
+# every DNS provider module (one grep per module, each must match) and was
+# built by this stage's Go. The complete build info (Go version and every
+# linked module with its version and checksum) is printed into the build
+# log, so the module set of each image can be checked against advisories.
 RUN go install "github.com/caddyserver/xcaddy/cmd/xcaddy@${XCADDY_VERSION}" \
  && xcaddy build "${CADDY_VERSION}" \
         --with "${CADDY_DNS_CLOUDFLARE}" \
@@ -48,7 +54,9 @@ RUN go install "github.com/caddyserver/xcaddy/cmd/xcaddy@${XCADDY_VERSION}" \
  && grep -qx 'dns\.providers\.route53' /tmp/caddy-modules.txt \
  && grep -qx 'dns\.providers\.hetzner' /tmp/caddy-modules.txt \
  && /caddy version | grep -q "^${CADDY_VERSION} " \
- && /caddy build-info | grep -E '^dep\s+github\.com/(caddy-dns|libdns)/'
+ && /caddy build-info | tee /tmp/caddy-build-info.txt \
+ && grep -qx "go[[:space:]]$(go env GOVERSION)" /tmp/caddy-build-info.txt \
+ && grep -E '^dep\s+github\.com/(caddy-dns|libdns)/' /tmp/caddy-build-info.txt
 
 # ---- Stage 2: Final image based on community add-ons base (s6-overlay v3) ----
 # hadolint ignore=DL3006
