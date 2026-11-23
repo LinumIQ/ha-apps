@@ -19,9 +19,12 @@ the web interface.
   flow-control accounting, GO-2026-6617: a crash from an HPACK race). With
   `mtls_enabled: true` (the default) only clients with a valid client
   certificate could reach them; with `mtls_enabled: false` anyone could.
-  The security fixes in Caddy 2.11.8 and 2.11.9 themselves (PHP/FastCGI,
-  `{host}`-based roots, the file matcher, rewrites) do not affect the
-  add-on's configuration.
+  Caddy's own security fixes in 2.11.8 and 2.11.9 concern features the
+  add-on does not use (PHP/FastCGI, `{host}`-based roots, the file matcher,
+  rewrites) or are hardening without a known effect here (hop-by-hop
+  headers in interim responses from the upstream; conflicting `client_auth`
+  between site blocks, which cannot occur with the add-on's one HTTPS
+  site).
 - Go 1.27.4 for the Caddy build: fixes in net/http and in the Go toolchain;
   none is on a path the add-on uses, the binary is rebuilt with it.
 - **FastAPI 0.163.2** (was 0.162.0): GHSA-f56c-v883-vx8r, quadratic
@@ -34,6 +37,11 @@ the web interface.
 - OpenSSL 3.5.9-r1 (CVE-2026-88822, CVE-2026-88823, CVE-2026-95691,
   CVE-2026-95692, CVE-2026-107496: QUIC, AES-GCM-SIV and CMS - not used by
   the add-on's certificate operations).
+- libexpat 2.10.0 (CVE-2026-113351, CVE-2026-115506, CVE-2026-117610,
+  CVE-2026-118370: XML parsing) and libffi 3.8.1 (an upstream security
+  release for calls made through libffi, e.g. GHSA-fq46-69xf-x5gf), both
+  from Alpine: the add-on parses no XML and does not use Python's `ctypes`,
+  the only user of libffi in the image.
 
 ### Changed
 
@@ -41,8 +49,9 @@ the web interface.
 | --- | --- | --- |
 | Base image `ghcr.io/hassio-addons/base` | 21.0.10 | 21.0.11 |
 | Alpine | 3.24.3 | 3.24.4 |
-| OpenSSL | 3.5.9-r0 | 3.5.9-r1 |
-| libexpat | 2.9.0 | 2.10.0 |
+| OpenSSL * | 3.5.9-r0 | 3.5.9-r1 or newer |
+| libexpat * | 2.9.0 | 2.10.0 or newer |
+| libffi * | 3.5.2 | 3.8.1 or newer |
 | tzdata | 2026e | 2026f |
 | Caddy | v2.11.7 | v2.11.9 |
 | Go (Caddy build stage) | 1.27.3 | 1.27.4 |
@@ -53,6 +62,10 @@ the web interface.
 | pydantic / pydantic-core | 2.14.1 / 2.50.1 | 2.14.3 / 2.50.4 |
 | python-multipart | 0.0.32 | 0.0.34 |
 | opentelemetry-api, anyio, click | 1.45.1, 4.15.1, 8.5.0 | 1.45.2, 4.16.0, 8.5.1 |
+| annotated-doc, typing-inspection | 0.0.5, 0.4.4 | 0.0.6, 0.4.5 |
+
+\* From Alpine's package repository on the day the image is built: the
+published image has the version shown or a newer one.
 
 - The image's build log now lists the complete build information of the
   Caddy binary (Go version and every linked module), so each release can be
