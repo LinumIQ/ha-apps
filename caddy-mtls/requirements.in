@@ -22,13 +22,21 @@
 #                             GHSA-x746-7m8f-x49c, GHSA-82w8-qh3p-5jfq
 #   python-multipart >= 0.0.31  GHSA-wp53-j4wj-2cfg, GHSA-mj87-hwqh-73pj, GHSA-pp6c-gr5w-3c5g,
 #                             GHSA-5rvq-cxj2-64vf and lows
+#   fastapi >= 0.163.2        GHSA-f56c-v883-vx8r (quadratic processing of Form() parameters)
+# and for two dependencies of FastAPI (kept by the lock; re-lock with
+# --upgrade-package <name>==<version> so they never fall below):
+#   pydantic >= 2.14.2        GHSA-qpmf-fgh3-ff25, GHSA-3r8g-cqwr-jr29
+#   opentelemetry-api >= 1.45.2  GHSA-mf5v-w3w3-f6cg
+# (the FastAPI and pydantic advisories are published only in the projects'
+# GitHub repositories, not in OSV or GitHub's advisory database: pip-audit
+# and Dependabot alerts do not report them.)
 # Alpine 3.24's py3-starlette is 1.1.0 (below the minimum) - which is why the
 # panel does not use Alpine's py3-* packages.
 #
 # starlette is pinned directly: app.py imports it (BaseHTTPMiddleware) and the
 # pin enforces the security minimum independently of FastAPI's lower bound.
-fastapi==0.162.0
+fastapi==0.163.2
 starlette==1.10.0
 uvicorn==0.54.0
 jinja2==3.1.6
-python-multipart==0.0.32
+python-multipart==0.0.34
