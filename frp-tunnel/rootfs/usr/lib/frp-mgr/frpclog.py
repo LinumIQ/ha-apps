@@ -50,7 +50,7 @@ import config as cfg
 STATUS_VERSION = 1
 DEFAULT_STATUS_FILE = "/run/frp-mgr/frpc-status.json"
 
-# frpc log messages (client/service.go; unchanged from 0.65 to 0.71).
+# frpc log messages (client/service.go; unchanged from 0.65 to 0.72).
 _CONNECTING = "try to connect to server"
 _SUCCESS = "login to server success"
 _FAILURE_RE = re.compile(r"(?:connect to server error|login to the server failed): ?(.*)")

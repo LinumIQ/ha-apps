@@ -12,12 +12,12 @@ ARG BUILD_REF
 ARG BUILD_REPOSITORY
 ARG BUILD_VERSION
 
-# Pinned upstream frp release (v0.71.x line) and the SHA-256 of each release
+# Pinned upstream frp release (v0.72.x line) and the SHA-256 of each release
 # tarball, as published in the release's frp_sha256_checksums.txt. Bumping
 # FRP_VERSION requires updating both checksums; the build fails on a mismatch.
-ARG FRP_VERSION=0.71.1
-ARG FRP_SHA256_AMD64=1d9875210972a5d1a62b2dc4c48df45ab0af05d3ca1b5e494a014428259df803
-ARG FRP_SHA256_ARM64=8edf590b0c396fa42f9c147121a76af83cfc2002b08f5aef0ea1008c43482019
+ARG FRP_VERSION=0.72.0
+ARG FRP_SHA256_AMD64=daf719b32ca2778770bb92955e231a07414d754378b9af328aa2642862479804
+ARG FRP_SHA256_ARM64=02180b857480302fd934e9ddbd50fe2f73229f99062f88756abc6de9df5e95cf
 
 # The hassio-addons base already provides bash, jq, curl, tzdata,
 # ca-certificates, s6-overlay and bashio. Added here:
