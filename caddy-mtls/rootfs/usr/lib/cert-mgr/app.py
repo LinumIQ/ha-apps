@@ -132,9 +132,11 @@ def _caddy_reload() -> tuple[bool, str]:
     The `caddy` CLI converts the Caddyfile to JSON and POSTs it to /load on
     the admin endpoint. Before that, caddyctl regenerates the list of active
     client certificates from the ``active/`` folder (the header
-    authentication gate, 2.3.0); if that fails, Caddy is not reloaded and
-    the reload counts as failed. See caddyctl.py for what a reload re-reads
-    (the custom snippets only as the copies checked at the start).
+    authentication gate, 2.3.0); if that fails, Caddy is reloaded all the
+    same (with the previous list: revocation must not depend on it) and the
+    result is "not ok" with a message that says so. See caddyctl.py for what
+    a reload re-reads (the custom snippets only as the copies checked at the
+    start).
 
     ``--force`` is required: client changes never change the Caddyfile (the
     leaf verifier only names the ``active/`` folder, whose files Caddy reads
@@ -143,6 +145,16 @@ def _caddy_reload() -> tuple[bool, str]:
     still accepted until the add-on restarted.
     """
     return caddyctl.reload(caddy_bin=CADDY_BIN, caddyfile=CADDYFILE, admin=CADDY_ADMIN)
+
+
+def _reload_problem(message: str) -> str:
+    """The end of a "..., but ..." flash message after a reload that was not
+    ok: what caddyctl reports when only the list of active certificates
+    failed (Caddy did reload), else that reloading failed."""
+    if message.startswith("the list of active client certificates"):
+        text = message if len(message) <= 600 else message[:597] + "..."
+        return f"{text}. Check the add-on logs."
+    return "reloading Caddy failed. Check the add-on logs."
 
 
 def _validate_client_name(name: str) -> str:
@@ -509,8 +521,7 @@ async def add_client(request: Request, name: str = Form(...)):
     if not ok_reload:
         LOG.error("caddy reload after add_client failed: %s", msg)
         raise FlashError(
-            f"Client '{name}' was created, but reloading Caddy failed. "
-            "Check the add-on logs."
+            f"Client '{name}' was created, but {_reload_problem(msg)}"
         )
     return _redirect_home(request, ok=f"Client '{name}' created.")
 
@@ -547,8 +558,7 @@ async def revoke_client(request: Request, name: str, reason: str = Form("unspeci
     if not ok_reload:
         LOG.error("caddy reload after revoke_client failed: %s", msg)
         raise FlashError(
-            f"Client '{name}' was revoked, but reloading Caddy failed. "
-            "Check the add-on logs."
+            f"Client '{name}' was revoked, but {_reload_problem(msg)}"
         )
     return _redirect_home(request, ok=f"Client '{name}' revoked.")
 
@@ -597,8 +607,7 @@ async def regenerate_client(request: Request, name: str):
     if not ok_reload:
         LOG.error("caddy reload after regenerate_client failed: %s", msg)
         raise FlashError(
-            f"Client '{name}' was regenerated, but reloading Caddy failed. "
-            "Check the add-on logs."
+            f"Client '{name}' was regenerated, but {_reload_problem(msg)}"
         )
     return _redirect_home(request, ok=f"Client '{name}' regenerated.")
 
@@ -729,7 +738,7 @@ async def regenerate_ca(request: Request, confirm: str = Form(...)):
     if not ok_reload:
         LOG.error("caddy reload after regenerate_ca failed: %s", msg)
         raise FlashError(
-            "CA was regenerated, but reloading Caddy failed. Check the add-on logs."
+            f"CA was regenerated, but {_reload_problem(msg)}"
         )
     return _redirect_home(request, ok="CA regenerated.")
 

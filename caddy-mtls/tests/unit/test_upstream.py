@@ -879,6 +879,23 @@ class ApplyTest(TempFiles):
                          "adapting config using caddyfile: syntax error: unexpected token '{', "
                          "expecting '}', at /etc/caddy/Caddyfile:80")
 
+    def test_a_list_failure_counts_as_applied_for_the_mode(self) -> None:
+        """C-2: Caddy reloads despite a fingerprint list that could not be
+        written - so the forwarding mode in the snippet DID apply: "ok" for
+        _apply (no write-back of the old mode); caddyctl logs the list."""
+        done = mock.Mock(returncode=0, stderr="", stdout="")
+
+        def fail() -> None:
+            raise upstream.caddyctl.FingerprintError("cannot write x: read-only")
+        with mock.patch.object(upstream.subprocess, "run", return_value=done) as run, \
+                mock.patch.object(upstream.caddyctl, "write_fingerprints", side_effect=fail), \
+                mock.patch.object(upstream, "CADDYFILE", upstream.STATE_FILE), \
+                self.assertLogs("caddyctl", level="ERROR"):
+            upstream.STATE_FILE.write_text("{}")
+            ok, message = upstream.caddy_reload()
+        self.assertEqual((ok, message), (True, "reloaded"))
+        run.assert_called_once()
+
     def test_start_reports_the_facts(self) -> None:
         facts = upstream.start(self.settings(self.ha.port))
         self.assertEqual((facts["card"], facts["mode"], facts["source_address"], facts["suggestion"]),

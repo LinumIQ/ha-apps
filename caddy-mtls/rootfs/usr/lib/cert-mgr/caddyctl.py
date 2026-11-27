@@ -19,10 +19,12 @@ certificate), never kept separately. ``write_fingerprints`` renders them into
 FINGERPRINT_FILE (imported by the gate's matcher), atomically. It runs in
 init-caddy before rendering and in ``reload`` immediately before EVERY
 ``caddy reload`` the add-on performs (the panel: client add / revoke /
-regenerate, CA regenerate; upstream.py: the forwarding mode). If it fails, the
-reload does not happen and counts as failed. A stale list can only refuse a
-new client, never admit a revoked one: the leaf verifier refuses that one in
-the handshake.
+regenerate, CA regenerate; upstream.py: the forwarding mode). If it fails,
+Caddy is reloaded all the same - with the previous list, which is the safe
+direction: the reload refreshes the leaf verifier (a revoked certificate is
+refused in the handshake), and a stale list can only refuse a new client,
+never admit a revoked one. The failure is logged and reported (see
+``reload``).
 
 The value Caddy reports for "no certificate" is the SHA-256 of empty input
 (EMPTY_SHA256): it is never written, whatever the folder holds. No active
@@ -38,15 +40,19 @@ import base64
 import binascii
 import contextlib
 import hashlib
+import logging
 import os
 import re
 import subprocess
 import sys
 import tempfile
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import headerauth
+
+LOG = logging.getLogger("caddyctl")
 
 ACTIVE_DIR = Path(os.environ.get("CADDY_MTLS_ACTIVE_DIR", "/data/certs/active"))
 FINGERPRINT_FILE = Path(os.environ.get("CADDY_MTLS_FINGERPRINT_FILE", "/etc/caddy/client-fingerprints.caddy"))
@@ -65,7 +71,8 @@ _PEM_BLOCK = re.compile(rb"-----BEGIN ([A-Z0-9 ]+)-----\r?\n(.*?)-----END \1----
 
 
 class FingerprintError(OSError):
-    """The list could not be written (the reload must not go ahead)."""
+    """The list could not be written (Caddy is reloaded with the previous
+    one; the failure is reported)."""
 
 
 def _der_of(path: Path) -> bytes:
@@ -204,24 +211,56 @@ def write_fingerprints(folder: Path | None = None, path: Path | None = None) -> 
 Runner = Callable[..., subprocess.CompletedProcess]
 
 
-def reload(*, caddy_bin: str | None = None, caddyfile: Path | None = None, admin: str | None = None,
-           timeout: float = 60, run: Runner | None = None,
-           regenerate: Callable[[], object] | None = None) -> tuple[bool, str]:
+@dataclass(frozen=True)
+class ReloadResult:
+    """What ``reload_detailed`` did."""
+
+    #: Caddy took the configuration.
+    reloaded: bool
+    #: Why the fingerprint list could not be written ("" when it was).
+    list_error: str = ""
+    #: Caddy's output (scrubbed of the header key) when it did not reload.
+    caddy_error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.reloaded and not self.list_error
+
+    @property
+    def message(self) -> str:
+        """What happened, for the log, the panel and the state file."""
+        if self.ok:
+            return "reloaded"
+        if not self.list_error:
+            return self.caddy_error
+        what = f"the list of active client certificates could not be written ({self.list_error})"
+        if self.reloaded:
+            return (f"{what}; Caddy was reloaded with the previous list: revoked certificates are refused; "
+                    "with a header key set, a new or regenerated client certificate gets 403 until the "
+                    "list can be written (at the latest after a restart of the add-on)")
+        return f"{what}, and Caddy could not be reloaded: {self.caddy_error}"
+
+
+def reload_detailed(*, caddy_bin: str | None = None, caddyfile: Path | None = None, admin: str | None = None,
+                    timeout: float = 60, run: Runner | None = None,
+                    regenerate: Callable[[], object] | None = None) -> ReloadResult:
     """Regenerate the fingerprint list, then ``caddy reload --force`` (Caddy
     skips an unchanged config otherwise: a client change touches only the
-    active folder and the list). (ok, Caddy's output scrubbed of the header
-    key, or why it did not run)."""
+    active folder and the list) - also when the list could not be written:
+    the reload must not depend on it (revocation), and the previous list can
+    only refuse too much. A list failure is logged here as an ERROR line."""
     caddy_bin = CADDY_BIN if caddy_bin is None else caddy_bin
     caddyfile = CADDYFILE if caddyfile is None else caddyfile
     admin = CADDY_ADMIN if admin is None else admin
     run = subprocess.run if run is None else run
     regenerate = write_fingerprints if regenerate is None else regenerate
     if not caddyfile.exists():
-        return False, f"Caddyfile not found at {caddyfile}"
+        return ReloadResult(False, caddy_error=f"Caddyfile not found at {caddyfile}")
+    list_error = ""
     try:
         regenerate()
     except FingerprintError as err:
-        return False, f"the list of active client certificates could not be written ({err}); Caddy was not reloaded"
+        list_error = str(err)
     try:
         proc = run(
             [caddy_bin, "reload", "--force", "--config", str(caddyfile),
@@ -229,10 +268,24 @@ def reload(*, caddy_bin: str | None = None, caddyfile: Path | None = None, admin
             capture_output=True, text=True, check=False, timeout=timeout,
         )
     except (OSError, subprocess.SubprocessError) as err:
-        return False, headerauth.scrub(str(err))
-    if proc.returncode != 0:
-        return False, headerauth.scrub(proc.stderr or proc.stdout or "caddy reload failed")
-    return True, "reloaded"
+        result = ReloadResult(False, list_error, headerauth.scrub(str(err)))
+    else:
+        if proc.returncode != 0:
+            result = ReloadResult(False, list_error,
+                                  headerauth.scrub(proc.stderr or proc.stdout or "caddy reload failed"))
+        else:
+            result = ReloadResult(True, list_error)
+    if list_error:
+        LOG.error("%s", result.message)
+    return result
+
+
+def reload(**kwargs: object) -> tuple[bool, str]:
+    """``reload_detailed`` as (ok, message): ok only when Caddy reloaded AND
+    the fingerprint list was written (the panel reports anything else; see
+    ReloadResult.message for what happened)."""
+    result = reload_detailed(**kwargs)  # type: ignore[arg-type]
+    return result.ok, result.message
 
 
 def _main(argv: list[str]) -> int:

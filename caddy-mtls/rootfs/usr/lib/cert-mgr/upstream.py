@@ -870,11 +870,13 @@ def snippet_mode() -> str | None:
 def caddy_reload() -> tuple[bool, str]:
     """``caddy reload --force`` of the Caddyfile (the snippet is imported at
     adapt time; --force: Caddy skips an unchanged config otherwise), through
-    caddyctl.reload: it regenerates the list of active client certificates
-    first (header authentication, 2.3.0) - see the comment there on what a
-    reload re-reads."""
-    ok, message = caddyctl.reload(caddy_bin=CADDY_BIN, caddyfile=CADDYFILE, admin=CADDY_ADMIN)
-    return ok, ("reloaded" if ok else _cli_error(message))
+    caddyctl.reload_detailed: it regenerates the list of active client
+    certificates first (header authentication, 2.3.0) - see the comment there
+    on what a reload re-reads. "ok" here means Caddy took the configuration,
+    so the snippet's mode applies; a fingerprint list that could not be
+    written is logged by caddyctl (Caddy reloads with the previous one)."""
+    result = caddyctl.reload_detailed(caddy_bin=CADDY_BIN, caddyfile=CADDYFILE, admin=CADDY_ADMIN)
+    return result.reloaded, ("reloaded" if result.reloaded else _cli_error(result.message))
 
 
 def _cli_error(output: str) -> str:

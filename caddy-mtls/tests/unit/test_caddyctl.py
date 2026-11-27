@@ -210,14 +210,35 @@ class ReloadTest(unittest.TestCase):
         self.assertEqual((ok, message), (True, "reloaded"))
         self.assertEqual(self.calls, ["regenerate", "reload"])
 
-    def test_no_reload_with_a_stale_list(self) -> None:
-        def fail() -> None:
-            raise caddyctl.FingerprintError("cannot write /etc/caddy/client-fingerprints.caddy: read-only")
-        ok, message = caddyctl.reload(caddyfile=self.caddyfile, run=self.run_ok, regenerate=fail)
+    @staticmethod
+    def fail_list() -> None:
+        raise caddyctl.FingerprintError("cannot write /etc/caddy/client-fingerprints.caddy: read-only")
+
+    def test_a_list_failure_still_reloads(self) -> None:
+        """C-2: revocation must not depend on the list - Caddy reloads with
+        the previous one (it can only refuse too much), and the result says
+        so and is not ok."""
+        with self.assertLogs("caddyctl", level="ERROR") as logs:
+            ok, message = caddyctl.reload(caddyfile=self.caddyfile, run=self.run_ok, regenerate=self.fail_list)
         self.assertFalse(ok)
-        self.assertIn("could not be written", message)
-        self.assertIn("Caddy was not reloaded", message)
-        self.assertEqual(self.calls, [])
+        self.assertEqual(self.calls, ["reload"])  # the reload command still ran
+        self.assertIn("the list of active client certificates could not be written", message)
+        self.assertIn("read-only", message)
+        self.assertIn("Caddy was reloaded with the previous list: revoked certificates are refused", message)
+        self.assertIn("gets 403", message)
+        self.assertEqual(logs.output, [f"ERROR:caddyctl:{message}"])
+        result = caddyctl.reload_detailed(caddyfile=self.caddyfile, run=self.run_ok, regenerate=self.fail_list)
+        self.assertTrue(result.reloaded)
+        self.assertFalse(result.ok)
+
+    def test_a_list_failure_and_a_failed_reload_name_both(self) -> None:
+        def run_fail(args, **kwargs):
+            return subprocess.CompletedProcess(args, 1, "", "Error: loading config: boom\n")
+        with self.assertLogs("caddyctl", level="ERROR"):
+            ok, message = caddyctl.reload(caddyfile=self.caddyfile, run=run_fail, regenerate=self.fail_list)
+        self.assertFalse(ok)
+        self.assertIn("could not be written (cannot write", message)
+        self.assertIn("and Caddy could not be reloaded: Error: loading config: boom", message)
 
     def test_failed_reload_output_is_scrubbed_of_the_key(self) -> None:
         key = "fakekey.NOT-A-SECRET.0123456789abcdef0123"
