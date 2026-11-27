@@ -29,7 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (the log and the card say so).
 - **Custom Caddyfile snippets for experts**: `global.caddy`, `site.caddy`,
   `lan.caddy` and `sites.caddy` in the add-on's configuration folder
-  (`app_configs/<slug>/caddy/`), imported at four fixed places (global
+  (`app_configs/<slug>/caddy/` - `addon_configs/...` in apps that still use
+  the old name), imported at four fixed places (global
   options first, so the add-on's own win; the public and the local-network
   site after their access checks, before the proxy; further sites last;
   `import mtls` = the add-on's strict client certificate check). Read at
@@ -56,9 +57,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - The documentation of "Method 2: File Access" named a folder that exists
-  only for a local copy, under an old name: the copies are in
-  `app_configs/<slug>/certs/` (`2644ca2c_caddy_mtls` for this repository);
-  the web interface now names the folder.
+  only for a local copy: the copies are in `<slug>/certs/` of the app
+  configuration folders (`2644ca2c_caddy_mtls` for this repository), called
+  `app_configs` in the official apps of today and `addon_configs` in apps
+  that still use the old name (for example Advanced SSH & Web Terminal); the
+  web interface now names the folder.
 - The `.p12` copy of a revoked client stayed in that folder for good; it is
   now removed at the next start.
 - Test data no longer uses a real host name or address.

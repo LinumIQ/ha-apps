@@ -196,6 +196,8 @@ class CardTest(unittest.TestCase):
         ctx = customconf.card_context({"state": "none", "files": [], "folder": "app_configs/x/caddy",
                                        "ignored": [{"name": "site.caddy", "reason": "a symbolic link"}]})
         self.assertTrue(ctx["show"])
+        self.assertEqual(ctx["folder_legacy"], "addon_configs/x/caddy")  # C-1
+        self.assertIsNone(customconf.legacy_folder(None))
         ctx = customconf.card_context({"state": "rejected", "files": [{"name": "site.caddy", "bytes": 3}],
                                        "error": "e" * 9000, "error_file": "../x", "folder": None})
         self.assertEqual((ctx["state"], ctx["error_file"], len(ctx["error"])), ("rejected", None, customconf.ERROR_MAX))

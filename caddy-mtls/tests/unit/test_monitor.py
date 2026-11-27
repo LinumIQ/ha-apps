@@ -240,6 +240,65 @@ class ProcessOnceTest(unittest.TestCase):
         self.assertFalse(any("persistent_notification" in path for _, path, _ in self.calls))
 
 
+class CustomConfigWatchTest(unittest.TestCase):
+    """2.3.0: the notification about rejected custom snippets - raised while
+    this start's state is rejected (retried until sent), otherwise a
+    leftover dismissed once; it names both folder names (C-1)."""
+
+    def setUp(self) -> None:
+        self.calls: list[tuple[str, str, dict]] = []
+        self.ok = True
+
+        def fake_request(method: str, path: str, payload: dict | None = None) -> bool:
+            self.calls.append((method, path, payload or {}))
+            return self.ok
+
+        patcher = mock.patch.object(monitor, "_supervisor_request", side_effect=fake_request)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.tmp = Path(tempfile.mkdtemp())
+        self.state = self.tmp / "custom.json"
+
+    def tearDown(self) -> None:
+        for path in self.tmp.iterdir():
+            path.unlink()
+        self.tmp.rmdir()
+
+    def run_watch(self) -> monitor.CustomConfigWatch:
+        watch = monitor.CustomConfigWatch()
+        with mock.patch.object(monitor.customconf, "STATE_FILE", self.state):
+            watch.check()
+        return watch
+
+    def test_rejected_raises_with_both_folder_names(self) -> None:
+        self.state.write_text(json.dumps({
+            "state": "rejected", "files": [{"name": "site.caddy", "bytes": 3}], "ignored": [],
+            "error": "File to import not found: x, at caddy/site.caddy:2", "error_file": "site.caddy",
+            "folder": "app_configs/2644ca2c_caddy_mtls/caddy"}))
+        self.ok = False
+        watch = self.run_watch()
+        self.assertFalse(watch.done)  # retried until the Supervisor took it
+        self.ok = True
+        with mock.patch.object(monitor.customconf, "STATE_FILE", self.state):
+            watch.check()
+        self.assertTrue(watch.done)
+        method, path, payload = self.calls[-1]
+        self.assertTrue(path.endswith("/persistent_notification/create"))
+        self.assertEqual(payload["notification_id"], "caddy_mtls_custom_config")
+        self.assertIn("`app_configs/2644ca2c_caddy_mtls/caddy/`", payload["message"])
+        self.assertIn("`addon_configs/2644ca2c_caddy_mtls/caddy/` in apps that still use the old name",
+                      payload["message"])
+        self.assertIn("caddy/site.caddy:2", payload["message"])
+
+    def test_not_rejected_dismisses_once(self) -> None:
+        self.state.write_text(json.dumps({"state": "loaded", "files": [], "ignored": [], "folder": None}))
+        watch = self.run_watch()
+        self.assertTrue(watch.done)
+        self.assertEqual([p for _, p, _ in self.calls], ["/core/api/services/persistent_notification/dismiss"])
+        watch.check()
+        self.assertEqual(len(self.calls), 1)
+
+
 class PublicCertWatchTest(unittest.TestCase):
     """The public certificate notification (fast lane, notify after 2
     minutes, dismiss when the certificate exists) with a mocked Supervisor."""

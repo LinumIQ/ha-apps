@@ -393,11 +393,14 @@ read_host_ports() {
 }
 read_host_ports || true
 
-# The add-on's own folder in Home Assistant's app configuration folders (on
-# the host app_configs/<slug>/, called addon_configs before Supervisor
-# 2026.7; /config in here): the slug ends in _caddy_mtls and starts with the
-# repository's hash (local_ for a local copy). The panel shows the real
-# folder; unknown outside Supervisor.
+# The add-on's own folder in Home Assistant's app configuration folders
+# (/config in here): app_configs/<slug>/ on the host since Supervisor 2026.7
+# and in the apps that map all_app_configs (the official Samba share,
+# Terminal & SSH and File editor of today), addon_configs/<slug>/ in apps
+# that still map the legacy all_addon_configs (e.g. Advanced SSH & Web
+# Terminal). The slug ends in _caddy_mtls and starts with the repository's
+# hash (local_ for a local copy). The panel shows the folder; unknown outside
+# Supervisor.
 CONFIG_SLUG=""
 read_config_slug() {
     local slug
@@ -1035,7 +1038,11 @@ custom_notice() {
     local state folder
     state="$(jq -r '.state' "${CUSTOM_STATE}" 2>/dev/null)" || state=none
     folder="$(jq -r '.folder // ""' "${CUSTOM_STATE}" 2>/dev/null)" || folder=""
-    [[ -n "${folder}" ]] || folder="caddy/ in the add-on's configuration folder"
+    if [[ "${folder}" == app_configs/* ]]; then
+        folder="${folder}/ (addon_configs/${folder#app_configs/}/ in apps that still use the old name)"
+    else
+        folder="caddy/ in the add-on's configuration folder"
+    fi
     case "${state}" in
         loaded)
             bashio::log.info "  Custom:      in use (checked by Caddy and by the add-on's integrity check), from ${folder}:"
@@ -1052,7 +1059,7 @@ custom_notice() {
             bashio::log.warning ""
             bashio::log.warning "$(jq -r '.error' "${CUSTOM_STATE}")"
             bashio::log.warning ""
-            bashio::log.warning "Fix the file in ${folder}/ and restart the add-on."
+            bashio::log.warning "Fix the file in ${folder} and restart the add-on."
             bashio::log.warning "Details: the add-on's web interface (card \"Custom Caddy configuration\")."
             bashio::log.warning "------------------------------------------------------------"
             ;;

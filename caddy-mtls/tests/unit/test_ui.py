@@ -255,7 +255,10 @@ class RenderTests(unittest.TestCase):
         rt = public_cert.Runtime(domain="home.example.org", started_at=self.NOW, config_slug="2644ca2c_caddy_mtls")
         html = self.env.get_template("index.html").render(self._context("ok") | {"rt": rt, "lan_rt": rt})
         self.assertIn("<code>app_configs/2644ca2c_caddy_mtls/certs/</code>", html)
-        self.assertIn("<code>/app_configs/2644ca2c_caddy_mtls/certs/</code>", html)
+        # C-1: the name in apps that still map the legacy folder name.
+        self.assertIn("<code>addon_configs/2644ca2c_caddy_mtls/certs/</code> in apps that still\n"
+                      "          use the old name, for example Advanced SSH &amp; Web Terminal", html)
+        self.assertNotIn("in the SSH app", html)
         self.assertIn('class="clients__mirror"', html)
         for rt in (None, public_cert.Runtime(domain="home.example.org", started_at=self.NOW)):
             with self.subTest(rt=rt):
@@ -505,7 +508,8 @@ class CustomCardTests(unittest.TestCase):
         for needle in ('id="custom-config"', 'data-state="loaded"', "status--success", ">In use<",
                        "<code>caddy/site.caddy</code> (120 bytes)", "Restart the add-on to apply changes",
                        "<code>app_configs/2644ca2c_caddy_mtls/caddy/</code>",
-                       "<code>/app_configs/2644ca2c_caddy_mtls/caddy/</code>"):
+                       "<code>addon_configs/2644ca2c_caddy_mtls/caddy/</code> in apps that still use the old name",
+                       "Advanced SSH &amp; Web Terminal"):
             with self.subTest(needle=needle):
                 self.assertIn(needle, html)
 

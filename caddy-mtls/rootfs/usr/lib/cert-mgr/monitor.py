@@ -692,9 +692,11 @@ def custom_notification(state: dict[str, Any]) -> tuple[str, str]:
     """Title and Markdown text of the "custom snippets not in use"
     notification."""
     folder = state.get("folder") or "caddy/ in the app's configuration folder"
+    legacy = customconf.legacy_folder(state.get("folder"))
+    where = f"`{folder}/`" + (f" (`{legacy}/` in apps that still use the old name)" if legacy else "")
     error = str(state.get("error") or "no message")[:customconf.ERROR_MAX]
     lines = [
-        f"Caddy or the add-on's integrity check rejected your custom Caddyfile snippets in `{folder}/`, "
+        f"Caddy or the add-on's integrity check rejected your custom Caddyfile snippets in {where}, "
         "so the app runs with its own configuration only - one rejected file drops all of them.",
         "",
         "Message:",

@@ -531,9 +531,10 @@ and access tokens still stand behind it.
 ## Custom Caddyfile snippets (since 2.3.0)
 
 For experts who know Caddy's Caddyfile: four optional files in the
-add-on's configuration folder, sub-folder `caddy` - `app_configs/<slug>/caddy/`
-(see [Method 2: File Access](#method-2-file-access) for the slug and how to
-reach the folder; the web interface names it):
+add-on's configuration folder, sub-folder `caddy` - `app_configs/<slug>/caddy/`,
+or `addon_configs/<slug>/caddy/` in apps that still use the old name (see
+[Method 2: File Access](#method-2-file-access) for the slug and how to reach
+the folder; the web interface names it):
 
 | File          | Imported ... |
 | ------------- | ------------ |
@@ -616,21 +617,26 @@ folder of its own configuration folder in Home Assistant:
 - `mTLS-CA.crl` - the certificate revocation list,
 - `mTLS-client-<name>.p12` - the bundle of each **active** client.
 
-The folder is `app_configs/<slug>/certs/`. The slug ends in `_caddy_mtls`:
-it is `2644ca2c_caddy_mtls` when you added the repository as
-`https://github.com/LinumIQ/ha-apps`, and `local_caddy_mtls` for a local
-copy in the `local_apps` (formerly `addons`) folder. The web interface shows
-the exact folder under **Client certificates**. To reach it:
+The folder is `<slug>/certs/` in Home Assistant's app configuration
+folders. The slug ends in `_caddy_mtls`: it is `2644ca2c_caddy_mtls` when you
+added the repository as `https://github.com/LinumIQ/ha-apps`, and
+`local_caddy_mtls` for a local copy in the `local_apps` (formerly `addons`)
+folder. The web interface shows the exact folder under **Client
+certificates**.
+
+The name of the parent folder depends on the app you use to reach it: since
+Supervisor 2026.7 it is `app_configs` on the host and in the apps that use
+the new name, and `addon_configs` in older versions of those apps and in
+apps that still use the old name - both are the same folder:
 
 - **Samba share** app: the share `app_configs`, folder
   `<slug>/certs/` (the old share name `addon_configs` still works);
 - **Terminal & SSH** app: `/app_configs/<slug>/certs/` (before version 10.5
   of that app: `/addon_configs/<slug>/certs/`);
 - **File editor** app: `/app_configs/<slug>/certs/`, only with its option
-  `enforce_basepath: false`.
-
-Older versions of Home Assistant (Supervisor before 2026.7) call the folder
-`addon_configs` instead of `app_configs`.
+  `enforce_basepath: false`;
+- **Advanced SSH & Web Terminal** (community app): `/addon_configs/<slug>/certs/`
+  (it still uses the old name).
 
 The copy is refreshed only when the add-on starts: a client you create,
 regenerate or revoke in the web interface, and a regenerated CA, show up there
@@ -803,7 +809,8 @@ again, so pick a new name for a replacement device.
 public - set your own). After you change it, the add-on checks at the next
 start whether each active client's bundle opens with the new password and
 re-encrypts every one that does not (the log shows one line per bundle);
-the copies in the add-on's `certs` folder (`app_configs/<slug>/certs/`, see
+the copies in the add-on's `certs` folder (`app_configs/<slug>/certs/` or,
+in some apps, `addon_configs/<slug>/certs/` - see
 [Method 2: File Access](#method-2-file-access)) are refreshed too. Download the bundles again and give your users the new password -
 bundles they downloaded before keep the old one.
 
@@ -825,9 +832,9 @@ bundle and issues new certificates for the **active** clients - download
 and distribute them again. Revoked clients stay revoked; revoke the clients
 you want to drop for good before regenerating the CA.
 
-Deleting files in the add-on's `certs` folder (`app_configs/<slug>/certs/`)
-or removing names from `client_names` revokes nothing: that folder only holds
-copies for download.
+Deleting files in the add-on's `certs` folder (`app_configs/<slug>/certs/`,
+in some apps `addon_configs/<slug>/certs/`) or removing names from
+`client_names` revokes nothing: that folder only holds copies for download.
 
 ## Expiration Notifications
 
@@ -961,7 +968,8 @@ phone (not tested by us).
 ### My custom snippet is ignored
 
 The card **Custom Caddy configuration** and the log at the start say what
-happened. File not listed: it is not in `app_configs/<slug>/caddy/`, its
+happened. File not listed: it is not in `app_configs/<slug>/caddy/` (in some
+apps `addon_configs/<slug>/caddy/`), its
 name is not exactly one of the four, or it was ignored (symbolic link,
 larger than 256 KiB, blank - the reason is shown). Listed, red: it was
 rejected - the message says why, and none of the files is in use. Listed,

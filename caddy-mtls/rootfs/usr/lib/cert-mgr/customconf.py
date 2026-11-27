@@ -259,7 +259,18 @@ def read_state(path: Path | None = None) -> dict[str, Any]:
 
 
 def folder_name(slug: str) -> str | None:
+    """The folder of the custom files as the official apps of today show
+    it (Samba share, Terminal & SSH, File editor: ``app_configs``)."""
     return f"app_configs/{slug}/caddy" if slug else None
+
+
+def legacy_folder(folder: str | None) -> str | None:
+    """The same folder in apps that still map Supervisor's legacy name
+    (``addon_configs``: older versions of those apps, and e.g. the community
+    Advanced SSH & Web Terminal)."""
+    if folder and folder.startswith("app_configs/"):
+        return "addon_configs/" + folder[len("app_configs/"):]
+    return None
 
 
 def card_context(state: dict[str, Any]) -> dict[str, Any]:
@@ -278,6 +289,7 @@ def card_context(state: dict[str, Any]) -> dict[str, Any]:
         "error": str(state.get("error") or "")[:ERROR_MAX],
         "error_file": state.get("error_file") if state.get("error_file") in FILES else None,
         "folder": folder,
+        "folder_legacy": legacy_folder(folder),
         "docs_url": DOCS_URL,
     }
 

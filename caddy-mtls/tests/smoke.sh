@@ -798,7 +798,7 @@ if wait_for "${BOOT_TIMEOUT}" booted; then
         logs_contain "Removed the copy of '"'"'bob'"'"' from /config/certs (the client is not active)."'
     check "Method 2: runtime.json has the slug, the dashboard names the folder of the copies" eval '
         test "$(cexec jq -r .config_slug /run/caddy-mtls/runtime.json)" == local_caddy_mtls &&
-        [[ "$(cexec curl -fsS --max-time 10 http://127.0.0.1:8099/ 2>/dev/null)" == *"<code>app_configs/local_caddy_mtls/certs/</code>"* ]]'
+        [[ "$(cexec curl -fsS --max-time 10 http://127.0.0.1:8099/ 2>/dev/null)" == *"<code>app_configs/local_caddy_mtls/certs/</code>"*"<code>addon_configs/local_caddy_mtls/certs/</code>"* ]]'
     check "M5: dave-phone (new in client_names) issued: state active, key/p12 600, active/ pem" eval '
         test "$(state ".clients[] | select(.name == \"dave-phone\") | .status")" == active &&
         test "$(state ".clients[] | select(.name == \"dave-phone\") | .serial")" == "$(crt_serial /data/certs/mTLS-client-dave-phone.crt)" &&
@@ -2228,7 +2228,7 @@ if wait_for "${BOOT_TIMEOUT}" booted; then
     check "custom-ok: README.txt written in /config/caddy" eval '
         cexec grep -F "applied when the add-on STARTS" /config/caddy/README.txt >/dev/null'
     check "custom-ok: the log lists each file and says changes need a restart" eval '
-        logs_contain "Custom:      in use (checked by Caddy and by the add-on'"'"'s integrity check), from app_configs/local_caddy_mtls/caddy:" &&
+        logs_contain "Custom:      in use (checked by Caddy and by the add-on'"'"'s integrity check), from app_configs/local_caddy_mtls/caddy/ (addon_configs/local_caddy_mtls/caddy/ in apps that still use the old name):" &&
         logs_contain "caddy/site.caddy (" && logs_contain "caddy/sites.caddy (" &&
         logs_contain "Changes to these files take effect when the add-on restarts."'
     check "custom-ok: global.caddy took effect (protocols h1 h2 on the add-on's servers)" \

@@ -93,9 +93,17 @@ class Runtime:
 
     @property
     def config_folder(self) -> str:
-        """The add-on's configuration folder as the Samba / SSH apps show
-        it (``app_configs/<slug>``), or "" when the slug is unknown."""
+        """The add-on's configuration folder as the official Samba share,
+        Terminal & SSH and File editor apps of today show it
+        (``app_configs/<slug>``), or "" when the slug is unknown."""
         return f"app_configs/{self.config_slug}" if self.config_slug else ""
+
+    @property
+    def config_folder_legacy(self) -> str:
+        """The same folder in apps that still map Supervisor's legacy name
+        (``addon_configs/<slug>``: older versions of those apps, and e.g.
+        the community Advanced SSH & Web Terminal), or ""."""
+        return f"addon_configs/{self.config_slug}" if self.config_slug else ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Runtime:

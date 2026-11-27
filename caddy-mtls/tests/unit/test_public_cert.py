@@ -317,7 +317,10 @@ class RuntimeTest(unittest.TestCase):
                 data = {"domain": DOMAIN, "started_at": 1.0}
                 if slug is not None:
                     data["config_slug"] = slug
-                self.assertEqual(public_cert.Runtime.from_dict(data).config_folder, folder)
+                rt = public_cert.Runtime.from_dict(data)
+                self.assertEqual(rt.config_folder, folder)
+                # C-1: the same folder under the legacy name.
+                self.assertEqual(rt.config_folder_legacy, folder.replace("app_configs/", "addon_configs/", 1))
 
 
 if __name__ == "__main__":

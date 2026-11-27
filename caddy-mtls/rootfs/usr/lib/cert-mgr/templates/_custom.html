@@ -54,8 +54,9 @@
   </ul>
   {% endif %}
   <p class="cc__note">
-    Folder: <code>{{ folder }}/</code>{% if cc.folder %} (Samba share
-    <code>app_configs</code>; in the SSH app <code>/{{ cc.folder }}/</code>){% endif %}.
+    Folder: <code>{{ folder }}/</code>{% if cc.folder_legacy %} - called
+    <code>{{ cc.folder_legacy }}/</code> in apps that still use the old name,
+    for example Advanced SSH &amp; Web Terminal{% endif %}.
     Its <code>README.txt</code> and the documentation (section "Custom
     Caddyfile snippets") describe the four files.
   </p>

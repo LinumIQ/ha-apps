@@ -164,9 +164,9 @@
         <p class="clients__mirror">
           At every start the add-on also copies the CA certificate, the CRL
           and the active clients' <code>.p12</code> bundles to the folder
-          <code>{{ rt.config_folder }}/certs/</code> (Samba share
-          <code>app_configs</code>; in the SSH app
-          <code>/app_configs/{{ rt.config_slug }}/certs/</code>).
+          <code>{{ rt.config_folder }}/certs/</code> - called
+          <code>{{ rt.config_folder_legacy }}/certs/</code> in apps that still
+          use the old name, for example Advanced SSH &amp; Web Terminal.
         </p>
         {% endif %}
 
