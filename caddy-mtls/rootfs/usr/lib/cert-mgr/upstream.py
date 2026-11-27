@@ -21,12 +21,14 @@ that header on every request. This module
 
 Every refused test request writes an ERROR line into Home Assistant's log,
 so the test request is only sent at the start, when the upstream answers
-again after it was unreachable (or after the monitor's keep-alive connection
-to it broke: a restart), on "Check again" in the panel and - only while Home
-Assistant accepts forwarded requests, which it then does not log - once a
-minute in mode ``pass`` under ``auto``. The control request (no forwarding
-header) is never logged by Home Assistant; the monitor sends it every few
-seconds to watch the upstream otherwise.
+again after it was unreachable (or after it closed the connection the
+monitor keeps open to it: a restart), on "Check again" in the panel and -
+only while Home Assistant accepts forwarded requests, which it then does not
+log - once a minute in mode ``pass`` under ``auto``. The control request (no
+forwarding header) is never logged by Home Assistant; the monitor sends it
+every few seconds to watch the upstream. A control request that times out
+means "slow", not "down": the upstream counts as unreachable after a failed
+connect or after two failures in a row.
 
 Shared by init-caddy (``upstream.py start``, before Caddy starts), the
 monitor (monitor.py) and the panel (app.py). Standard library only.
@@ -39,6 +41,7 @@ import fcntl
 import http.client
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -67,7 +70,14 @@ ACCEPTED = "accepted"
 REFUSED = "refused"
 UNREACHABLE = "unreachable"
 REACHABLE = "reachable"  # a control request only: the upstream answers
+#: Connected, but no answer in time (or the connection closed without one):
+#: no decision, no state change - unreachable only after FAILURES_UNREACHABLE
+#: such failures in a row (the monitor's watch) or a failed connect.
+SLOW = "slow"
 UNKNOWN = "unknown"
+#: The card state while the last mode change could not be applied to Caddy.
+RELOAD_FAILED = "reload_failed"
+FAILURES_UNREACHABLE = 2
 
 #: The request of the probe; Home Assistant's frontend serves it without
 #: authentication and without logging.
@@ -78,6 +88,11 @@ TEST_CLIENT = "192.0.2.1"
 #: requests and a name lookup) ends within PROBE_DEADLINE.
 REQUEST_TIMEOUT = 2.0
 PROBE_DEADLINE = 5.0
+#: The same while the add-on runs (the monitor's watch, "Check again"):
+#: Home Assistant can take a few seconds to answer while it starts. A pause
+#: shorter than WATCH_TIMEOUT + the control interval never makes two
+#: control requests in a row fail.
+WATCH_TIMEOUT = 5.0
 USER_AGENT = "caddy-mtls-upstream-check"
 
 #: The network Home Assistant's own documentation of its proxy add-ons
@@ -145,12 +160,16 @@ class ProbeResult:
     """One look at the upstream: a control request, and with ``test`` the
     same request with forwarding headers."""
 
-    result: str  # accepted | refused | unreachable | reachable (no test sent)
+    result: str  # accepted | refused | unreachable | reachable (no test sent) | slow
     control_status: int | None = None
     test_status: int | None = None
     error: str = ""
     source_address: str = ""
     test_sent: bool = False
+    #: Why it is unreachable / slow: connect (no connection: Caddy answers
+    #: 502), timeout (connected, no answer in time: Caddy waits), closed (the
+    #: connection closed without an answer), http (it answered 5xx).
+    kind: str = ""
 
 
 @dataclass
@@ -164,18 +183,34 @@ class State:
     result: str = UNKNOWN
     #: The last accepted / refused of this upstream (kept while unreachable).
     decisive: str | None = None
-    #: The mode written to SNIPPET_FILE ...
+    #: The mode decided ...
     mode: str = PASS
-    #: ... and whether Caddy runs with it (False: the reload failed).
+    #: ... whether Caddy runs with it (False: the reload failed, retried) ...
     applied: bool = True
+    #: ... and the mode Caddy really runs (None: the same as ``mode``; the
+    #: snippet file always holds this one).
+    running: str | None = None
+    reload_error: str = ""
     reachable: bool | None = None
+    #: A test request is owed (the upstream came back, the test was slow).
+    test_due: bool = False
+    #: Visitor addresses are hidden since a switch at run time (not at the
+    #: start): the monitor's "addresses hidden" notification (cleared at the
+    #: next start and when addresses are passed on again).
+    hidden_at_runtime: bool = False
     checked_at: float | None = None  # the last test request
     seen_at: float | None = None  # the last answer of the upstream
     changed_at: float | None = None  # the last mode switch
     error: str = ""
+    #: ProbeResult.kind of ``error``.
+    error_kind: str = ""
     control_status: int | None = None
     test_status: int | None = None
     source_address: str = ""
+
+    @property
+    def running_mode(self) -> str:
+        return self.running or self.mode
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> State:
@@ -187,6 +222,8 @@ class State:
             state.decisive = None
         if state.mode not in (PASS, STRIP):
             state.mode = PASS
+        if state.running not in (PASS, STRIP):
+            state.running = None
         return state
 
 
@@ -200,7 +237,10 @@ class Outcome:
     card: str
     probe: ProbeResult | None = None
     reload_error: str = ""
+    #: The mode Caddy runs changed.
     switched: bool = field(default=False)
+    #: A test request was sent.
+    tested: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -222,39 +262,80 @@ def classify(control_status: int | None, test_status: int | None, error: str = "
 def decide(option: str, mtls: bool, decisive: str | None) -> str:
     """The effective mode.
 
-    always: pass. never: strip. auto: pass unless the upstream refused the
-    last test request and mTLS is on - every visitor on the public port has
-    a client certificate, so showing them to Home Assistant under the
-    add-on's address is acceptable. Without mTLS the visitors are
+    Without mTLS: always pass, whatever the option. The visitors are then
     unauthenticated internet clients that must never look like a local
-    address to Home Assistant, so auto stays at pass (and the 400 is
-    explained in the panel and a notification). While the upstream is
-    unreachable the last decisive result counts (none yet: pass).
+    address to the upstream; auto stays at pass (the 400 is explained in the
+    panel and a notification), and init-caddy refuses to start with
+    ``never`` (this is the second line).
+
+    With mTLS: always -> pass; never -> strip; auto -> pass unless the
+    upstream refused the last test request. Visitors on the public port have
+    a client certificate and visitors on the local-network port come from
+    private addresses, so showing them to Home Assistant under the add-on's
+    address is acceptable. While the upstream is unreachable the last
+    decisive result counts (none yet: pass).
     """
+    if not mtls:
+        return PASS
     if option == "always":
         return PASS
     if option == "never":
         return STRIP
-    if not mtls:
-        return PASS
     return STRIP if decisive == REFUSED else PASS
 
 
 def card_state(settings: Settings, state: State | None) -> str:
-    """The state the panel card, the log and the notification show:
-    unknown, unreachable, never, accepted, strip (refused, works without
-    addresses) or broken (refused, every request answered 400)."""
-    if state is None or (state.result == UNKNOWN and state.reachable is None):
+    """The state the panel card and the log show: unknown, reload_failed
+    (the last mode change could not be applied: red, whatever else),
+    unreachable, never, accepted, strip (refused, works without addresses)
+    or broken (refused, every request answered 400). Always from the mode
+    Caddy really runs."""
+    if state is None:
         return UNKNOWN
+    if not state.applied:
+        return RELOAD_FAILED
     if state.reachable is False:
         return UNREACHABLE
+    if state.reachable is None:
+        return UNKNOWN
     if settings.option == "never":
         return "never"
     if state.decisive == REFUSED:
-        return STRIP if state.mode == STRIP else "broken"
-    if state.decisive == ACCEPTED:
+        return STRIP if state.running_mode == STRIP else "broken"
+    if state.decisive == ACCEPTED and state.running_mode == PASS:
         return ACCEPTED
     return UNKNOWN
+
+
+def is_broken(settings: Settings, state: State | None) -> bool:
+    """Every request is answered 400: the upstream refuses forwarded
+    requests and Caddy (really) passes the addresses on."""
+    return (
+        state is not None
+        and state.reachable is True
+        and settings.option != "never"
+        and state.decisive == REFUSED
+        and state.running_mode == PASS
+    )
+
+
+def is_hidden(state: State | None) -> bool:
+    """Visitor addresses are hidden since a switch at run time."""
+    return state is not None and state.hidden_at_runtime and state.running_mode == STRIP
+
+
+def card_title(settings: Settings) -> str:
+    """The title of the panel card for this upstream."""
+    return "Home Assistant connection" if settings.is_home_assistant else "Upstream connection"
+
+
+def unreachable_effect(kind: str) -> str:
+    """What visitors get while the upstream is unreachable."""
+    if kind == "connect":
+        return "visitors get 502 Bad Gateway"
+    if kind == "http":
+        return "visitors get its error answers"
+    return "visitors' requests wait for it or fail"
 
 
 def trusted_proxy_suggestion(source_address: str) -> str:
@@ -293,9 +374,11 @@ def render_snippet(mode: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-def upstream_name(settings: Settings) -> str:
-    """How texts name the upstream."""
-    return "Home Assistant" if settings.is_home_assistant else f"the upstream {settings.target}"
+def upstream_name(settings: Settings, start: bool = False) -> str:
+    """How texts name the upstream (``start``: at the start of a sentence)."""
+    if settings.is_home_assistant:
+        return "Home Assistant"
+    return f"{'The' if start else 'the'} upstream {settings.target}"
 
 
 def fix_steps(settings: Settings, suggestion: str) -> list[str]:
@@ -357,11 +440,15 @@ def card_context(settings: Settings | None, state: State | None) -> dict[str, An
         "settings": settings,
         "state": state,
         "name": upstream_name(settings),
+        "Name": upstream_name(settings, start=True),
+        "title": card_title(settings),
         "source": source or "this add-on's address",
         "suggestion": suggestion,
         "steps": fix_steps(settings, suggestion),
         "yaml": yaml_block(suggestion),
         "consequences": strip_consequences(settings, source),
+        "effect": unreachable_effect(state.error_kind if state else ""),
+        "broken": is_broken(settings, state),
         "time": local_time,
     }
 
@@ -415,20 +502,34 @@ class _Conn(http.client.HTTPConnection):
         return str(self.sock.getsockname()[0]).split("%", 1)[0]
 
 
+class ConnectError(OSError):
+    """No connection: the name lookup or the TCP connect failed (refused,
+    no route, timed out)."""
+
+
 def _connect(settings: Settings, timeout: float) -> _Conn:
+    try:
+        infos = _resolve(settings.host, settings.port, timeout)
+    except OSError as err:
+        raise ConnectError(str(err) or f"name lookup of {settings.host} failed") from err
     errors: list[str] = []
-    for family, _, _, _, sockaddr in _resolve(settings.host, settings.port, timeout):
+    for family, _, _, _, sockaddr in infos:
         conn = _Conn(family, sockaddr, timeout)
         try:
             conn.connect()
             return conn
         except OSError as err:
-            errors.append(str(err))
-    raise OSError("; ".join(errors) or f"no address for {settings.host}")
+            errors.append(str(err) or type(err).__name__)
+    raise ConnectError("; ".join(errors) or f"no address for {settings.host}")
 
 
-def _get(conn: _Conn, settings: Settings, extra: dict[str, str] | None = None) -> tuple[int, bool]:
-    """GET PROBE_PATH; (status, connection kept open)."""
+_KEEP_ALIVE_TIMEOUT = re.compile(r"(?:^|,)\s*timeout\s*=\s*(\d+)", re.I)
+
+
+def _get(conn: _Conn, settings: Settings, extra: dict[str, str] | None = None
+         ) -> tuple[int, bool, float | None]:
+    """GET PROBE_PATH; (status, connection kept open, the idle timeout the
+    upstream announces in a Keep-Alive header or None)."""
     headers = {"Host": settings.domain or settings.host, "User-Agent": USER_AGENT, "Accept": "*/*"}
     headers.update(extra or {})
     conn.request("GET", PROBE_PATH, headers=headers)
@@ -436,7 +537,13 @@ def _get(conn: _Conn, settings: Settings, extra: dict[str, str] | None = None) -
     resp.read(256 * 1024)
     if not resp.isclosed():
         resp.close()
-    return resp.status, not resp.will_close
+    match = _KEEP_ALIVE_TIMEOUT.search(resp.getheader("Keep-Alive") or "")
+    return resp.status, not resp.will_close, float(match.group(1)) if match else None
+
+
+def _no_answer(err: BaseException) -> str:
+    """ProbeResult.kind of an error after the connection was made."""
+    return "timeout" if isinstance(err, TimeoutError) else "closed"
 
 
 def _error_text(err: BaseException) -> str:
@@ -444,24 +551,30 @@ def _error_text(err: BaseException) -> str:
     return text if len(text) <= 200 else text[:197] + "..."
 
 
-def probe(settings: Settings, test: bool = True, timeout: float = REQUEST_TIMEOUT,
-          deadline: float = PROBE_DEADLINE) -> ProbeResult:
+def probe(settings: Settings, test: bool = True, timeout: float | None = None,
+          deadline: float | None = None) -> ProbeResult:
     """Control request, then (with ``test``) the test request; both on new
-    connections. Ends within about ``deadline`` seconds."""
+    connections. Ends within about ``deadline`` seconds. No connection:
+    UNREACHABLE; connected but no answer in time: SLOW (no decision)."""
+    timeout = REQUEST_TIMEOUT if timeout is None else timeout
+    deadline = PROBE_DEADLINE if deadline is None else deadline
     start = time.monotonic()
     result = ProbeResult(result=UNREACHABLE)
     try:
         conn = _connect(settings, timeout)
-        try:
-            result.source_address = conn.local_address
-            result.control_status, _ = _get(conn, settings)
-        finally:
-            conn.close()
-    except (OSError, http.client.HTTPException) as err:
-        result.error = _error_text(err)
+    except ConnectError as err:
+        result.error, result.kind = _error_text(err), "connect"
         return result
+    try:
+        result.source_address = conn.local_address
+        result.control_status, _, _ = _get(conn, settings)
+    except (OSError, http.client.HTTPException) as err:
+        result.result, result.error, result.kind = SLOW, _error_text(err), _no_answer(err)
+        return result
+    finally:
+        conn.close()
     if result.control_status >= 500:
-        result.error = f"answered HTTP {result.control_status}"
+        result.error, result.kind = f"answered HTTP {result.control_status}", "http"
         return result
     if not test:
         result.result = REACHABLE
@@ -473,86 +586,147 @@ def probe(settings: Settings, test: bool = True, timeout: float = REQUEST_TIMEOU
         return result
     try:
         conn = _connect(settings, min(timeout, remaining))
-        try:
-            result.test_sent = True
-            result.test_status, _ = _get(conn, settings, {
-                "X-Forwarded-For": TEST_CLIENT,
-                "X-Forwarded-Proto": "https",
-                "X-Forwarded-Host": settings.domain or settings.host,
-            })
-        finally:
-            conn.close()
-    except (OSError, http.client.HTTPException) as err:
-        result.error = _error_text(err)
-        result.result = UNREACHABLE
+    except ConnectError as err:
+        result.result, result.error, result.kind = UNREACHABLE, _error_text(err), "connect"
         return result
+    try:
+        result.test_sent = True
+        result.test_status, _, _ = _get(conn, settings, {
+            "X-Forwarded-For": TEST_CLIENT,
+            "X-Forwarded-Proto": "https",
+            "X-Forwarded-Host": settings.domain or settings.host,
+        })
+    except (OSError, http.client.HTTPException) as err:
+        result.result, result.error, result.kind = SLOW, _error_text(err), _no_answer(err)
+        return result
+    finally:
+        conn.close()
     result.result = classify(result.control_status, result.test_status)
     return result
 
 
 class ControlChannel:
-    """The monitor's watch on the upstream: a control request on one kept-
-    alive connection. A connection that worked for at least one reuse and
-    then broke means the upstream went away in between (Home Assistant's
-    server keeps idle connections for an hour - aiohttp's default - and the
-    watch asks every few seconds): ``interrupted``, i.e. probably restarted
-    - the moment a changed HTTP configuration takes effect. An upstream that
-    never keeps connections open is watched by its reachability alone."""
+    """The monitor's watch on the upstream: a control request on one
+    kept-alive connection.
 
-    def __init__(self, settings: Settings, timeout: float = REQUEST_TIMEOUT) -> None:
+    * Restart: the upstream closes a connection it had kept open (Home
+      Assistant's server keeps idle connections for an hour - aiohttp's
+      default - and the watch asks every few seconds): it went away in
+      between, probably restarted - the moment a changed HTTP configuration
+      takes effect. Reported as ``came_back`` with the next answer, also when
+      the connection had not been reused yet.
+    * Upstreams that close connections themselves are told apart: one that
+      answers "Connection: close" (or HTTP/1.0) or announces an idle timeout
+      shorter than the watch interval (``Keep-Alive: timeout=N``) is never
+      kept, so it cannot look restarted; one whose kept connection is gone at
+      ``max_lost`` polls in a row without a successful reuse in between
+      closes idle connections itself - from then on a lost connection means
+      nothing until a reuse succeeds again. ``max_lost`` is 3 for Home
+      Assistant (its server keeps idle connections for an hour; two quick
+      restarts in a row are both noticed) and 2 for other upstreams (at most
+      one false "restart" after a start).
+    * Slow is not down: a timeout or a connection closed without an answer
+      is a failure; the upstream is UNREACHABLE after a failed connect or
+      FAILURES_UNREACHABLE failures in a row, SLOW before that.
+    """
+
+    def __init__(self, settings: Settings, timeout: float | None = None,
+                 interval: float = 12.0) -> None:
         self.settings = settings
-        self.timeout = timeout
+        self.timeout = WATCH_TIMEOUT if timeout is None else timeout
+        self.interval = interval
         self._conn: _Conn | None = None
-        self._keepalive_proven = False
+        self._failures = 0
+        self._pending_restart = False
+        self._lost_streak = 0
+        self._idle_closer = False
+        self._short_keepalive = False
+        self.max_lost = 3 if settings.is_home_assistant else 2
 
     def close(self) -> None:
+        self._drop()
+
+    def _drop(self) -> None:
         if self._conn is not None:
             self._conn.close()
         self._conn = None
-        self._keepalive_proven = False
 
     def check(self) -> tuple[ProbeResult, bool]:
-        """(result REACHABLE or UNREACHABLE, interrupted)."""
-        lost = False
+        """(result REACHABLE, SLOW or UNREACHABLE, came_back: the first
+        answer after the upstream closed the connection it kept open)."""
         if self._conn is not None:
             old = self._conn
             source = old.local_address
             try:
-                status, keep = _get(old, self.settings)
+                status, keep, keep_alive = _get(old, self.settings)
+            except TimeoutError as err:
+                # Slow. The connection is dropped by us (a late answer would
+                # be read as the next one's) - no sign of a restart.
+                self._drop()
+                return self._failure(ProbeResult(result=SLOW, error=_error_text(err), kind="timeout",
+                                                 source_address=source))
             except (OSError, http.client.HTTPException):
-                lost = True
-                old.close()
-                self._conn = None
+                # The upstream closed the connection it had kept open.
+                self._drop()
+                self._lost()
             else:
-                self._keepalive_proven = True
-                if not keep:
-                    old.close()
-                    self._conn = None
-                return self._result(status, source), False
-        interrupted = lost and self._keepalive_proven
-        self._keepalive_proven = False
+                self._lost_streak = 0
+                self._idle_closer = False
+                if not keep or self._announces_short(keep_alive):
+                    self._drop()
+                return self._answer(status, source)
         try:
             conn = _connect(self.settings, self.timeout)
-        except OSError as err:
-            return ProbeResult(result=UNREACHABLE, error=_error_text(err)), interrupted
+        except ConnectError as err:
+            self._failures += 1
+            return ProbeResult(result=UNREACHABLE, error=_error_text(err), kind="connect"), False
         source = conn.local_address
         try:
-            status, keep = _get(conn, self.settings)
+            status, keep, keep_alive = _get(conn, self.settings)
         except (OSError, http.client.HTTPException) as err:
             conn.close()
-            return ProbeResult(result=UNREACHABLE, error=_error_text(err)), interrupted
-        if keep and status < 500:
+            return self._failure(ProbeResult(result=SLOW, error=_error_text(err), kind=_no_answer(err),
+                                             source_address=source))
+        if keep and status < 500 and not self._announces_short(keep_alive):
             self._conn = conn
         else:
             conn.close()
-        return self._result(status, source), interrupted
+        return self._answer(status, source)
 
-    @staticmethod
-    def _result(status: int, source: str) -> ProbeResult:
+    @property
+    def restart_pending(self) -> bool:
+        """The upstream closed the kept connection and has not answered
+        since (it is restarting)."""
+        return self._pending_restart
+
+    def _announces_short(self, keep_alive: float | None) -> bool:
+        if keep_alive is not None and keep_alive <= self.interval:
+            self._short_keepalive = True
+        return self._short_keepalive
+
+    def _lost(self) -> None:
+        if self._idle_closer or self._short_keepalive:
+            return
+        self._lost_streak += 1
+        if self._lost_streak >= self.max_lost:
+            self._idle_closer = True
+            self._pending_restart = False
+            return
+        self._pending_restart = True
+
+    def _failure(self, result: ProbeResult) -> tuple[ProbeResult, bool]:
+        self._failures += 1
+        if self._failures >= FAILURES_UNREACHABLE:
+            result.result = UNREACHABLE
+        return result, False
+
+    def _answer(self, status: int, source: str) -> tuple[ProbeResult, bool]:
         if status >= 500:
-            return ProbeResult(result=UNREACHABLE, control_status=status,
-                               error=f"answered HTTP {status}", source_address=source)
-        return ProbeResult(result=REACHABLE, control_status=status, source_address=source)
+            return self._failure(ProbeResult(result=SLOW, control_status=status, kind="http",
+                                             error=f"answered HTTP {status}", source_address=source))
+        self._failures = 0
+        came_back, self._pending_restart = self._pending_restart, False
+        return ProbeResult(result=REACHABLE, control_status=status, source_address=source), came_back
 
 
 # ---------------------------------------------------------------------------
@@ -643,8 +817,25 @@ def caddy_reload() -> tuple[bool, str]:
     except (OSError, subprocess.SubprocessError) as err:
         return False, str(err)
     if proc.returncode != 0:
-        return False, (proc.stderr or proc.stdout or "caddy reload failed").strip()
+        return False, _cli_error(proc.stderr or proc.stdout or "")
     return True, "reloaded"
+
+
+def _cli_error(output: str) -> str:
+    """The error of a failed Caddy CLI call without its timestamps (stable
+    across retries, so it is logged once): the "msg" of its last JSON log
+    line of level error (Caddy 2.11), else its last "Error:" line, else the
+    last line."""
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and entry.get("level") == "error" and entry.get("msg"):
+            return str(entry["msg"])
+    return next((line for line in reversed(lines) if line.startswith("Error:")),
+                lines[-1] if lines else "caddy reload failed")
 
 
 Reload = Callable[[], tuple[bool, str]]
@@ -652,47 +843,63 @@ Reload = Callable[[], tuple[bool, str]]
 
 def _apply(settings: Settings, state: State, result: ProbeResult | None, now: float,
            reload: Reload | None) -> Outcome:
-    """Record a probe result, decide, write the snippet and reload Caddy
-    when the mode changed (or the last reload failed). Caller holds the
-    lock."""
-    previous_mode = state.mode
+    """Record a probe result (SLOW or None: no information), decide, write
+    the snippet and reload Caddy when the mode changed (or the last reload
+    failed). After a failed reload the snippet goes back to the mode Caddy
+    runs (so that another reload, e.g. for a client, cannot apply the new
+    mode unnoticed) and ``running`` keeps it: the card, the log and the
+    notifications follow what Caddy runs. Caller holds the lock."""
+    previous_running = state.running_mode
     previous_card = card_state(settings, state)
     state.upstream = settings.target
-    if result is not None:
-        if result.source_address:
-            state.source_address = result.source_address
-        state.control_status = result.control_status
-        if result.result == UNREACHABLE:
+    info = result if result is not None and result.result != SLOW else None
+    if info is not None:
+        if info.source_address:
+            state.source_address = info.source_address
+        state.control_status = info.control_status
+        if info.result == UNREACHABLE:
             state.reachable = False
             state.result = UNREACHABLE
-            state.error = result.error
+            state.error = info.error
+            state.error_kind = info.kind
         else:
             state.reachable = True
             state.seen_at = now
             state.error = ""
-            if result.result in (ACCEPTED, REFUSED):
-                state.decisive = result.result
-                state.result = result.result
+            state.error_kind = ""
+            if info.result in (ACCEPTED, REFUSED):
+                state.decisive = info.result
+                state.result = info.result
                 state.checked_at = now
-                state.test_status = result.test_status
+                state.test_status = info.test_status
+                state.test_due = False
             elif state.result in (UNREACHABLE, UNKNOWN):
                 state.result = state.decisive or UNKNOWN
     mode = decide(settings.option, settings.mtls, state.decisive)
-    outcome = Outcome(state=state, previous_mode=previous_mode, previous_card=previous_card,
+    outcome = Outcome(state=state, previous_mode=previous_running, previous_card=previous_card,
                       card=previous_card, probe=result)
-    if mode != previous_mode or not state.applied or snippet_mode() != mode:
+    if (mode != state.mode or mode != previous_running or not state.applied
+            or snippet_mode() != mode):
         write_snippet(mode)
         state.mode = mode
-        if mode != previous_mode:
-            state.changed_at = now
-            outcome.switched = True
-        if reload is None:
+        ok, message = (True, "") if reload is None else reload()
+        if ok:
+            if mode != previous_running:
+                state.changed_at = now
+                outcome.switched = True
+                if reload is not None and mode == STRIP:
+                    state.hidden_at_runtime = True
+            state.running = mode
             state.applied = True
+            state.reload_error = ""
         else:
-            ok, message = reload()
-            state.applied = ok
-            if not ok:
-                outcome.reload_error = message
+            write_snippet(previous_running)
+            state.running = previous_running
+            state.applied = False
+            state.reload_error = message
+            outcome.reload_error = message
+    if state.running_mode == PASS:
+        state.hidden_at_runtime = False
     save_state(state)
     outcome.card = card_state(settings, state)
     return outcome
@@ -703,23 +910,34 @@ def check(settings: Settings, *, test: bool = True, reload: Reload | None = cadd
     """Probe (with ``test``: also the test request), decide and apply."""
     with locked():
         state = load_state(settings) or State(upstream=settings.target)
-        result = prober(settings, test=test)
-        return _apply(settings, state, result, time.time() if now is None else now, reload)
+        result = prober(settings, test=test, timeout=WATCH_TIMEOUT, deadline=2 * WATCH_TIMEOUT + 1)
+        outcome = _apply(settings, state, result, time.time() if now is None else now, reload)
+        outcome.tested = result.test_sent
+        return outcome
 
 
 def watch_once(settings: Settings, channel: ControlChannel, *, reload: Reload | None = caddy_reload,
-               now: float | None = None, prober: Callable[..., ProbeResult] = probe) -> Outcome:
+               now: float | None = None, prober: Callable[..., ProbeResult] = probe,
+               force_test: bool = False) -> Outcome:
     """The monitor's regular look: the control request on the kept-alive
-    channel; when the upstream answers again (it was unreachable or not
-    checked, or the channel broke: a restart) also the test request."""
+    channel. When it answers and the upstream came back (it was unreachable
+    or not checked, or it closed the kept connection: a restart), a test is
+    still owed, nothing is decided yet, or ``force_test`` (the periodic test
+    while passing addresses on): also the test request. A slow answer
+    changes nothing."""
     with locked():
         state = load_state(settings) or State(upstream=settings.target)
-        control, interrupted = channel.check()
-        result = control
-        if control.result == REACHABLE and (state.reachable is not True or interrupted
-                                            or state.decisive is None):
-            result = prober(settings, test=True)
-        return _apply(settings, state, result, time.time() if now is None else now, reload)
+        control, came_back = channel.check()
+        result: ProbeResult | None = control
+        tested = False
+        if control.result == REACHABLE and (came_back or force_test or state.test_due
+                                            or state.reachable is not True or state.decisive is None):
+            state.test_due = True
+            result = prober(settings, test=True, timeout=WATCH_TIMEOUT, deadline=2 * WATCH_TIMEOUT + 1)
+            tested = result.test_sent
+        outcome = _apply(settings, state, result, time.time() if now is None else now, reload)
+        outcome.tested = tested
+        return outcome
 
 
 def retry_apply(settings: Settings, *, reload: Reload | None = caddy_reload,
@@ -741,7 +959,16 @@ def start(settings: Settings, now: float | None = None) -> dict[str, Any]:
     init-caddy's log notice."""
     with locked():
         state = load_state(settings) or State(upstream=settings.target)
+        # This start's facts only: reachability is unknown until the probe
+        # says so; the decisive result (the last known mode) stays; the
+        # "addresses hidden at run time" notification ends with the restart.
+        state.reachable = None
+        state.result = UNKNOWN if state.decisive is None else state.decisive
+        state.hidden_at_runtime = False
+        state.test_due = False
         result = probe(settings, test=True)
+        if result.result == SLOW:
+            state.error, state.error_kind = result.error, result.kind
         outcome = _apply(settings, state, result, time.time() if now is None else now, None)
     st = outcome.state
     return {
@@ -752,6 +979,8 @@ def start(settings: Settings, now: float | None = None) -> dict[str, Any]:
         "source_address": st.source_address,
         "suggestion": trusted_proxy_suggestion(st.source_address),
         "error": st.error,
+        "error_kind": st.error_kind,
+        "effect": unreachable_effect(st.error_kind),
         "control_status": result.control_status,
         "test_status": result.test_status,
         "target": settings.target,

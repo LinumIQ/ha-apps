@@ -131,8 +131,27 @@
 }
 
 .hc--broken,
-.hc--unreachable {
+.hc--unreachable,
+.hc--reload_failed {
   --hc-accent: var(--color-danger-solid);
+}
+
+.hc__error {
+  margin: 0 0 var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--color-danger-soft);
+  border: 1px solid var(--color-danger-border);
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+}
+
+.hc__error-text {
+  display: block;
+  margin-top: var(--space-1);
+  padding: 0;
+  background: transparent;
+  border: 0;
+  overflow-wrap: anywhere;
 }
 
 .hc__lead {
@@ -227,6 +246,10 @@
 
 .lan__list li {
   margin-bottom: var(--space-1);
+}
+
+.lan__warn {
+  color: var(--color-danger);
 }
 
 /* ---------- Notices ("No CA metadata", "CRL not yet generated") ---------- */

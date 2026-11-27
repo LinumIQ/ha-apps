@@ -29,6 +29,18 @@
 #         the client's own address; the websocket works.
 #   start   a new add-on container with that Core: pass at the start.
 #   back    settings removed, restart, confirm: the add-on switches to strip.
+# With the monitor's default intervals (control 12 s, test 60 s):
+#   first-boot  Core down at the add-on's first start: polled every 2.5 s, the
+#         switch to strip within 5 s of Core's first answer (review B-5).
+#   early-restart  Core gets the reverse-proxy settings (restart) 1 s after
+#         the add-on started: noticed without Check again (B-4).
+#   untrust  settings removed while in pass: strip within 20 s of Core being
+#         back, not after the minute test; the "addresses hidden"
+#         notification (B-3, B-12).
+#   stall  Core paused 15 s (one control request unanswered; with the 5 s
+#         watch timeout and the 12 s interval a pause shorter than about 17 s
+#         can never fail two in a row): nothing happens, 0 lines; paused
+#         40 s: unreachable without a 502 claim, one test afterwards (B-6).
 # For each phase the script counts the lines in Core's log that refused
 # forwarded requests caused (the probe's share and the visitors' share).
 #
@@ -162,6 +174,10 @@ check "core: HTTP config in storage, no reverse proxy (Core's default)" eval '
     [[ "$(http_config | jq -r ".stable.use_x_forwarded_for // false")" == false ]]'
 
 # --- the add-on ------------------------------------------------------------------
+# The monitor's intervals: short (control 2 s, test 5 s) for the first phases;
+# the last phases (the review's scenarios B-3 to B-6) use the defaults
+# (control 12 s, test 60 s, 2.5 s while nothing is decided).
+ADDON_ENV=(-e CADDY_MTLS_UPSTREAM_CONTROL_SECONDS=2 -e CADDY_MTLS_UPSTREAM_TEST_SECONDS=5)
 # boot_addon <name> <image> <forwarded_headers> [<data.tar>]
 boot_addon() {
     local name="${P}-$1" image="$2" fwd="$3" dir="${WORK}/$1"
@@ -181,8 +197,7 @@ boot_addon() {
     "${DOCKER}" create --name "${name}" --network "${NET}" --memory 512m \
         -e ACME_CA_URL=http://127.0.0.1:9/directory -e TZ=Europe/Vienna \
         -e SUPERVISOR_TOKEN=real-core-test -e SUPERVISOR_URL=http://127.0.0.1:8765 \
-        -e CADDY_MTLS_UPSTREAM_CONTROL_SECONDS=2 -e CADDY_MTLS_UPSTREAM_TEST_SECONDS=5 \
-        "${image}" >/dev/null
+        "${ADDON_ENV[@]+"${ADDON_ENV[@]}"}" "${image}" >/dev/null
     if [[ -n "${4:-}" ]]; then
         "${DOCKER}" cp - "${name}:/" <"$4"
     fi
@@ -368,6 +383,118 @@ if [[ -s "${WORK}/data-auto.tar" ]] && boot_addon start "${IMAGE}" auto "${WORK}
     note "back: Core log lines: $(( r1 - r0 )) (the refused test that switched to strip), then 0 in 30 s"
 else
     fail "start: add-on booted"
+fi
+stop_addon
+
+# ==================================================================================
+# The review's scenarios with the default intervals (control 12 s, test 60 s).
+# ==================================================================================
+ADDON_ENV=()
+# seen_at: the time of the add-on's last successful control request.
+seen_at() { aexec jq -r '.seen_at // 0' /data/upstream.json 2>/dev/null || echo 0; }
+alog_since() { "${DOCKER}" logs "${ADDON}" 2>&1 | tail -n "+$(( $1 + 1 ))"; }
+alines() { "${DOCKER}" logs "${ADDON}" 2>&1 | wc -l; }
+# shellcheck disable=SC2016
+hidden_raised() {
+    supervisor_got '.body.notification_id == "caddy_mtls_upstream_addresses_hidden" and (.path | endswith("/create"))'
+}
+
+# --- B-5: the first start with Core down ------------------------------------------
+log "first-boot: Core stopped at the add-on's first start, then started"
+"${DOCKER}" stop -t 60 "${CORE}" >/dev/null
+r0="$(refused_lines)"
+if boot_addon first "${IMAGE}" auto; then
+    check "first-boot: nothing decided, upstream down -> mode pass, card unreachable" eval '
+        mode_is pass && wait_for 20 card_is unreachable'
+    "${DOCKER}" start "${CORE}" >/dev/null
+    t0=${SECONDS}
+    first_answer=""
+    switched=""
+    codes=()
+    while (( SECONDS - t0 < 400 )); do
+        c="$(code_of /manifest.json -o /dev/null --max-time 3)"
+        codes+=("$(( SECONDS - t0 )):${c}")
+        if [[ -z "${first_answer}" && "${c}" != 502 && "${c}" != 000 && -n "${c}" ]]; then first_answer=$(( SECONDS - t0 )); fi
+        if mode_is strip; then switched=$(( SECONDS - t0 )); break; fi
+        sleep 0.5
+    done
+    log "first-boot timeline (s:code): ${codes[*]}"
+    check "first-boot: switched to strip after Core came up" test -n "${switched}"
+    window=$(( ${switched:-999} - ${first_answer:-0} ))
+    check "first-boot: from Core's first answer to the switch <= 5 s (polling every 2.5 s; was about 10 s)" \
+        test "${window}" -le 5
+    n400="$(printf '%s\n' "${codes[@]}" | grep -c ':400$' || true)"
+    note "first-boot: Core answered after ${first_answer:-?} s, the add-on switched to strip after ${switched:-never} s (${window} s later); 400s seen by a visitor polling every 0.5 s: ${n400}; Core log lines: $(( $(refused_lines) - r0 )) (1 probe + the visitor's refused requests)"
+else
+    fail "first-boot: add-on booted"
+fi
+stop_addon
+
+# --- B-4: Core restarts right after the add-on started -----------------------------
+log "early-restart: add-on starts in strip, Core gets the reverse-proxy settings 1 s later"
+if boot_addon early "${IMAGE}" auto; then
+    check "early-restart: strip at the start" eval 'mode_is strip && wait_for 20 card_is strip'
+    sleep 1
+    t0=${SECONDS}
+    r0="$(refused_lines)"
+    check "early-restart: Core configured, restarted and confirmed" \
+        configure_core "{\"use_x_forwarded_for\": true, \"trusted_proxies\": [\"${SUBNET}\"]}"
+    t_up=$(( SECONDS - t0 ))
+    check "early-restart: the add-on notices the restart and switches to pass (no Check again)" wait_for 40 mode_is pass
+    note "early-restart: Core back after ${t_up} s, the add-on in mode pass $(( SECONDS - t0 - t_up )) s later; Core log lines: $(( $(refused_lines) - r0 ))"
+
+    # --- B-3: trust lost while passing addresses on --------------------------------
+    log "untrust: reverse-proxy settings removed while in pass"
+    r0="$(refused_lines)"
+    l0="$(alines)"
+    t0=${SECONDS}
+    check "untrust: Core configured without reverse proxy, restarted, confirmed" configure_core '{}'
+    t_up=$(( SECONDS - t0 ))
+    check "untrust: the add-on switches to strip within one control interval (not the minute test)" wait_for 20 mode_is strip
+    took=$(( SECONDS - t0 - t_up ))
+    check "untrust: within 20 s of Core being back (was up to 60 s)" test "${took}" -le 20
+    sleep 2 # Core writes its log lines asynchronously
+    check "untrust: the notification 'visitor addresses are hidden' was raised" wait_for 15 hidden_raised
+    note "untrust: Core back after ${t_up} s, the add-on in strip ${took} s later; Core log lines: $(( $(refused_lines) - r0 )) (the test that switched)"
+
+    # --- B-6: a paused Core is slow, not down -----------------------------------------
+    log "stall: Core paused for 15 s, 3 s after a control request (one control falls into it)"
+    # Two answered control requests in a row first (Core settled after its
+    # restart, the add-on's failure count at 0), then align with the second.
+    for _ in 1 2; do
+        # shellcheck disable=SC2034 # used in the eval'd condition
+        s0="$(seen_at)"
+        wait_for 40 eval '[[ "$(seen_at)" != "${s0}" ]]' || log "stall: no answered control request seen"
+    done
+    sleep 3
+    r0="$(refused_lines)"
+    l0="$(alines)"
+    "${DOCKER}" pause "${CORE}" >/dev/null
+    sleep 15
+    "${DOCKER}" unpause "${CORE}" >/dev/null
+    sleep 15
+    check "stall 15 s: still strip, no state change" eval 'mode_is strip && card_is strip'
+    check "stall 15 s: no 'does not answer' / 502 warning in the add-on log" eval '
+        ! alog_since "${l0}" | grep -E "does not answer|502" >/dev/null'
+    n15=$(( $(refused_lines) - r0 ))
+    check "stall 15 s: no line in Core's log (was 1)" test "${n15}" == 0
+    note "stall 15 s (one control request without answer): Core log lines: ${n15}"
+    log "stall: Core paused for 40 s (at least two control requests without answer)"
+    r0="$(refused_lines)"
+    l0="$(alines)"
+    "${DOCKER}" pause "${CORE}" >/dev/null
+    sleep 40
+    unanswered="$(alog_since "${l0}" | grep -F "does not answer" | tail -n 1)"
+    "${DOCKER}" unpause "${CORE}" >/dev/null
+    sleep 20
+    log "stall 40 s: ${unanswered}"
+    check "stall 40 s: called unreachable after two unanswered control requests, without claiming a 502" eval '
+        [[ "${unanswered}" == *"does not answer (timed out)"*"requests wait for it or fail"* ]]'
+    check "stall 40 s: back in strip after Core answered again" wait_for 30 mode_is strip
+    n40=$(( $(refused_lines) - r0 ))
+    note "stall 40 s (two or more control requests without answer): Core log lines: ${n40} (the test after it answered again)"
+else
+    fail "early-restart: add-on booted"
 fi
 stop_addon
 

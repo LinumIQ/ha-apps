@@ -45,6 +45,17 @@
       From the internet, use <code>https://{{ domain }}/</code> with a client
       certificate.
     </li>
+    {% if port == 443 %}
+    <li class="lan__warn">
+      <strong>Check your router's port forwarding now:</strong> external TCP
+      443 must go to host port
+      {% if lan_rt.https_host_port %}<strong>{{ lan_rt.https_host_port }}</strong>{% else %}of
+      <code>443/tcp</code>{% endif %} (the client-certificate port), never to host
+      port 443 - that is now this port without client certificates.
+      Installations from before 2.0.0 used host port 443 for the
+      client-certificate port, so an old rule may still point there.
+    </li>
+    {% endif %}
   </ul>
   {% else %}
   <p class="lan__lead">

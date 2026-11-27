@@ -19,14 +19,16 @@ forwarding checklist, and dismisses it as soon as the certificate exists. The
 add-on log gets one line per change of that state.
 
 It watches the upstream (upstream.py) as well: a control request every
-UPSTREAM_CONTROL_INTERVAL seconds on a kept-alive connection; when the
-upstream answers again after it was unreachable or restarted, the test
-request (does it accept forwarded requests?), which switches the forwarding
-mode at run time. Under forwarded_headers: auto in mode pass the test runs
-every UPSTREAM_TEST_INTERVAL seconds instead (Home Assistant logs nothing
-while it trusts the add-on). While every request is answered "400: Bad
-Request" (refused, mode pass) a persistent notification is raised; it is
-dismissed when that is over.
+UPSTREAM_CONTROL_INTERVAL seconds on a kept-alive connection (every
+UPSTREAM_FAST_INTERVAL seconds while nothing is decided and the upstream does
+not answer); when the upstream answers again after it was unreachable or
+restarted, the test request (does it accept forwarded requests?), which
+switches the forwarding mode at run time. Under forwarded_headers: auto in
+mode pass the test also runs every UPSTREAM_TEST_INTERVAL seconds (Home
+Assistant logs nothing while it trusts the add-on). While every request is
+answered "400: Bad Request" (refused, mode pass) a persistent notification is
+raised; another one when the add-on starts hiding the visitor addresses at
+run time; each is dismissed when that is over.
 
 Failure to reach the Supervisor never crashes the loop - we log and try
 again on the next iteration.
@@ -81,11 +83,15 @@ FAST_LANE_SECONDS = int(os.environ.get("CERT_MONITOR_FAST_LANE_SECONDS", "1800")
 PUBLIC_CERT_NOTIFICATION_ID = "caddy_mtls_public_certificate"
 
 # Upstream watch (upstream.py): the control request's interval, the test
-# request's interval in mode pass under auto, the notification of the state
-# "every request is answered 400". (Overridable for tests only.)
+# request's interval in mode pass under auto, the control interval while
+# nothing is decided and the upstream does not answer, the notifications
+# "every request is answered 400" and "addresses hidden at run time".
+# (Overridable for tests only.)
 UPSTREAM_CONTROL_INTERVAL = float(os.environ.get("CADDY_MTLS_UPSTREAM_CONTROL_SECONDS", "12"))
 UPSTREAM_TEST_INTERVAL = float(os.environ.get("CADDY_MTLS_UPSTREAM_TEST_SECONDS", "60"))
+UPSTREAM_FAST_INTERVAL = float(os.environ.get("CADDY_MTLS_UPSTREAM_FAST_SECONDS", "2.5"))
 UPSTREAM_NOTIFICATION_ID = "caddy_mtls_upstream_refuses"
+UPSTREAM_HIDDEN_NOTIFICATION_ID = "caddy_mtls_upstream_addresses_hidden"
 
 # Tracks which (cert_id, threshold_days) pairs we've already notified for
 # in the current state, so we don't spam HA on every loop iteration.
@@ -436,7 +442,7 @@ def upstream_notification(settings: upstream.Settings, state: upstream.State) ->
     )
     why = (
         "forwarded_headers is `always`"
-        if settings.option == "always"
+        if settings.option == "always" and settings.mtls
         else "mTLS is off (`mtls_enabled: false`), so the add-on never hides the visitor "
         "addresses: every internet visitor would look like a local device"
     )
@@ -466,36 +472,95 @@ def upstream_notification(settings: upstream.Settings, state: upstream.State) ->
         ]
     lines += [
         "",
-        "The app's web interface (Caddy mTLS, card \"Home Assistant connection\") shows the "
+        f'The app\'s web interface (Caddy mTLS, card "{upstream.card_title(settings)}") shows the '
         "details and checks again.",
     ]
     return title, "\n".join(lines)
 
 
+def hidden_notification(settings: upstream.Settings, state: upstream.State) -> tuple[str, str]:
+    """Title and Markdown text of the notification raised when the add-on
+    stops passing visitor addresses on at run time (the upstream stopped
+    trusting it)."""
+    name = upstream.upstream_name(settings)
+    name_start = upstream.upstream_name(settings, start=True)
+    source = state.source_address or "this add-on"
+    suggestion = upstream.trusted_proxy_suggestion(state.source_address)
+    title = (
+        "Caddy mTLS: Home Assistant no longer trusts the app - visitor addresses are hidden"
+        if settings.is_home_assistant
+        else "Caddy mTLS: the upstream no longer trusts the app - visitor addresses are hidden"
+    )
+    why = (
+        " - it restarted without the reverse-proxy settings (Home Assistant also restores "
+        "the previous HTTP settings when a change is not confirmed within 5 minutes)"
+        if settings.is_home_assistant
+        else ""
+    )
+    lines = [
+        f"{name_start} no longer accepts the visitor addresses from this add-on ({source}){why}. "
+        f"So that **{settings.domain}** keeps working, the add-on now removes them "
+        f"(`forwarded_headers: auto`): {name} sees every visitor as {source}.",
+        "",
+        "What this means:",
+    ]
+    lines += [f"- {item}" for item in upstream.strip_consequences(settings, state.source_address)]
+    lines += ["", "To pass the visitor addresses on again:"]
+    lines += [f"{n}. {step}" for n, step in enumerate(upstream.fix_steps(settings, suggestion), 1)]
+    lines += [
+        "",
+        "The add-on notices the restart and passes the addresses on again by itself; this "
+        "notification then disappears. "
+        f'The app\'s web interface (Caddy mTLS, card "{upstream.card_title(settings)}") shows the '
+        "details.",
+    ]
+    return title, "\n".join(lines)
+
+
 _CARD_LOG = {
-    "accepted": (logging.INFO, "{name} accepts this add-on ({source}) as a reverse proxy: visitor addresses are passed on (mode pass)."),
-    "strip": (logging.WARNING, "{name} does not trust this add-on ({source}) as a reverse proxy: the forwarding headers are removed (mode strip), {name} sees every visitor as {source}."),
-    "broken": (logging.WARNING, "{name} answers every request with 400 Bad Request: it does not trust this add-on ({source}) as a reverse proxy (see the web interface)."),
+    "accepted": (logging.INFO, "{Name} accepts this add-on ({source}) as a reverse proxy: visitor "
+                 "addresses are passed on (mode pass)."),
+    "strip": (logging.WARNING, "{Name} does not trust this add-on ({source}) as a reverse proxy: the "
+              "forwarding headers are removed (mode strip), and {name} sees every visitor as {source}."),
+    "broken": (logging.WARNING, "{Name} answers every request with 400 Bad Request: it does not trust "
+               'this add-on ({source}) as a reverse proxy (see the card "{title}" in the web interface).'),
     "never": (logging.INFO, "forwarded_headers: never - visitor addresses are not passed on."),
-    "unreachable": (logging.WARNING, "The upstream {target} does not answer ({error}): visitors get 502 Bad Gateway."),
+    "unreachable": (logging.WARNING, "{Name} does not answer ({error}): {effect}."),
+    "reload_failed": (logging.ERROR, "Applying the forwarding mode {mode} failed: Caddy could not be "
+                      "reloaded ({reload_error}). Caddy keeps mode {running}{broken}; the add-on "
+                      "retries every {interval:g} s."),
 }
 
 
 class UpstreamWatch:
-    """The monitor's side of upstream.py: picks the request (control on the
-    kept-alive channel, or the periodic test under auto in mode pass), logs
-    one line per change of the card state, raises the notification while
-    every request is answered 400 (refused, mode pass) and dismisses it when
-    that is over (also once after a start, for a notification of a previous
-    run)."""
+    """The monitor's side of upstream.py.
+
+    * Requests: the control request on the kept-alive channel every
+      UPSTREAM_CONTROL_INTERVAL seconds in every state (a restart of the
+      upstream - the moment trust appears or disappears - is noticed at the
+      next one), every UPSTREAM_FAST_INTERVAL seconds while it is
+      unreachable, nothing has been decided for it, it is restarting (it
+      closed the kept connection and has not answered since) or a test is
+      owed - so the window of 400s after it is back stays short; under auto
+      in mode pass also the periodic test every UPSTREAM_TEST_INTERVAL
+      seconds.
+      After a failed reload: a retry instead.
+    * Log: one line per change of the card state (and of the reload error).
+    * Notifications: "refuses" while every request is answered 400 (from
+      the mode Caddy really runs); "addresses hidden" after a switch to
+      strip at run time. Each is raised once, dismissed when it is over and
+      dismissed once after a start (a previous run's)."""
 
     def __init__(self, started: float, reload: upstream.Reload | None = upstream.caddy_reload) -> None:
         self.reload = reload
         self.channel: upstream.ControlChannel | None = None
         self.card: str | None = None
+        self.logged_error = ""
         self.next_test = started + UPSTREAM_TEST_INTERVAL
         self._raised = False
         self._dismiss_pending = True
+        self._hidden_raised = False
+        self._hidden_dismiss_pending = True
 
     def tick(self, now: float) -> float:
         """One look; returns the seconds until the next one."""
@@ -505,25 +570,25 @@ class UpstreamWatch:
         if self.channel is None or self.channel.settings != settings:
             if self.channel is not None:
                 self.channel.close()
-            self.channel = upstream.ControlChannel(settings)
+            self.channel = upstream.ControlChannel(settings, interval=UPSTREAM_CONTROL_INTERVAL)
         state = upstream.load_state(settings)
         if state is not None and not state.applied:
             outcome = upstream.retry_apply(settings, reload=self.reload)
-        elif self._periodic(settings, state):
-            # The kept-alive connection would idle; a test request every
-            # minute watches the upstream (and logs nothing in Home
-            # Assistant while it trusts the add-on).
-            self.channel.close()
-            if now < self.next_test:
-                return self.next_test - now
-            outcome = upstream.check(settings, test=True, reload=self.reload)
-            self.next_test = now + UPSTREAM_TEST_INTERVAL
         else:
-            outcome = upstream.watch_once(settings, self.channel, reload=self.reload)
-            self.next_test = now + UPSTREAM_TEST_INTERVAL
+            force = self._periodic(settings, state) and now >= self.next_test
+            outcome = upstream.watch_once(settings, self.channel, reload=self.reload, force_test=force)
+            if outcome.tested or not self._periodic(settings, outcome.state):
+                self.next_test = now + UPSTREAM_TEST_INTERVAL
         self._report(settings, outcome)
-        if self._periodic(settings, outcome.state):
-            return max(1.0, self.next_test - now)
+        st = outcome.state
+        if st.applied and (st.reachable is False or (st.decisive is None and st.reachable is not True)
+                           or st.test_due or self.channel.restart_pending):
+            # Down, restarting or a test owed: ask every few seconds, so that
+            # the 400s after it is back (trust gone, or nothing decided yet)
+            # stay few. A merely slow answer does not count here.
+            return UPSTREAM_FAST_INTERVAL
+        if self._periodic(settings, st):
+            return max(0.5, min(UPSTREAM_CONTROL_INTERVAL, self.next_test - now))
         return UPSTREAM_CONTROL_INTERVAL
 
     @staticmethod
@@ -533,7 +598,7 @@ class UpstreamWatch:
             and state is not None
             and state.reachable is True
             and state.decisive == upstream.ACCEPTED
-            and state.mode == upstream.PASS
+            and state.running_mode == upstream.PASS
             and state.applied
         )
 
@@ -543,32 +608,47 @@ class UpstreamWatch:
             LOG.warning(
                 "Forwarding headers: mode %s -> %s (%s answered the test request with %s).",
                 outcome.previous_mode,
-                state.mode,
+                state.running_mode,
                 settings.target,
                 state.test_status if state.test_status is not None else "-",
             )
-        if outcome.reload_error:
-            LOG.error("Reloading Caddy for the forwarding mode failed (retried): %s", outcome.reload_error)
         if self.card is None:
             self.card = outcome.previous_card
-        if outcome.card != self.card:
-            level, text = _CARD_LOG.get(outcome.card, (logging.INFO, "Connection to {target}: {card}."))
-            name = upstream.upstream_name(settings)
-            LOG.log(level, text.format(
-                name=name[:1].upper() + name[1:],
-                source=state.source_address or "this add-on", target=settings.target,
-                error=state.error or "no answer", card=outcome.card,
-            ))
+        if outcome.card != self.card or state.reload_error != self.logged_error:
+            if outcome.card == upstream.RELOAD_FAILED or outcome.card != self.card:
+                level, text = _CARD_LOG.get(outcome.card, (logging.INFO, "Connection to {target}: {card}."))
+                LOG.log(level, text.format(
+                    Name=upstream.upstream_name(settings, start=True),
+                    name=upstream.upstream_name(settings),
+                    title=upstream.card_title(settings),
+                    source=state.source_address or "this add-on", target=settings.target,
+                    error=state.error or "no answer", effect=upstream.unreachable_effect(state.error_kind),
+                    card=outcome.card, mode=state.mode, running=state.running_mode,
+                    reload_error=state.reload_error or "-", interval=UPSTREAM_CONTROL_INTERVAL,
+                    broken=(" - every request is answered 400" if upstream.is_broken(settings, state) else ""),
+                ))
+            if self.logged_error and not state.reload_error:
+                LOG.info("Caddy reloaded: the forwarding mode %s applies now.", state.running_mode)
             self.card = outcome.card
-        if outcome.card == "broken":
+            self.logged_error = state.reload_error
+        if upstream.is_broken(settings, state):
             self._dismiss_pending = False
             if not self._raised:
                 title, message = upstream_notification(settings, state)
                 self._raised = _send_notification(title, message, UPSTREAM_NOTIFICATION_ID)
-        elif outcome.card in ("accepted", "strip", "never") and (self._raised or self._dismiss_pending):
+        elif state.reachable is True and (self._raised or self._dismiss_pending):
             if _dismiss_notification(UPSTREAM_NOTIFICATION_ID):
                 self._raised = False
                 self._dismiss_pending = False
+        if upstream.is_hidden(state):
+            self._hidden_dismiss_pending = False
+            if not self._hidden_raised:
+                title, message = hidden_notification(settings, state)
+                self._hidden_raised = _send_notification(title, message, UPSTREAM_HIDDEN_NOTIFICATION_ID)
+        elif self._hidden_raised or self._hidden_dismiss_pending:
+            if _dismiss_notification(UPSTREAM_HIDDEN_NOTIFICATION_ID):
+                self._hidden_raised = False
+                self._hidden_dismiss_pending = False
 
 
 def main() -> None:

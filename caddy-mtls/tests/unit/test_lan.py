@@ -127,9 +127,13 @@ class LanCardTest(unittest.TestCase):
         self.assertIn("IPv4", html)
 
     def test_port_443_is_the_plain_url(self) -> None:
-        html = self.render(lan_state="on", lan_host_port=443)
+        html = self.render(lan_state="on", lan_host_port=443, https_host_port=8444)
         self.assertIn("https://home.example.com/", html)
         self.assertNotIn("https://home.example.com:443/", html)
+        # B-10: the router must forward 443 to the client-certificate port.
+        self.assertIn("Check your router's port forwarding now", html)
+        self.assertIn("<strong>8444</strong>", html)
+        self.assertNotIn("lan__warn", self.render(lan_state="on", lan_host_port=9443))
 
     def test_unknown(self) -> None:
         html = self.render(lan_state="unknown", host_ports_known=False)

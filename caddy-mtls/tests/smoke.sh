@@ -46,9 +46,12 @@
 #              (tests/fake-upstream.py, in a container whose network namespace
 #              the add-on shares): auto with mTLS (start probe -> strip, the
 #              headers that arrive, switch to pass after a "restart", back to
-#              strip by the periodic test, Check again, refusal counts), the
-#              last known mode while the upstream is down, always (400, red
-#              card, notification, dismissed), never, auto without mTLS.
+#              strip by the periodic test with the "addresses hidden"
+#              notification, Check again, refusal counts, a failed reload:
+#              red card, Caddy's real mode, one ERROR line, repair), the last
+#              known mode while the upstream is down, always (400, red card,
+#              notification, dismissed), never, auto without mTLS, the texts
+#              for an upstream that is not Home Assistant.
 #   lan*       the local-network port 4443 (host port seeded): proxied without
 #              a client certificate from private sources, 403 for public IPv4
 #              / IPv6 sources and for the container's default gateway,
@@ -63,7 +66,9 @@
 #              log, and Caddy's environment carries the credentials.
 #   bad-*      refused starts: route53 token without ":", a Cloudflare token
 #              the module rejects (its error text quotes the token: it must be
-#              redacted), a domain with a port, an upstream without a port.
+#              redacted), a domain with a port, an upstream without a port,
+#              forwarded_headers never without mTLS (Home Assistant and
+#              another upstream).
 #
 # No external network traffic: every container runs with --network none and
 # ACME_CA_URL points at a closed local port (http://127.0.0.1:9/directory);
@@ -1052,6 +1057,12 @@ no_forwarding_headers() { # the echo carries none of them
 NOTE_UP_CREATE='.method == "POST" and .path == "/core/api/services/persistent_notification/create"
     and .body.notification_id == "caddy_mtls_upstream_refuses"'
 # shellcheck disable=SC2034 # used in eval'd checks
+NOTE_HIDDEN_CREATE='.method == "POST" and .path == "/core/api/services/persistent_notification/create"
+    and .body.notification_id == "caddy_mtls_upstream_addresses_hidden"'
+# shellcheck disable=SC2034 # used in eval'd checks
+NOTE_HIDDEN_DISMISS='.path == "/core/api/services/persistent_notification/dismiss"
+    and .body.notification_id == "caddy_mtls_upstream_addresses_hidden"'
+# shellcheck disable=SC2034 # used in eval'd checks
 NOTE_UP_DISMISS='.path == "/core/api/services/persistent_notification/dismiss"
     and .body.notification_id == "caddy_mtls_upstream_refuses"'
 FWD_ENV=(
@@ -1129,6 +1140,14 @@ if wait_for "${BOOT_TIMEOUT}" booted; then
     check "fwd-auto: trust lost -> the periodic test switches back to strip (one more refusal)" eval '
         wait_for 15 upstream_mode_is strip && refusals_are 2'
     check "fwd-auto: card strip again" wait_for 10 upstream_card_is strip
+    # B-12: a switch to strip at run time raises one notification (none when
+    # the add-on started in strip: only the dismissal of a previous run's).
+    check "notify: addresses hidden at run time -> one notification with the consequences and the steps" eval '
+        wait_for 15 supervisor_got "${NOTE_HIDDEN_CREATE}" &&
+        test "$(supervisor_count "${NOTE_HIDDEN_CREATE}")" == 1 &&
+        supervisor_got "${NOTE_HIDDEN_CREATE} and (.body.title == \"Caddy mTLS: Home Assistant no longer trusts the app - visitor addresses are hidden\")
+            and (.body.message | contains(\"Can only log in from the local network\") and contains(\"Trust X-Forwarded-For\"))" &&
+        test "$(supervisor_count "${NOTE_HIDDEN_DISMISS}")" == 1'
     check "fwd-auto: Check again (POST, ingress) -> 303 with the result, one more refusal" eval '
         [[ "$(panel_post /api/upstream/check)" == "303 http://127.0.0.1:8099${INGRESS_PREFIX}/?ok="*"does+not+trust"* ]] &&
         refusals_are 3'
@@ -1137,6 +1156,41 @@ if wait_for "${BOOT_TIMEOUT}" booted; then
         == "strip refused strip"
     check "notify: no upstream notification for strip / accepted, one dismissal after the start" eval '
         test "$(supervisor_count "${NOTE_UP_CREATE}")" == 0 && test "$(supervisor_count "${NOTE_UP_DISMISS}")" == 1'
+    # B-2: a reload that fails (the Caddyfile broken on purpose) - the card is
+    # red and everything follows the mode Caddy really runs (strip).
+    cexec cp /etc/caddy/Caddyfile /tmp/Caddyfile.good
+    cexec sh -c 'printf "broken-on-purpose {\n" >> /etc/caddy/Caddyfile'
+    # shellcheck disable=SC2034 # used in eval'd checks
+    lines="$(log_line_count)"
+    fake_trust on
+    fake_restart
+    check "reload-failed: card red (Change not applied) with the error" eval '
+        wait_for 20 upstream_card_is reload_failed && upstream_card_contains "Change not applied" &&
+        upstream_card_contains "Applying the forwarding mode pass failed"'
+    check "reload-failed: Caddy keeps strip - snippet, upstream.json (mode pass, running strip, not applied)" eval '
+        snippet_is strip && adapted "${HEADERS_STRIP}" &&
+        test "$(cexec jq -c "[.mode, .running, .applied]" /data/upstream.json)" == "[\"pass\",\"strip\",false]"'
+    check "reload-failed: requests still arrive without forwarding headers (what Caddy runs)" \
+        no_forwarding_headers "$(proxied /reload-failed-check)"
+    sleep 4
+    reload_error_logged_once() {
+        local n
+        n="$("${DOCKER}" logs "${CTR}" 2>&1 | tail -n "+$((lines + 1))" | grep -c "Applying the forwarding mode pass failed")"
+        [[ "${n}" == 1 ]] || { log "reload error logged ${n} times"; return 1; }
+    }
+    check "reload-failed: one ERROR line for it, not one per retry (control interval 1 s)" reload_error_logged_once
+    check "reload-failed: Check again -> flash error naming the failed reload" eval '
+        [[ "$(panel_post /api/upstream/check)" == "303 http://127.0.0.1:8099${INGRESS_PREFIX}/?error=Applying+the+forwarding+mode+pass+failed"* ]]'
+    cexec cp /tmp/Caddyfile.good /etc/caddy/Caddyfile
+    check "reload-failed: repaired -> the retry applies pass, card accepted, logged once" eval '
+        wait_for 15 upstream_mode_is pass && wait_for 10 upstream_card_is accepted &&
+        new_logs_contain "${lines}" "Caddy reloaded: the forwarding mode pass applies now."'
+    hidden_dismissed_twice() { test "$(supervisor_count "${NOTE_HIDDEN_DISMISS}")" == 2; }
+    check "notify: addresses passed on again -> the hidden notification dismissed" wait_for 10 hidden_dismissed_twice
+    # Back to strip (fwd-down below starts from this /data).
+    fake_trust off
+    fake_restart
+    check "fwd-auto: trust gone with a restart -> strip again" wait_for 20 upstream_mode_is strip
     check "fwd-auto: no Traceback in the log" logs_lack "Traceback"
     check "fwd-auto: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
     "${DOCKER}" cp "${CTR}:/data" - >"${WORK}/data-fwd-auto.tar"
@@ -1234,12 +1288,62 @@ if wait_for "${BOOT_TIMEOUT}" booted; then
     pass "fwd-nomtls: add-on booted"
     check "fwd-nomtls: refused, auto without mTLS stays at mode pass (broken)" eval '
         refusals_are 1 && upstream_mode_is pass && upstream_card_is broken'
-    check "fwd-nomtls: the card explains why auto does not strip and warns against never" eval '
-        upstream_card_contains "mtls_enabled: false" && upstream_card_contains "Not recommended"'
+    check "fwd-nomtls: the card explains why auto does not strip and offers mTLS, not never" eval '
+        upstream_card_contains "mtls_enabled: false" && upstream_card_contains "Or turn mTLS on" &&
+        ! upstream_card_contains "forwarded_headers: never" && ! upstream_card_contains "<code>never</code>"'
+    check "fwd-nomtls: the log block offers mTLS, not never" eval '
+        logs_contain "Or turn mTLS on (mtls_enabled: true): with forwarded_headers" && logs_lack "forwarded_headers: never"'
     check "notify: raised (mTLS off)" wait_for 30 supervisor_got "${NOTE_UP_CREATE} and (.body.message | contains(\"mtls_enabled: false\"))"
     check "fwd-nomtls: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
 else
     fail "fwd-nomtls: add-on booted"
+fi
+show_log_on_failure "${before}"
+
+# --- an upstream that is not Home Assistant: neutral texts (B-7) ---------------
+log "fwd-other: upstream 127.0.0.1:8124 (not Home Assistant), auto, refusing"
+before=${FAIL_COUNT}
+boot_fwd fwd-other "$(options "${DOMAIN}" true none "" 127.0.0.1 8124)"
+if wait_for "${BOOT_TIMEOUT}" booted; then
+    pass "fwd-other: add-on booted"
+    check "fwd-other: strip notice names the upstream, lower case inside sentences, card Upstream connection" eval '
+        upstream_mode_is strip &&
+        logs_contain "The upstream 127.0.0.1:8124 does not trust this add-on (127.0.0.1) as a reverse proxy." &&
+        logs_contain "and the upstream 127.0.0.1:8124 sees every visitor as 127.0.0.1." &&
+        logs_contain "let the upstream 127.0.0.1:8124 trust 127.0.0.1 as a reverse proxy" &&
+        logs_contain "(card \"Upstream connection\")"'
+    check "fwd-other: no \"The upstream\" mid-sentence, no Home Assistant card named" eval '
+        logs_lack "and The upstream" && logs_lack "let The upstream" && logs_lack "Home Assistant connection"'
+    check "fwd-other: card titled Upstream connection, no claim about Home Assistant" eval '
+        upstream_card_contains "<h2 class=\"card__title\" id=\"hc-heading\">Upstream connection</h2>" &&
+        ! upstream_card_contains "Home Assistant"'
+    check "fwd-other: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
+else
+    fail "fwd-other: add-on booted"
+fi
+show_log_on_failure "${before}"
+
+log "fwd-other-always: upstream 127.0.0.1:8124 (not Home Assistant), always, refusing"
+before=${FAIL_COUNT}
+OPT_FORWARDED=always
+boot_fwd fwd-other-always "$(options "${DOMAIN}" true none "" 127.0.0.1 8124)"
+OPT_FORWARDED=auto
+if wait_for "${BOOT_TIMEOUT}" booted; then
+    pass "fwd-other-always: add-on booted"
+    check "fwd-other-always: the 400 block names the upstream in lower case and the card's own title" eval '
+        logs_contain "The upstream 127.0.0.1:8124 answers EVERY request through ${DOMAIN}" &&
+        logs_contain "Let the upstream 127.0.0.1:8124 trust 127.0.0.1 as a reverse" &&
+        logs_contain "Or set forwarded_headers to auto: the upstream 127.0.0.1:8124 then sees" &&
+        logs_contain "Details: the add-on'"'"'s web interface (card \"Upstream connection\")." &&
+        logs_lack "forwarded_headers: never" && logs_lack "Home Assistant connection"'
+    # shellcheck disable=SC2016
+    note_other='.body.title == "Caddy mTLS: the upstream refuses the proxied requests"
+        and (.body.message | contains("card \"Upstream connection\"") and (contains("Home Assistant") | not))'
+    check "fwd-other-always: notification neutral, naming the Upstream connection card" \
+        wait_for 30 supervisor_got "${NOTE_UP_CREATE} and ${note_other}"
+    check "fwd-other-always: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
+else
+    fail "fwd-other-always: add-on booted"
 fi
 show_log_on_failure "${before}"
 
@@ -1474,6 +1578,16 @@ bad_case domain-port "$(options home.example.com:8443 true none "")" \
     "Option 'domain' must be a host name without scheme, port or path"
 bad_case upstream-port "$(options home.example.com true none "" 192.0.2.10 "")" \
     "Option 'upstream_port' is required when upstream_host is not 'homeassistant'."
+# B-1: never needs mTLS, for every upstream.
+OPT_FORWARDED=never
+bad_case never-nomtls "$(options home.example.com false none "")" \
+    "forwarded_headers: never needs mtls_enabled: true. Without client certificates the add-on never hides visitor addresses"
+check "bad-never-nomtls: the message names the alternatives (mTLS on, or auto with Home Assistant's reverse-proxy settings)" eval '
+    logs_contain "Turn mTLS on (mtls_enabled: true), or set forwarded_headers to auto" &&
+    logs_contain "Settings > System > Network > HTTP server > Reverse proxy"'
+bad_case never-nomtls-other "$(options home.example.com false none "" 192.0.2.10 8080)" \
+    "forwarded_headers: never needs mtls_enabled: true."
+OPT_FORWARDED=auto
 
 printf '\n%d passed, %d failed\n' "${PASS_COUNT}" "${FAIL_COUNT}"
 (( FAIL_COUNT == 0 ))

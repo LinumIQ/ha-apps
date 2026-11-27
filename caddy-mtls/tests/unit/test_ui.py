@@ -274,7 +274,9 @@ class UpstreamCardTests(unittest.TestCase):
                 "broken": dict(result="refused", decisive="refused", mode="pass", reachable=True),
                 "never": dict(result="refused", decisive="refused", mode="strip", reachable=True),
                 "unreachable": dict(result="unreachable", decisive="refused", mode="strip", reachable=False,
-                                    error="[Errno 111] Connection refused"),
+                                    error="[Errno 111] Connection refused", error_kind="connect"),
+                "reload_failed": dict(result="refused", decisive="refused", mode="strip", running="pass",
+                                      applied=False, reachable=True, reload_error="Error: loading config: x"),
                 "unknown": dict(),
             }[card]
             defaults.update(source_address="172.30.33.3", checked_at=self.NOW - 30)
@@ -311,6 +313,9 @@ class UpstreamCardTests(unittest.TestCase):
             "never": ["Addresses not passed on", "forwarded_headers: never", "172.30.33.3"],
             "unreachable": ["status--danger", "Unreachable", "<code>homeassistant:8123</code> does not answer",
                             "Connection refused", "502 Bad Gateway", "mode <code>strip</code>"],
+            "reload_failed": ["status--danger", "Change not applied", 'role="alert"',
+                              "Applying the forwarding mode strip failed", "Error: loading config: x",
+                              'every request is answered "400: Bad Request"', 'data-mode="pass"'],
             "unknown": ["Not checked yet"],
         }
         for card, needles in expectations.items():
@@ -320,11 +325,27 @@ class UpstreamCardTests(unittest.TestCase):
                 for needle in needles:
                     self.assertIn(needle, html)
 
-    def test_broken_without_mtls_warns_against_never(self):
+    def test_broken_without_mtls_offers_no_never(self):
+        """B-1: never needs mTLS - not offered while it is off."""
         html = self.render("broken", option="auto", mtls=False)
         self.assertIn("mtls_enabled: false", html)
-        self.assertIn("everyone on the\n    internet", html)
+        self.assertIn("Or turn mTLS on", html)
         self.assertNotIn("Or set the app option", html)
+        self.assertNotIn("<code>never</code>", html)
+        self.assertNotIn("forwarded_headers: never", html)
+
+    def test_strip_names_both_kinds_of_visitors(self):
+        """B-9: not "every visitor has a client certificate"."""
+        html = self.render("strip")
+        self.assertIn("visitors on the public\n    port have a client certificate", html)
+        self.assertIn("local-network port come\n    from private addresses", html)
+        self.assertNotIn("every visitor has a", html)
+
+    def test_slow_unreachable_claims_no_502(self):
+        """B-6."""
+        html = self.render("unreachable", error="timed out", error_kind="timeout")
+        self.assertIn("visitors&#39; requests wait for it or fail", html)
+        self.assertNotIn("502", html)
 
     def test_other_upstream_is_neutral(self):
         html = self.render("broken", option="always", host="192.0.2.10")

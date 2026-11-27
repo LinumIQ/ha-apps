@@ -351,7 +351,10 @@ def api_upstream() -> dict[str, Any]:
             "result": state.result,
             "decisive": state.decisive,
             "mode": state.mode,
+            "running": state.running_mode,
             "applied": state.applied,
+            "reload_error": state.reload_error,
+            "hidden_at_runtime": state.hidden_at_runtime,
             "reachable": state.reachable,
             "source_address": state.source_address,
             "checked_at": state.checked_at,
@@ -600,7 +603,7 @@ _CHECK_RESULT = {
     "strip": "{Name} does not trust this add-on as a reverse proxy: visitor addresses are not passed on.",
     "broken": "{Name} does not trust this add-on as a reverse proxy: every request is answered 400.",
     "never": "Checked. Visitor addresses are not passed on (forwarded_headers: never).",
-    "unreachable": "{target} does not answer: {error}",
+    "unreachable": "{Name} does not answer ({error}): {effect}.",
     "unknown": "Checked; the result is not known yet.",
 }
 
@@ -616,21 +619,27 @@ def check_upstream(request: Request):
         outcome = upstream.check(settings, test=True)
     except TimeoutError:
         raise FlashError("Another check is running; try again in a moment.") from None
+    name_start = upstream.upstream_name(settings, start=True)
     if outcome.reload_error:
         LOG.error("caddy reload for the forwarding mode failed: %s", outcome.reload_error)
         raise FlashError(
-            "The forwarding mode changed, but reloading Caddy failed (the add-on "
-            "retries). Check the add-on logs."
+            f"Applying the forwarding mode {outcome.state.mode} failed: Caddy could not be "
+            f"reloaded ({outcome.reload_error[:300]}). Caddy keeps mode "
+            f"{outcome.state.running_mode}; the add-on retries."
         )
-    name = upstream.upstream_name(settings)
+    if outcome.probe is not None and outcome.probe.result == upstream.SLOW:
+        raise FlashError(
+            f"{name_start} did not answer in time ({outcome.probe.error}); nothing changed. "
+            "Try again in a moment."
+        )
     message = _CHECK_RESULT.get(outcome.card, _CHECK_RESULT["unknown"]).format(
-        Name=name[:1].upper() + name[1:],
-        target=settings.target,
+        Name=name_start,
         error=outcome.state.error or "no answer",
+        effect=upstream.unreachable_effect(outcome.state.error_kind),
     )
     if outcome.switched:
-        message += f" Forwarding mode: {outcome.previous_mode} -> {outcome.state.mode}."
-    if outcome.card == "unreachable":
+        message += f" Forwarding mode: {outcome.previous_mode} -> {outcome.state.running_mode}."
+    if outcome.card in ("unreachable", upstream.RELOAD_FAILED):
         raise FlashError(message)
     return _redirect_home(request, ok=message)
 

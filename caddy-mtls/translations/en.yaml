@@ -137,7 +137,9 @@ configuration:
       add-on, addresses are passed on; if not, and mTLS is on, they are
       removed and Home Assistant sees every visitor as the add-on.
       always: always passed on (Home Assistant must trust the add-on).
-      never: never passed on.
+      never: never passed on - only with mTLS on (Enable mTLS); without it
+      the add-on refuses to start, because every visitor from the internet
+      would look like a device in your local network.
       The add-on's web interface shows the state and how to let Home
       Assistant trust the add-on.
 

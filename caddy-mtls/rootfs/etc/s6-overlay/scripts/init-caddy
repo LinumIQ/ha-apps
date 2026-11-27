@@ -110,6 +110,15 @@ case "${FORWARDED_HEADERS}" in
     *) bashio::exit.nok "Unknown forwarded_headers '${FORWARDED_HEADERS}' (auto, always or never)." ;;
 esac
 
+# forwarded_headers: never needs mTLS (for every upstream). Without client
+# certificates the visitors are anyone on the internet; hiding their
+# addresses would make each of them look like a local device to the
+# upstream (Home Assistant: "local network only" users, local-only webhooks,
+# trusted networks).
+if [[ "${FORWARDED_HEADERS}" == "never" ]] && ! bashio::var.true "${MTLS_ENABLED}"; then
+    bashio::exit.nok "forwarded_headers: never needs mtls_enabled: true. Without client certificates the add-on never hides visitor addresses from the upstream: every visitor from the internet would look like a device in your local network to it. Turn mTLS on (mtls_enabled: true), or set forwarded_headers to auto and let Home Assistant trust this add-on as a reverse proxy (Settings > System > Network > HTTP server > Reverse proxy; see the documentation)."
+fi
+
 if [[ "${ACME_DNS_PROVIDER}" != "none" ]] && bashio::var.is_empty "${DNS_API_TOKEN}"; then
     bashio::exit.nok "DNS API token is required when acme_dns_provider is '${ACME_DNS_PROVIDER}'."
 fi
@@ -354,10 +363,17 @@ fi
 # upstream() <key>: a fact of the check ("" if unknown; never fails).
 upstream() { [[ -z "${UPSTREAM_JSON}" ]] || jq -r --arg k "$1" '.[$k] // "" | tostring' <<<"${UPSTREAM_JSON}"; }
 if [[ ! -s "${FORWARD_SNIPPET}" ]]; then
-    # Only when upstream.py could not run: today's behaviour (headers passed
-    # on); the monitor rewrites the file with its decision.
-    printf '%s\n' '# Forwarding headers, mode pass (fallback of init-caddy).' \
-        'header_up X-Real-IP {remote_host}' 'header_up -Forwarded' >"${FORWARD_SNIPPET}"
+    # Only when upstream.py could not run: the headers passed on (as up to
+    # 2.1.x) - removed with forwarded_headers: never; the monitor rewrites
+    # the file with its decision.
+    if [[ "${FORWARDED_HEADERS}" == "never" ]]; then
+        printf '%s\n' '# Forwarding headers, mode strip (fallback of init-caddy).' \
+            'header_up -X-Forwarded-For' 'header_up -X-Forwarded-Proto' 'header_up -X-Forwarded-Host' \
+            'header_up -X-Real-IP' 'header_up -Forwarded' >"${FORWARD_SNIPPET}"
+    else
+        printf '%s\n' '# Forwarding headers, mode pass (fallback of init-caddy).' \
+            'header_up X-Real-IP {remote_host}' 'header_up -Forwarded' >"${FORWARD_SNIPPET}"
+    fi
     chmod 644 "${FORWARD_SNIPPET}"
 fi
 
@@ -718,33 +734,41 @@ mv -f "${RUNTIME_FILE}.tmp" "${RUNTIME_FILE}"
 # only when every request is answered "400: Bad Request".
 ###############################################################################
 upstream_notice() {
-    local card source suggestion error what
+    local card source suggestion error what what_mid title
     card="$(upstream card)"
     source="$(upstream source_address)"
     suggestion="$(upstream suggestion)"
     error="$(upstream error)"
+    # How texts name the upstream: at the start of a sentence / inside one;
+    # the title of its card in the web interface.
     what="Home Assistant"
-    [[ "${UPSTREAM_HOST}" == "homeassistant" ]] || what="The upstream ${UPSTREAM_HOST}:${UPSTREAM_PORT}"
+    what_mid="Home Assistant"
+    title="Home Assistant connection"
+    if [[ "${UPSTREAM_HOST}" != "homeassistant" ]]; then
+        what="The upstream ${UPSTREAM_HOST}:${UPSTREAM_PORT}"
+        what_mid="the upstream ${UPSTREAM_HOST}:${UPSTREAM_PORT}"
+        title="Upstream connection"
+    fi
     case "${card}" in
         accepted)
             bashio::log.info "${what} accepts this add-on (${source}) as a reverse proxy: visitor addresses are passed on."
             ;;
         strip)
-            bashio::log.notice "${what} does not trust this add-on (${source}) as a reverse proxy. The add-on therefore removes the forwarding headers (forwarded_headers: auto, mTLS on): it works, and ${what} sees every visitor as ${source}."
-            bashio::log.notice "To pass visitor addresses on, let ${what} trust ${suggestion} as a reverse proxy - the steps are in the add-on's web interface (Home Assistant connection)."
+            bashio::log.notice "${what} does not trust this add-on (${source}) as a reverse proxy. The add-on therefore removes the forwarding headers (forwarded_headers: auto, mTLS on): it works, and ${what_mid} sees every visitor as ${source}."
+            bashio::log.notice "To pass visitor addresses on, let ${what_mid} trust ${suggestion} as a reverse proxy - the steps are in the add-on's web interface (card \"${title}\")."
             ;;
         never)
-            bashio::log.info "forwarded_headers: never - visitor addresses are not passed on; ${what} sees every visitor as ${source:-this add-on}."
+            bashio::log.info "forwarded_headers: never - visitor addresses are not passed on; ${what_mid} sees every visitor as ${source:-this add-on}."
             ;;
         unreachable)
-            bashio::log.warning "The upstream ${UPSTREAM_HOST}:${UPSTREAM_PORT} does not answer yet (${error:-no answer}): visitors get 502 Bad Gateway until it does. Forwarding headers until then: mode $(upstream mode) (last known); the add-on checks again every few seconds."
+            bashio::log.warning "The upstream ${UPSTREAM_HOST}:${UPSTREAM_PORT} does not answer yet (${error:-no answer}): $(upstream effect) until it does. Forwarding headers until then: mode $(upstream mode) (last known); the add-on checks again every few seconds."
             ;;
         broken)
             bashio::log.warning "------------------------------------------------------------"
             bashio::log.warning "${what} answers EVERY request through ${DOMAIN}"
             bashio::log.warning "with \"400: Bad Request\": it does not trust this add-on"
             bashio::log.warning "(${source}) as a reverse proxy, and the add-on passes the"
-            if [[ "${FORWARDED_HEADERS}" == "always" ]]; then
+            if [[ "${MTLS_BOOL}" == true ]]; then
                 bashio::log.warning "visitor addresses on (forwarded_headers: always)."
             else
                 bashio::log.warning "visitor addresses on (mtls_enabled: false - without client"
@@ -765,20 +789,28 @@ upstream_notice() {
                 bashio::log.warning "    trusted_proxies:"
                 bashio::log.warning "      - ${suggestion}"
             else
-                bashio::log.warning "Let the upstream trust ${suggestion} as a reverse proxy"
-                bashio::log.warning "(X-Forwarded-For), or set forwarded_headers: never."
+                bashio::log.warning "Let ${what_mid} trust ${suggestion} as a reverse"
+                bashio::log.warning "proxy (X-Forwarded-For)."
             fi
-            if [[ "${FORWARDED_HEADERS}" == "always" && "${MTLS_BOOL}" == true ]]; then
+            if [[ "${MTLS_BOOL}" == true ]]; then
                 bashio::log.warning ""
-                bashio::log.warning "Or set forwarded_headers to auto: ${what} then sees"
+                bashio::log.warning "Or set forwarded_headers to auto: ${what_mid} then sees"
                 bashio::log.warning "every visitor as ${source}."
+            else
+                bashio::log.warning ""
+                bashio::log.warning "Or turn mTLS on (mtls_enabled: true): with forwarded_headers"
+                bashio::log.warning "auto the add-on then hides the visitor addresses."
             fi
             bashio::log.warning ""
-            bashio::log.warning "Details: the add-on's web interface (Home Assistant connection)."
+            bashio::log.warning "Details: the add-on's web interface (card \"${title}\")."
             bashio::log.warning "------------------------------------------------------------"
             ;;
         *)
-            bashio::log.info "Connection to the upstream not checked yet; the add-on checks it in a few seconds."
+            if [[ -n "${error}" ]]; then
+                bashio::log.info "${what} did not answer in time (${error}); the add-on checks again in a few seconds."
+            else
+                bashio::log.info "Connection to the upstream not checked yet; the add-on checks it in a few seconds."
+            fi
             ;;
     esac
 }
