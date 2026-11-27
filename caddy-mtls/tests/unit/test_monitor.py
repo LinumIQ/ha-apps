@@ -244,7 +244,7 @@ class PublicCertWatchTest(unittest.TestCase):
     """The public certificate notification (fast lane, notify after 2
     minutes, dismiss when the certificate exists) with a mocked Supervisor."""
 
-    DOMAIN = "ladyfit.duckdns.org"
+    DOMAIN = "home.example.com"
 
     def setUp(self) -> None:
         self.calls: list[tuple[str, str, dict]] = []
@@ -275,7 +275,7 @@ class PublicCertWatchTest(unittest.TestCase):
         error = json.dumps({
             "level": "error", "ts": now - 1, "logger": "tls.obtain",
             "msg": "could not get certificate from issuer", "identifier": self.DOMAIN,
-            "error": "HTTP 400 urn:ietf:params:acme:error:connection - 86.62.32.88: Error getting validation data",
+            "error": "HTTP 400 urn:ietf:params:acme:error:connection - 203.0.113.10: Error getting validation data",
         })
         cert = None
         if with_cert:
@@ -311,7 +311,7 @@ class PublicCertWatchTest(unittest.TestCase):
         warnings = [r for r in logs.records if r.levelname == "WARNING"]
         self.assertEqual(len(warnings), 1, logs.output)  # one line per state change
         self.assertIn(self.DOMAIN, warnings[0].getMessage())
-        self.assertIn("86.62.32.88: Error getting validation data", warnings[0].getMessage())
+        self.assertIn("203.0.113.10: Error getting validation data", warnings[0].getMessage())
         self.assertEqual(watch.state, "notified")
 
         creates = self.creates()
@@ -321,7 +321,7 @@ class PublicCertWatchTest(unittest.TestCase):
         self.assertEqual(note["title"], f"Caddy mTLS: no public certificate for {self.DOMAIN}")
         for text in (
             "port 8080", "port 8443", f"{self.DOMAIN} resolves to your public IP",
-            "connection: 86.62.32.88: Error getting validation data",
+            "connection: 203.0.113.10: Error getting validation data",
             "restart the app to retry immediately",
         ):
             with self.subTest(text=text):

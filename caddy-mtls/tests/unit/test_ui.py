@@ -199,7 +199,7 @@ class RenderTests(unittest.TestCase):
             fingerprint_sha256="ab" * 32, mtime=self.NOW - 3600)
         error = public_cert.AcmeEvent(ts=self.NOW - 60, logger="tls.obtain", level="error",
                                       msg="could not get certificate from issuer",
-                                      error="86.62.32.88: Timeout during connect", problem_type="connection")
+                                      error="203.0.113.10: Timeout during connect", problem_type="connection")
         if state == "ok":
             return public_cert.Status(state="ok", runtime=runtime, certificate=cert, served=True, now=self.NOW)
         return public_cert.Status(state="missing", runtime=runtime, last_error=error, now=self.NOW)
