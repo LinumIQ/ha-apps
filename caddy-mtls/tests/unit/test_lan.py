@@ -72,7 +72,7 @@ class GatewayTest(unittest.TestCase):
 
 class PrivateTest(unittest.TestCase):
     def test_private(self) -> None:
-        for address in ("10.1.2.3", "172.16.0.1", "172.31.255.254", "192.168.1.181", "127.0.0.1",
+        for address in ("10.1.2.3", "172.16.0.1", "172.31.255.254", "192.168.1.50", "127.0.0.1",
                         "169.254.10.10", "fd0c:ac1e:2100::5", "fc00::1", "fe80::1%eth0", "::1",
                         "::ffff:192.168.1.20"):
             with self.subTest(address=address):
