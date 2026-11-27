@@ -394,13 +394,14 @@ read_host_ports() {
 read_host_ports || true
 
 # The add-on's own folder in Home Assistant's app configuration folders
-# (/config in here): app_configs/<slug>/ on the host since Supervisor 2026.7
-# and in the apps that map all_app_configs (the official Samba share,
-# Terminal & SSH and File editor of today), addon_configs/<slug>/ in apps
-# that still map the legacy all_addon_configs (e.g. Advanced SSH & Web
-# Terminal). The slug ends in _caddy_mtls and starts with the repository's
-# hash (local_ for a local copy). The panel shows the folder; unknown outside
-# Supervisor.
+# (/config in here). Depending on the app and its version it appears as
+# app_configs/<slug>/ (apps that map all_app_configs: the official Samba
+# share, Terminal & SSH and File editor of today) or under its earlier name
+# addon_configs/<slug>/ (older versions of those, and apps that still map
+# all_addon_configs, e.g. Advanced SSH & Web Terminal); the content is the
+# same. The slug ends in _caddy_mtls and starts with a hash of the exact
+# repository address that was added (local_ for a local copy). The panel
+# shows the folder; unknown outside Supervisor.
 CONFIG_SLUG=""
 read_config_slug() {
     local slug

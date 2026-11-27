@@ -621,25 +621,27 @@ folder of its own configuration folder in Home Assistant:
 - `mTLS-client-<name>.p12` - the bundle of each **active** client.
 
 The folder is `<slug>/certs/` in Home Assistant's app configuration
-folders. The slug ends in `_caddy_mtls`: it is `2644ca2c_caddy_mtls` when you
-added the repository as `https://github.com/LinumIQ/ha-apps`, and
-`local_caddy_mtls` for a local copy in the `local_apps` (formerly `addons`)
-folder. The web interface shows the exact folder under **Client
-certificates**.
+folders. The slug ends in `_caddy_mtls` and starts with a hash of the exact
+repository address you added: `2644ca2c_caddy_mtls` for
+`https://github.com/LinumIQ/ha-apps` (an address with a trailing `/` or
+`.git` gives another one), `local_caddy_mtls` for a local copy in the
+`local_apps` (formerly `addons`) folder. **The web interface shows the exact
+folder** under **Client certificates**.
 
-The name of the parent folder depends on the app you use to reach it: since
-Supervisor 2026.7 it is `app_configs` on the host and in the apps that use
-the new name, and `addon_configs` in older versions of those apps and in
-apps that still use the old name - both are the same folder:
+Depending on the app and its version, the parent folder appears as
+`app_configs` or under its earlier name `addon_configs`; the content is the
+same:
 
-- **Samba share** app: the share `app_configs`, folder
-  `<slug>/certs/` (the old share name `addon_configs` still works);
-- **Terminal & SSH** app: `/app_configs/<slug>/certs/` (before version 10.5
-  of that app: `/addon_configs/<slug>/certs/`);
-- **File editor** app: `/app_configs/<slug>/certs/`, only with its option
-  `enforce_basepath: false`;
-- **Advanced SSH & Web Terminal** (community app): `/addon_configs/<slug>/certs/`
-  (it still uses the old name).
+- **Samba share** app: from version 12.10.0 the shares `app_configs` and
+  (still) `addon_configs`, folder `<slug>/certs/`; before 12.10.0 only the
+  share `addon_configs`;
+- **Terminal & SSH** app: from version 10.5.0 `/app_configs/<slug>/certs/`,
+  before that `/addon_configs/<slug>/certs/`;
+- **File editor** app: from version 6.1.0 `/app_configs/<slug>/certs/`,
+  before that `/addon_configs/<slug>/certs/` - in both cases only with its
+  option `enforce_basepath: false`;
+- **Advanced SSH & Web Terminal** (community app):
+  `/addon_configs/<slug>/certs/`.
 
 The copy is refreshed only when the add-on starts: a client you create,
 regenerate or revoke in the web interface, and a regenerated CA, show up there
