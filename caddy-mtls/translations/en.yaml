@@ -126,3 +126,30 @@ configuration:
       about 1.5 KB per request - loading the Home Assistant frontend makes
       several hundred). Off by default; turn it on to debug a connection
       problem.
+
+  forwarded_headers:
+    name: Forwarding Headers
+    description: >-
+      Whether Home Assistant gets each visitor's own address
+      (X-Forwarded-For). Home Assistant answers "400: Bad Request" when it
+      gets one from a proxy it does not trust.
+      auto (default): the add-on asks Home Assistant; if it trusts the
+      add-on, addresses are passed on; if not, and mTLS is on, they are
+      removed and Home Assistant sees every visitor as the add-on.
+      always: always passed on (Home Assistant must trust the add-on).
+      never: never passed on - only with mTLS on (Enable mTLS); without it
+      the add-on refuses to start, because every visitor from the internet
+      would look like a device in your local network.
+      The add-on's web interface shows the state and how to let Home
+      Assistant trust the add-on.
+
+network:
+  80/tcp: >-
+    HTTP (Let's Encrypt HTTP-01, CRL, redirect to HTTPS).
+    Router: forward external TCP 80 to this port.
+  443/tcp: >-
+    HTTPS with mTLS client certificates.
+    Router: forward external TCP 443 to this port.
+  4443/tcp: >-
+    HTTPS for your local network without a client certificate (private
+    addresses only). Empty = off. Never forward this port on the router.

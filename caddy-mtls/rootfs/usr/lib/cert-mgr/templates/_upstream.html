@@ -1,0 +1,192 @@
+{#- "Home Assistant connection" card ("Upstream connection" for another
+    upstream): rendered into index.html and alone by GET upstream, which the
+    dashboard fetches every 30 s. hc: upstream.card_context (card state,
+    upstream.Settings, upstream.State, texts). Every statement follows the
+    mode Caddy really runs (state.running_mode). -#}
+{%- set labels = {
+  "accepted": "Connected",
+  "strip": "Connected - addresses hidden",
+  "broken": "Refused (400)",
+  "never": "Addresses not passed on",
+  "unreachable": "Unreachable",
+  "reload_failed": "Change not applied",
+  "too_slow": "Too slow to decide",
+  "unknown": "Not checked yet",
+} -%}
+{%- set badges = {
+  "accepted": "success",
+  "strip": "info",
+  "broken": "danger",
+  "never": "info",
+  "unreachable": "danger",
+  "reload_failed": "danger",
+  "too_slow": "warn",
+  "unknown": "info",
+} -%}
+{%- set s = hc.settings -%}
+{%- set st = hc.state -%}
+<section
+  class="card hc hc--{{ hc.card }}"
+  id="upstream"
+  aria-labelledby="hc-heading"
+  aria-live="polite"
+  data-state="{{ hc.card }}"
+  data-mode="{{ st.running_mode if st else '' }}"
+>
+  <div class="card__header">
+    <h2 class="card__title" id="hc-heading">{{ hc.title or "Home Assistant connection" }}</h2>
+    <span class="status status--{{ badges[hc.card] }} hc-badge--{{ hc.card }}">{{ labels[hc.card] }}</span>
+  </div>
+
+  {% if not s %}
+  <p class="hc__lead">
+    The connection state is not available yet: the app is still starting.
+  </p>
+  {% else %}
+
+  {% if hc.card == "reload_failed" %}
+  <div class="hc__error" role="alert">
+    <strong>Applying the forwarding mode {{ st.mode }} failed</strong>: Caddy
+    could not be reloaded. The add-on retries on its own at each regular check
+    of the connection.
+    <code class="hc__error-text">{{ st.reload_error }}</code>
+  </div>
+  <p class="hc__lead">
+    Caddy keeps the mode it runs:
+    {% if st.running_mode == "pass" %}visitor addresses are passed on{% if hc.broken %},
+    and {{ hc.name }} does not trust this add-on (<code>{{ hc.source }}</code>) -
+    <strong>every request is answered "400: Bad Request"</strong>{% endif %}.
+    {% else %}visitor addresses are removed, {{ hc.name }} sees every visitor as
+    <code>{{ hc.source }}</code>.{% endif %}
+    If this persists, restart the app; its log shows the reason.
+  </p>
+
+  {% elif hc.card == "accepted" %}
+  <p class="hc__lead">
+    {{ hc.Name }} accepts this add-on as a reverse proxy: visitor addresses are
+    passed on, so {{ hc.name }} sees each visitor's own address.
+  </p>
+
+  {% elif hc.card == "strip" %}
+  <p class="hc__lead">
+    <strong>It works</strong>, and {{ hc.name }} sees every visitor as
+    <code>{{ hc.source }}</code>. {{ hc.Name }} does not trust this add-on as
+    a reverse proxy, so the add-on does not pass visitor addresses on
+    (<code>forwarded_headers: auto</code> with mTLS: visitors on the public
+    port have a client certificate, visitors on the local-network port come
+    from private addresses).
+  </p>
+  <p class="hc__note"><strong>What this means:</strong></p>
+  <ul class="hc__list">
+    {% for item in hc.consequences %}
+    <li>{{ item }}</li>
+    {% endfor %}
+  </ul>
+  <p class="hc__note"><strong>To pass the real visitor addresses on instead:</strong></p>
+  {% include "_upstream_steps.html" %}
+
+  {% elif hc.card == "broken" %}
+  <p class="hc__lead">
+    <strong>Every request is answered "400: Bad Request"</strong> by
+    {{ hc.name }}: the add-on passes the visitor's address on
+    (X-Forwarded-For), but {{ hc.name }} does not trust this add-on
+    (<code>{{ hc.source }}</code>) as a reverse proxy.
+    {% if s.mtls %}The add-on passes the addresses on because
+    <code>forwarded_headers</code> is <code>always</code>.
+    {% else %}The add-on never hides the visitor addresses while mTLS is off
+    (<code>mtls_enabled: false</code>): every visitor from the internet would
+    then look like a device in your local network.{% endif %}
+  </p>
+  <p class="hc__note"><strong>To fix it:</strong></p>
+  {% include "_upstream_steps.html" %}
+  {% if s.mtls %}
+  <p class="hc__note">
+    Or set the app option <code>forwarded_headers</code> to
+    <code>auto</code> (or <code>never</code>): {{ hc.name }} then sees every
+    visitor as <code>{{ hc.source }}</code>, with these consequences:
+  </p>
+  <ul class="hc__list">
+    {% for item in hc.consequences %}
+    <li>{{ item }}</li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="hc__note">
+    Or turn mTLS on (<code>mtls_enabled: true</code>): with
+    <code>forwarded_headers: auto</code> the add-on then hides the visitor
+    addresses as long as {{ hc.name }} does not trust it.
+  </p>
+  {% endif %}
+
+  {% elif hc.card == "never" %}
+  <p class="hc__lead">
+    Visitor addresses are not passed on (<code>forwarded_headers: never</code>
+    in the app's configuration): {{ hc.name }} sees every visitor as
+    <code>{{ hc.source }}</code>.
+    {% if st and st.decisive == "accepted" %}{{ hc.Name }} would accept them:
+    with <code>forwarded_headers: auto</code> the add-on passes them on.{% endif %}
+  </p>
+  <ul class="hc__list">
+    {% for item in hc.consequences %}
+    <li>{{ item }}</li>
+    {% endfor %}
+  </ul>
+
+  {% elif hc.card == "unreachable" %}
+  <p class="hc__lead">
+    <strong>The upstream <code>{{ s.target }}</code> {{ hc.down }}</strong>
+    ({{ hc.down_detail }}), so {{ hc.effect }}.
+    While {{ hc.name }} starts or restarts this is normal: the add-on keeps
+    asking and decides about the forwarding headers as soon as it answers
+    (until then: mode <code>{{ st.running_mode }}</code>, the last known).
+  </p>
+
+  {% elif hc.card == "too_slow" %}
+  <p class="hc__lead">
+    <strong>{{ hc.Name }} answers the test request too slowly to decide</strong>
+    whether it trusts this add-on as a reverse proxy: {{ hc.slow_tests_max }}
+    test requests in a row got no answer in time. The add-on has stopped
+    retrying on its own; it tests again when {{ hc.name }} restarts, when the
+    app starts and when you select <strong>Check again</strong>. Until then:
+    mode <code>{{ st.running_mode }}</code> (visitor addresses
+    {% if st.running_mode == "strip" %}removed{% else %}passed on{% endif %}).
+  </p>
+
+  {% else %}
+  <p class="hc__lead">
+    Not checked yet: the add-on asks {{ hc.name }} in a few seconds.
+    {% if st and st.error %}({{ st.error }}){% endif %}
+  </p>
+  {% endif %}
+
+  <dl class="meta-list hc__facts">
+    <div class="meta-list__row">
+      <dt class="meta-list__label">Upstream</dt>
+      <dd class="meta-list__value"><code>{{ s.target }}</code></dd>
+    </div>
+    <div class="meta-list__row">
+      <dt class="meta-list__label">forwarded_headers</dt>
+      <dd class="meta-list__value">
+        <code>{{ s.option }}</code> - visitor addresses
+        {% if st and st.running_mode == "strip" %}removed{% else %}passed on{% endif %}
+      </dd>
+    </div>
+    {% if st and st.checked_at %}
+    <div class="meta-list__row">
+      <dt class="meta-list__label">Last check</dt>
+      <dd class="meta-list__value">
+        {{ hc.time(st.checked_at) }}: {{ st.decisive or "-" }}
+      </dd>
+    </div>
+    {% endif %}
+  </dl>
+
+  <form method="post" action="api/upstream/check" class="hc__check">
+    <button class="btn" type="submit">Check again</button>
+    <span class="hc__check-hint">
+      Asks {{ hc.name }} now{% if s.is_home_assistant %} (if it refuses, its
+      log gets one line){% endif %}.
+    </span>
+  </form>
+  {% endif %}
+</section>

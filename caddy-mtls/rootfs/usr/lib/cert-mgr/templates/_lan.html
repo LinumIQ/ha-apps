@@ -1,0 +1,80 @@
+{#- "Local network" card (container port 4443, since 2.2.0): HTTPS for the
+    same domain without client certificates, for private source addresses
+    only. lan_rt: public_cert.Runtime of this start (or None). -#}
+{%- set state = lan_rt.lan_state if lan_rt else "unknown" -%}
+{%- set port = lan_rt.lan_host_port if lan_rt else None -%}
+{%- set domain = lan_rt.domain if lan_rt else "your domain" -%}
+{%- set labels = {"on": "On", "off": "Off", "unknown": "Off"} -%}
+{%- set badges = {"on": "success", "off": "info", "unknown": "warn"} -%}
+<section
+  class="card lan lan--{{ state }}"
+  id="lan"
+  aria-labelledby="lan-heading"
+  data-state="{{ state }}"
+>
+  <div class="card__header">
+    <h2 class="card__title" id="lan-heading">Local network</h2>
+    <span class="status status--{{ badges[state] }}">{{ labels[state] }}</span>
+  </div>
+
+  {% if state == "on" %}
+  {% set url = "https://" ~ domain ~ ("/" if port == 443 else ":" ~ port ~ "/") %}
+  <p class="lan__lead">
+    At home, open <code>{{ url }}</code>: the same Home Assistant over
+    HTTPS, without a client certificate.
+  </p>
+  <ul class="lan__list">
+    <li>
+      <strong>Your local DNS</strong> (router, AdGuard Home, Pi-hole, the
+      Dnsmasq app) must resolve <code>{{ domain }}</code> to the
+      <strong>IPv4 address</strong> of this Home Assistant host. The address
+      itself (<code>https://192.168.x.y:{{ port }}/</code>) does not work: the
+      certificate is for <code>{{ domain }}</code>.
+    </li>
+    <li>
+      It answers only devices with a private address (local network); every
+      other connection gets "403 Forbidden".
+      {% if lan_rt.lan_refused %}It also refuses
+      {% for addr in lan_rt.lan_refused %}<code>{{ addr }}</code>{% if not loop.last %}, {% endif %}{% endfor %}:
+      Docker's address on the host, which hides where a connection really
+      comes from (IPv6 connections, connections from the host itself) - use
+      IPv4.{% endif %}
+    </li>
+    <li>
+      <strong>Never forward host port {{ port }} on your router.</strong>
+      From the internet, use <code>https://{{ domain }}/</code> with a client
+      certificate.
+    </li>
+    {% if port == 443 %}
+    <li class="lan__warn">
+      <strong>Check your router's port forwarding now:</strong> external TCP
+      443 must go to host port
+      {% if lan_rt.https_host_port %}<strong>{{ lan_rt.https_host_port }}</strong>{% else %}of
+      <code>443/tcp</code>{% endif %} (the client-certificate port), never to host
+      port 443 - that is now this port without client certificates.
+      Installations from before 2.0.0 used host port 443 for the
+      client-certificate port, so an old rule may still point there.
+    </li>
+    {% endif %}
+  </ul>
+  {% else %}
+  <p class="lan__lead">
+    {% if state == "unknown" %}Off: the host port of <code>4443/tcp</code>
+    could not be read (no Supervisor API), so the add-on does not offer it.
+    {% else %}Off. The add-on can also offer HTTPS for your local network
+    without a client certificate, on a second port that only devices at home
+    can use.{% endif %}
+  </p>
+  <p class="lan__note"><strong>To turn it on:</strong></p>
+  <ol class="lan__list">
+    <li>Open <strong>Settings &gt; Apps &gt; Caddy mTLS Proxy &gt; Configuration</strong>.</li>
+    <li>In the <strong>Network</strong> card, turn on
+      <strong>Show disabled ports</strong> and enter a free host port for
+      <code>4443/tcp</code> (for example 9443, or 443 if Home Assistant does
+      not use it).</li>
+    <li>Select <strong>Save</strong> and restart the app.</li>
+    <li>Let your local DNS resolve <code>{{ domain }}</code> to this host's
+      IPv4 address. Never forward that port on your router.</li>
+  </ol>
+  {% endif %}
+</section>

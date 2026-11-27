@@ -115,6 +115,147 @@
   margin-bottom: var(--space-1);
 }
 
+/* ---------- Home Assistant connection card (also rendered alone by GET upstream) ---------- */
+.hc {
+  border-left: 4px solid var(--hc-accent, var(--color-border));
+}
+
+.hc--accepted {
+  --hc-accent: var(--color-success-solid);
+}
+
+.hc--strip,
+.hc--never,
+.hc--unknown {
+  --hc-accent: var(--color-primary);
+}
+
+.hc--broken,
+.hc--unreachable,
+.hc--reload_failed {
+  --hc-accent: var(--color-danger-solid);
+}
+
+.hc--too_slow {
+  --hc-accent: var(--color-warn-solid);
+}
+
+.hc__error {
+  margin: 0 0 var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--color-danger-soft);
+  border: 1px solid var(--color-danger-border);
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+}
+
+.hc__error-text {
+  display: block;
+  margin-top: var(--space-1);
+  padding: 0;
+  background: transparent;
+  border: 0;
+  overflow-wrap: anywhere;
+}
+
+.hc__lead {
+  margin: 0 0 var(--space-3);
+}
+
+.hc__note {
+  margin: 0 0 var(--space-2);
+  color: var(--color-text-muted);
+  font-size: var(--text-sm);
+}
+
+.hc__note strong {
+  color: var(--color-text);
+}
+
+.hc__list,
+.hc__steps {
+  margin: 0 0 var(--space-3);
+  padding-left: var(--space-6);
+  font-size: var(--text-sm);
+}
+
+.hc__list li,
+.hc__steps li {
+  margin-bottom: var(--space-1);
+}
+
+.hc__yaml {
+  margin: 0 0 var(--space-3);
+}
+
+.hc__yaml p {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-sm);
+}
+
+.hc__facts {
+  margin: 0 0 var(--space-3);
+  font-size: var(--text-sm);
+}
+
+.hc__check {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+  margin: 0;
+}
+
+.hc__check-hint {
+  color: var(--color-text-muted);
+  font-size: var(--text-sm);
+}
+
+/* ---------- Local network card ---------- */
+.lan {
+  border-left: 4px solid var(--lan-accent, var(--color-border));
+}
+
+.lan--on {
+  --lan-accent: var(--color-success-solid);
+}
+
+.lan--off {
+  --lan-accent: var(--color-primary);
+}
+
+.lan--unknown {
+  --lan-accent: var(--color-warn-solid);
+}
+
+.lan__lead {
+  margin: 0 0 var(--space-3);
+}
+
+.lan__note {
+  margin: 0 0 var(--space-2);
+  color: var(--color-text-muted);
+  font-size: var(--text-sm);
+}
+
+.lan__note strong {
+  color: var(--color-text);
+}
+
+.lan__list {
+  margin: 0;
+  padding-left: var(--space-6);
+  font-size: var(--text-sm);
+}
+
+.lan__list li {
+  margin-bottom: var(--space-1);
+}
+
+.lan__warn {
+  color: var(--color-danger);
+}
+
 /* ---------- Notices ("No CA metadata", "CRL not yet generated") ---------- */
 .warn {
   margin: 0 0 var(--space-4);

@@ -42,14 +42,33 @@
 #              monitor raises the notification; a certificate placed in
 #              Caddy's storage turns the card green and dismisses it; a
 #              failed renewal turns it yellow.
+#   fwd-*      forwarded_headers (2.2.0) beside a fake Home Assistant
+#              (tests/fake-upstream.py, in a container whose network namespace
+#              the add-on shares): auto with mTLS (start probe -> strip, the
+#              headers that arrive, switch to pass after a "restart", back to
+#              strip by the periodic test with the "addresses hidden"
+#              notification, Check again, refusal counts, a failed reload:
+#              red card, Caddy's real mode, one ERROR line, repair), the last
+#              known mode while the upstream is down, always (400, red card,
+#              notification, dismissed), never, auto without mTLS, the texts
+#              for an upstream that is not Home Assistant.
+#   lan*       the local-network port 4443 (host port seeded): proxied without
+#              a client certificate from private sources, 403 for public IPv4
+#              / IPv6 sources and for the container's default gateway,
+#              session tickets of 4443 not resumable on 443 (TLS 1.2 and
+#              1.3), SNI/Host tricks, revocation still at once on 443, the
+#              redirect to 443; mTLS off with the port on.
 #   dns-*      one boot per DNS provider (cloudflare, route53, hetzner, dummy
-#              tokens, public domain): the rendered `dns` directive passes
+#              tokens, public domain, local-network port on): the rendered
+#              `dns` directive (in both HTTPS sites, one automation policy) passes
 #              `caddy validate` and Caddy runs with it (the module syntax at the
 #              pinned versions), the token stays out of the Caddyfile and the
 #              log, and Caddy's environment carries the credentials.
 #   bad-*      refused starts: route53 token without ":", a Cloudflare token
 #              the module rejects (its error text quotes the token: it must be
-#              redacted), a domain with a port, an upstream without a port.
+#              redacted), a domain with a port, an upstream without a port,
+#              forwarded_headers never without mTLS (Home Assistant and
+#              another upstream).
 #
 # No external network traffic: every container runs with --network none and
 # ACME_CA_URL points at a closed local port (http://127.0.0.1:9/directory);
@@ -60,7 +79,8 @@
 #
 # Prints one PASS/FAIL line per check. Exit status: 0 all checks passed,
 # 1 a check failed, 2 usage error. Containers are removed on exit.
-# Env: DOCKER (default docker), SMOKE_BOOT_TIMEOUT (seconds, default 90).
+# Env: DOCKER (default docker), SMOKE_BOOT_TIMEOUT (seconds, default 90),
+# SMOKE_PREFIX (container name prefix, default caddy-mtls-smoke).
 # ==============================================================================
 # Helper functions are called indirectly (check, wait_for, trap).
 # shellcheck disable=SC2329
@@ -75,7 +95,8 @@ BOOT_TIMEOUT="${SMOKE_BOOT_TIMEOUT:-90}"
 command -v "${DOCKER}" >/dev/null || { printf 'container CLI %s not found\n' "${DOCKER}" >&2; exit 2; }
 "${DOCKER}" image inspect "${IMAGE}" >/dev/null 2>&1 || { printf 'image %s not found\n' "${IMAGE}" >&2; exit 2; }
 
-PREFIX="caddy-mtls-smoke-$$"
+# Container names: SMOKE_PREFIX (e.g. a shared host's naming rule) or the default.
+PREFIX="${SMOKE_PREFIX:-caddy-mtls-smoke}-$$"
 WORK="$(mktemp -d)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ACME_SINKHOLE="http://127.0.0.1:9/directory"
@@ -90,6 +111,11 @@ CORE_INFO=""
 CONTAINERS=()
 # Extra `docker create` arguments of the next boot (e.g. environment).
 EXTRA_CREATE_ARGS=()
+# The network of the next boot: none, or container:<name> (the fake upstream's
+# network namespace - still no external traffic).
+BOOT_NETWORK=none
+# The add-on's network settings as Supervisor reports them (bashio's cache).
+SEED_NETWORK='{"80/tcp":8080,"443/tcp":8443}'
 PASS_COUNT=0
 FAIL_COUNT=0
 
@@ -193,7 +219,7 @@ boot() {
     # bashio's cache with the options (and the add-on info with the default
     # host ports, which init-caddy logs) so it never needs to.
     cp "${dir}/data/options.json" "${dir}/tmp/.bashio/addons.self.options.config.cache"
-    printf '%s\n' '{"name":"Caddy mTLS Proxy","network":{"80/tcp":8080,"443/tcp":8443}}' \
+    jq -n --argjson network "${SEED_NETWORK}" '{name: "Caddy mTLS Proxy", network: $network}' \
         >"${dir}/tmp/.bashio/addons.self.info.cache"
     # Home Assistant Core's info (port), only when a case sets CORE_INFO.
     if [[ -n "${CORE_INFO:-}" ]]; then
@@ -201,7 +227,7 @@ boot() {
     fi
     chmod -R go+rX "${dir}"
     CONTAINERS+=("${CTR}")
-    "${DOCKER}" create --name "${CTR}" --network none \
+    "${DOCKER}" create --name "${CTR}" --network "${BOOT_NETWORK}" \
         -e ACME_CA_URL="${ACME_SINKHOLE}" -e TZ=Europe/Vienna \
         "${EXTRA_CREATE_ARGS[@]+"${EXTRA_CREATE_ARGS[@]}"}" "${IMAGE}" >/dev/null
     if [[ -n "${3:-}" ]]; then
@@ -223,31 +249,53 @@ show_log_on_failure() {
 }
 # options <domain> <mtls_enabled> <provider> <token> [<upstream_host> [<upstream_port>]]
 # (upstream default 127.0.0.1:8123; an empty port leaves upstream_port unset;
-# client_names, client_cert_password, log_level and access_log from
-# OPT_CLIENT_NAMES / OPT_PASSWORD / OPT_LOG_LEVEL / OPT_ACCESS_LOG)
+# client_names, client_cert_password, log_level, access_log and
+# forwarded_headers from OPT_CLIENT_NAMES / OPT_PASSWORD / OPT_LOG_LEVEL /
+# OPT_ACCESS_LOG / OPT_FORWARDED)
 OPT_CLIENT_NAMES='["alice", "bob"]'
 OPT_PASSWORD="${P12_PASSWORD}"
 OPT_LOG_LEVEL=info
 OPT_ACCESS_LOG=false
+OPT_FORWARDED=auto
 options() {
     jq -n --arg domain "$1" --argjson mtls "$2" --arg provider "$3" --arg token "$4" \
         --arg uhost "${5:-127.0.0.1}" --arg uport "${6-8123}" \
         --arg pass "${OPT_PASSWORD}" --argjson names "${OPT_CLIENT_NAMES}" \
-        --arg level "${OPT_LOG_LEVEL}" --argjson access "${OPT_ACCESS_LOG}" '{
+        --arg level "${OPT_LOG_LEVEL}" --argjson access "${OPT_ACCESS_LOG}" \
+        --arg forwarded "${OPT_FORWARDED}" '{
         domain: $domain, email: "smoke@example.com",
         upstream_host: $uhost, mtls_enabled: $mtls,
         ca_country: "AT", ca_state: "Styria", ca_locality: "Graz",
         ca_organization: "LinumIQ", ca_common_name: "Caddy mTLS smoke CA",
         client_names: $names, client_cert_password: $pass,
         acme_dns_provider: $provider, dns_api_token: $token,
-        log_level: $level, access_log: $access, cert_expiry_warn_days: [30, 14, 7, 1],
-        cert_check_interval_hours: 6}
+        log_level: $level, access_log: $access, forwarded_headers: $forwarded,
+        cert_expiry_warn_days: [30, 14, 7, 1], cert_check_interval_hours: 6}
         + (if $uport == "" then {} else {upstream_port: ($uport | tonumber)} end)'
 }
 # The "Public certificate" card (GET /public-cert, as the dashboard reloads it).
 card() { cexec curl -fsS --max-time 15 http://127.0.0.1:8099/public-cert 2>/dev/null; }
 card_state_is() { [[ "$(card)" == *"data-state=\"$1\""* ]]; }
 card_contains() { local html; html="$(card)" && [[ "${html}" == *"$1"* ]]; }
+# The "Home Assistant connection" card (GET /upstream) and the forwarding
+# snippet (forwarded_headers, 2.2.0).
+upstream_card() { cexec curl -fsS --max-time 15 http://127.0.0.1:8099/upstream 2>/dev/null; }
+upstream_card_is() { [[ "$(upstream_card)" == *"data-state=\"$1\""* ]]; }
+upstream_card_contains() { local html; html="$(upstream_card)" && [[ "${html}" == *"$1"* ]]; }
+snippet_is() { # snippet_is pass|strip
+    cexec grep -qx -- "# Forwarding headers, mode $1 - written by the Caddy mTLS Proxy add-on" \
+        /etc/caddy/forwarded-headers.caddy 2>/dev/null
+}
+# The header operations of every reverse_proxy handler in Caddy's active
+# config, per mode.
+# shellcheck disable=SC2016
+HEADERS_PASS='[.. | objects | select(.handler? == "reverse_proxy") | .headers.request] | length > 0 and all(
+    (.delete == ["Forwarded"]) and ((.set | keys | map(ascii_downcase)) == ["x-real-ip"])
+    and ((.set | to_entries[0].value) == ["{http.request.remote.host}"]))'
+# shellcheck disable=SC2016
+HEADERS_STRIP='[.. | objects | select(.handler? == "reverse_proxy") | .headers.request] | length > 0 and all(
+    ((.delete | sort) == ["Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-IP"])
+    and (has("set") | not))'
 command -v jq >/dev/null || { printf 'jq is required\n' >&2; exit 2; }
 command -v tar >/dev/null || { printf 'tar is required\n' >&2; exit 2; }
 
@@ -323,6 +371,36 @@ check "main: init-caddy logged the router forwarding hint" \
 check "main: explicit upstream_port used (127.0.0.1:8123)" \
     eval 'logs_contain "Upstream:    127.0.0.1:8123 (option upstream_port)" &&
     cexec grep -F "reverse_proxy 127.0.0.1:8123 {" /etc/caddy/Caddyfile >/dev/null'
+
+# --- forwarded_headers (2.2.0): nothing listens on 127.0.0.1:8123 here --------------
+check "fwd: the reverse_proxy block imports the forwarding snippet" \
+    cexec grep -F "import /etc/caddy/forwarded-headers.caddy" /etc/caddy/Caddyfile
+check "fwd: upstream unreachable at the first start -> mode pass (snippet, 644)" \
+    eval 'snippet_is pass && file_mode_is /etc/caddy/forwarded-headers.caddy 644'
+check "fwd: admin API config (mode pass): X-Real-IP set to the client, Forwarded removed" adapted "${HEADERS_PASS}"
+check "fwd: init-caddy logged the unreachable upstream, no unconditional configuration.yaml block" eval '
+    logs_contain "The upstream 127.0.0.1:8123 does not answer yet" &&
+    logs_contain "Forwarding:  forwarded_headers auto, mode pass" &&
+    logs_lack "Add this to /config/configuration.yaml" && logs_lack "use_x_forwarded_for"'
+check "fwd: runtime.json carries the upstream, mTLS and forwarded_headers" \
+    test "$(cexec jq -c "[.upstream_host, .upstream_port, .mtls_enabled, .forwarded_headers]" /run/caddy-mtls/runtime.json)" \
+    == '["127.0.0.1",8123,true,"auto"]'
+check "fwd: /data/upstream.json 600: unreachable, mode pass" eval '
+    file_mode_is /data/upstream.json 600 &&
+    test "$(cexec jq -c "[.reachable, .mode, .decisive]" /data/upstream.json)" == "[false,\"pass\",null]"'
+# --- local-network port (2.2.0): off without a host port for 4443/tcp -----------
+check "lan: off without a host port for 4443/tcp: no :4443 site, logged, runtime.json" eval '
+    ! cexec grep -F ":4443 {" /etc/caddy/Caddyfile >/dev/null &&
+    logs_contain "Host ports:  80/tcp -> 8080, 443/tcp -> 8443, 4443/tcp -> disabled" &&
+    logs_contain "LAN port:    off (4443/tcp has no host port" &&
+    test "$(cexec jq -c "[.lan_state, .lan_host_port, .lan_refused]" /run/caddy-mtls/runtime.json)" == "[\"off\",null,[]]"'
+check "lan: admin API config has no listener on 4443" \
+    adapted '[.apps.http.servers[].listen[]] | index(":4443") == null'
+check "lan: the plain-HTTP site is the add-on's own (CRL + redirect), not Caddy's automatic one" \
+    cexec grep -F "redir https://{host}{uri} permanent" /etc/caddy/Caddyfile
+check "fwd: card 'Home Assistant connection' unreachable (502 explained)" eval '
+    upstream_card_is unreachable && upstream_card_contains "<code>127.0.0.1:8123</code> does not answer" &&
+    upstream_card_contains "502 Bad Gateway"'
 
 # --- panel --------------------------------------------------------------------
 dashboard() { cexec curl -fsS --max-time 10 "http://127.0.0.1:8099$1" 2>/dev/null; }
@@ -611,6 +689,12 @@ check "card: the live probe sees the stored certificate on port 443 (despite mTL
 check "card: at the top of the dashboard" eval '
     html="$(dashboard /)" && pre="${html%%id=\"public-cert\"*}" && [[ "${pre}" != "${html}" && "${pre}" != *"Certificate Authority"* ]]'
 check "card: the dashboard reloads it every 30 s" eval '[[ "$(dashboard /)" == *"fetch(\"public-cert\""*"30000"* ]]'
+check "fwd: dashboard shows the connection card between the public certificate and the CA" eval '
+    html="$(dashboard /)" && pre="${html%%id=\"upstream\"*}" && [[ "${pre}" != "${html}" && "${pre}" == *"id=\"public-cert\""* && "${pre}" != *"Certificate Authority"* ]]'
+check "lan: dashboard card 'Local network' off, with the steps (Show disabled ports, 4443/tcp)" eval '
+    html="$(dashboard /)" && [[ "${html}" == *"id=\"lan\""*"data-state=\"off\""* &&
+    "${html}" == *"Show disabled ports"* && "${html}" == *"<code>4443/tcp</code>"* ]]'
+check "fwd: the dashboard reloads the connection card every 30 s" eval '[[ "$(dashboard /)" == *"fetch(\"upstream\""*"30000"* ]]'
 check "panel: no /openapi.json (FastAPI schema) -> 404" \
     test "$(cexec curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8099/openapi.json)" == 404
 
@@ -754,6 +838,10 @@ if wait_for "${BOOT_TIMEOUT}" booted; then
     check "no-mtls: upstream_port unset -> Core's port from the Supervisor info (homeassistant:80)" \
         eval 'logs_contain "Upstream:    homeassistant:80 (Home Assistant Core'"'"'s port from the Supervisor API)" &&
         cexec grep -F "reverse_proxy homeassistant:80 {" /etc/caddy/Caddyfile >/dev/null'
+    check "no-mtls: port 80 redirects with 301 to https://<domain>/ (the add-on's plain-HTTP site, no CRL)" eval '
+        test "$(cexec curl -s --max-time 5 --resolve home.example.com:80:127.0.0.1 -o /dev/null -w "%{http_code} %{redirect_url}" http://home.example.com/x?y=1)" \
+            == "301 https://home.example.com/x?y=1" &&
+        test "$(cexec curl -s --max-time 5 --resolve home.example.com:80:127.0.0.1 -o /dev/null -w "%{http_code}" http://home.example.com/mTLS-CA.crl)" == 301'
     check "no-mtls: log_level debug renders the site's access log, uvicorn logs requests" eval '
         logs_contain "Access log:  on" && cexec grep -E "^[[:space:]]+log \{" /etc/caddy/Caddyfile >/dev/null &&
         cexec curl -fsS -o /dev/null http://127.0.0.1:8099/_health && sleep 1 && logs_contain "\"GET /_health"'
@@ -904,6 +992,504 @@ fi
 show_log_on_failure "${before}"
 
 # ==============================================================================
+# 2d. forwarded_headers: a fake Home Assistant (tests/fake-upstream.py) that
+#     refuses X-Forwarded-For unless told to trust the proxy
+# ==============================================================================
+# The fake runs in its own container (the add-on image, --network none) in a
+# restart loop on 127.0.0.1:8124; the add-on joins its network namespace
+# (--network container:<fake>), so the fake answers init-caddy's probe at the
+# start. Killing the fake's process is a quick "Home Assistant restart" (back
+# after 0.5 s - quicker than the monitor's control interval: the kept-alive
+# connection tells). The monitor runs with short intervals: control 1 s, test
+# (mode pass under auto) 3 s.
+FAKE_UP=""
+fexec() { "${DOCKER}" exec "${FAKE_UP}" "$@"; }
+fake_up_ok() { fexec curl -fsS -o /dev/null --max-time 2 http://127.0.0.1:8124/manifest.json 2>/dev/null; }
+# The fake's container also names 127.0.0.1 "homeassistant" (/etc/hosts, which
+# the add-on shares), so the add-on treats it as Home Assistant.
+# FAKE_NET_SETUP: shell commands run in the fake's network namespace (with
+# NET_ADMIN) before the add-on joins it.
+FAKE_NET_SETUP=""
+start_fake_upstream() { # start_fake_upstream <name> [trust]
+    local caps=()
+    FAKE_UP="${PREFIX}-up-$1"
+    CONTAINERS+=("${FAKE_UP}")
+    [[ -n "${FAKE_NET_SETUP}" ]] && caps=(--cap-add NET_ADMIN)
+    "${DOCKER}" create --name "${FAKE_UP}" --network none --add-host homeassistant:127.0.0.1 \
+        "${caps[@]+"${caps[@]}"}" -e "FAKE_TRUST=${2:-}" --entrypoint /bin/sh "${IMAGE}" -c \
+        'mkdir -p /tmp/up; [ -z "${FAKE_TRUST}" ] || touch /tmp/up/trust; while :; do if [ ! -e /tmp/up/down ]; then python3 /tmp/fake-upstream.py 8124 /tmp/up & echo $! >/tmp/up/pid; wait; fi; sleep 0.5; done' \
+        >/dev/null
+    tar -C "${SCRIPT_DIR}" --owner=0 --group=0 --numeric-owner -cf - fake-upstream.py | "${DOCKER}" cp - "${FAKE_UP}:/tmp"
+    "${DOCKER}" start "${FAKE_UP}" >/dev/null
+    if [[ -n "${FAKE_NET_SETUP}" ]]; then
+        "${DOCKER}" exec "${FAKE_UP}" sh -ec "${FAKE_NET_SETUP}" || return 1
+    fi
+    wait_for 20 fake_up_ok
+}
+fake_trust() { if [[ "$1" == on ]]; then fexec touch /tmp/up/trust; else fexec rm -f /tmp/up/trust; fi; }
+fake_restart() { fexec sh -c 'kill "$(cat /tmp/up/pid)"'; }
+# refusals: how many requests the fake refused (= Home Assistant log lines).
+refusals() { fexec sh -c 'cat /tmp/up/refused.log 2>/dev/null | wc -l' | tr -d ' '; }
+refusals_are() { [[ "$(refusals)" == "$1" ]]; }
+# proxied <path> [curl args...]: the fake's JSON echo of a request through
+# port 443 with alice's client certificate and spoofed forwarding headers.
+proxied() {
+    local path="$1"
+    shift
+    cexec curl -sk --max-time 10 --resolve "${DOMAIN}:443:127.0.0.1" \
+        --cert /data/certs/mTLS-client-alice.crt --key /data/certs/mTLS-client-alice.key \
+        -H "X-Forwarded-For: 203.0.113.9" -H "X-Real-IP: 203.0.113.8" -H "Forwarded: for=203.0.113.7" \
+        -H "X-Forwarded-Host: evil.example" -H "X-Forwarded-Proto: http" \
+        "$@" "https://${DOMAIN}${path}" 2>/dev/null
+}
+# echo_header <json> <name>: the values of a header in the echo (joined by
+# ","; empty if absent); names compared case-insensitively.
+echo_header() {
+    jq -r --arg n "$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" \
+        '.headers | to_entries | map(select((.key | ascii_downcase) == $n) | .value[]) | join(",")' <<<"$1" 2>/dev/null
+}
+no_forwarding_headers() { # the echo carries none of them
+    local h
+    for h in X-Forwarded-For X-Forwarded-Proto X-Forwarded-Host X-Real-IP Forwarded; do
+        [[ -z "$(echo_header "$1" "${h}")" ]] || { log "echo still has ${h}: $(echo_header "$1" "${h}")"; return 1; }
+    done
+}
+NOTE_UP_CREATE='.method == "POST" and .path == "/core/api/services/persistent_notification/create"
+    and .body.notification_id == "caddy_mtls_upstream_refuses"'
+# shellcheck disable=SC2034 # used in eval'd checks
+NOTE_HIDDEN_CREATE='.method == "POST" and .path == "/core/api/services/persistent_notification/create"
+    and .body.notification_id == "caddy_mtls_upstream_addresses_hidden"'
+# shellcheck disable=SC2034 # used in eval'd checks
+NOTE_HIDDEN_DISMISS='.path == "/core/api/services/persistent_notification/dismiss"
+    and .body.notification_id == "caddy_mtls_upstream_addresses_hidden"'
+# shellcheck disable=SC2034 # used in eval'd checks
+NOTE_UP_DISMISS='.path == "/core/api/services/persistent_notification/dismiss"
+    and .body.notification_id == "caddy_mtls_upstream_refuses"'
+FWD_ENV=(
+    -e "SUPERVISOR_TOKEN=${SMOKE_SUPERVISOR_TOKEN}"
+    -e "SUPERVISOR_URL=http://127.0.0.1:${FAKE_SUPERVISOR_PORT}"
+    -e CADDY_MTLS_UPSTREAM_CONTROL_SECONDS=1
+    -e CADDY_MTLS_UPSTREAM_TEST_SECONDS=3
+)
+# boot_fwd <name> <options-json> [trust]: the add-on beside a fresh fake
+# upstream, with the fake Supervisor.
+boot_fwd() {
+    start_fake_upstream "$1" "${3:-}" || { fail "$1: fake upstream up"; return 1; }
+    BOOT_NETWORK="container:${FAKE_UP}"
+    EXTRA_CREATE_ARGS=("${FWD_ENV[@]}")
+    boot "$1" "$2"
+    BOOT_NETWORK=none
+    EXTRA_CREATE_ARGS=()
+    tar -C "${SCRIPT_DIR}" --owner=0 --group=0 --numeric-owner -cf - fake-supervisor.py | "${DOCKER}" cp - "${CTR}:/tmp"
+    "${DOCKER}" exec -d "${CTR}" /usr/lib/cert-mgr/.venv/bin/python3 /tmp/fake-supervisor.py \
+        "${FAKE_SUPERVISOR_PORT}" "${SUPERVISOR_LOG}"
+}
+upstream_mode_is() { # upstream_mode_is pass|strip: snippet, state and Caddy agree
+    snippet_is "$1" && [[ "$(cexec jq -r '"\(.mode) \(.applied)"' /data/upstream.json 2>/dev/null)" == "$1 true" ]] &&
+        adapted "$([[ "$1" == pass ]] && printf '%s' "${HEADERS_PASS}" || printf '%s' "${HEADERS_STRIP}")"
+}
+
+# --- auto with mTLS: refused at the start -> strip; trust -> pass; back --------
+log "fwd-auto: booting beside a fake Home Assistant that refuses X-Forwarded-For"
+before=${FAIL_COUNT}
+boot_fwd fwd-auto "$(options "${DOMAIN}" true none "" homeassistant 8124)"
+if wait_for "${BOOT_TIMEOUT}" booted; then
+    pass "fwd-auto: add-on booted"
+    check "fwd-auto: start probe refused (one refusal = one Home Assistant log line) -> mode strip" eval '
+        refusals_are 1 && upstream_mode_is strip'
+    check "fwd-auto: init-caddy's short notice for strip (no 400 block)" eval '
+        logs_contain "Home Assistant does not trust this add-on (127.0.0.1) as a reverse proxy. The add-on therefore removes the forwarding headers" &&
+        logs_contain "Forwarding:  forwarded_headers auto, mode strip" && logs_lack "answers EVERY request"'
+    check "fwd-auto: card strip: works, visitors appear as 127.0.0.1, consequences and steps" eval '
+        upstream_card_is strip && upstream_card_contains "It works" &&
+        upstream_card_contains "<code>127.0.0.1</code>" && upstream_card_contains "Can only log in from the local network" &&
+        upstream_card_contains "Trust X-Forwarded-For" && upstream_card_contains "use_x_forwarded_for: true"'
+    echo_strip="$(proxied /strip-check)"
+    check "fwd-auto: strip: the request reaches the upstream (alice's certificate)" \
+        test "$(jq -r .path <<<"${echo_strip}" 2>/dev/null)" == /strip-check
+    check "fwd-auto: strip: no X-Forwarded-*, X-Real-IP or Forwarded reaches the upstream (spoofed ones neither)" \
+        no_forwarding_headers "${echo_strip}"
+    # shellcheck disable=SC2034 # used in eval'd checks
+    lines="$(log_line_count)"
+    sleep 6
+    check "fwd-auto: strip: 6 s of watching (control requests only) -> still one refusal" refusals_are 1
+    check "fwd-auto: strip: the monitor watches with control requests (no forwarding header)" \
+        test "$(fexec sh -c 'grep -c "\"forwarded\": {}" /tmp/up/requests.jsonl')" -gt 4
+    # Home Assistant gets the reverse proxy settings and restarts (quicker
+    # than the control interval: the broken kept-alive connection tells).
+    fake_trust on
+    fake_restart
+    check "fwd-auto: trust + restart -> the monitor switches to mode pass (no add-on restart)" wait_for 20 upstream_mode_is pass
+    check "fwd-auto: Caddy reloaded for the switch (stopped previous server), monitor logged the switch" eval '
+        wait_for 10 new_logs_contain "${lines}" "stopped previous server" &&
+        new_logs_contain "${lines}" "Forwarding headers: mode strip -> pass"'
+    check "fwd-auto: card accepted" wait_for 10 upstream_card_is accepted
+    echo_pass="$(proxied /pass-check)"
+    check "fwd-auto: pass: X-Forwarded-For = the real client (127.0.0.1), the spoofed value replaced" \
+        test "$(echo_header "${echo_pass}" X-Forwarded-For)" == 127.0.0.1
+    check "fwd-auto: pass: X-Real-IP = 127.0.0.1, X-Forwarded-Proto https, X-Forwarded-Host = the domain, no Forwarded" eval '
+        test "$(echo_header "${echo_pass}" X-Real-IP)" == 127.0.0.1 &&
+        test "$(echo_header "${echo_pass}" X-Forwarded-Proto)" == https &&
+        test "$(echo_header "${echo_pass}" X-Forwarded-Host)" == "${DOMAIN}" &&
+        test -z "$(echo_header "${echo_pass}" Forwarded)"'
+    sleep 7
+    check "fwd-auto: pass: tests every 3 s while trusted, still one refusal" eval '
+        refusals_are 1 && test "$(fexec sh -c "grep -c \"X-Forwarded-For\" /tmp/up/requests.jsonl")" -ge 3'
+    # Trust lost without a restart: the periodic test notices it.
+    fake_trust off
+    check "fwd-auto: trust lost -> the periodic test switches back to strip (one more refusal)" eval '
+        wait_for 15 upstream_mode_is strip && refusals_are 2'
+    check "fwd-auto: card strip again" wait_for 10 upstream_card_is strip
+    # B-12: a switch to strip at run time raises one notification (none when
+    # the add-on started in strip: only the dismissal of a previous run's).
+    check "notify: addresses hidden at run time -> one notification with the consequences and the steps" eval '
+        wait_for 15 supervisor_got "${NOTE_HIDDEN_CREATE}" &&
+        test "$(supervisor_count "${NOTE_HIDDEN_CREATE}")" == 1 &&
+        supervisor_got "${NOTE_HIDDEN_CREATE} and (.body.title == \"Caddy mTLS: Home Assistant no longer trusts the app - visitor addresses are hidden\")
+            and (.body.message | contains(\"Can only log in from the local network\") and contains(\"Trust X-Forwarded-For\"))" &&
+        test "$(supervisor_count "${NOTE_HIDDEN_DISMISS}")" == 1'
+    check "fwd-auto: Check again (POST, ingress) -> 303 with the result, one more refusal" eval '
+        [[ "$(panel_post /api/upstream/check)" == "303 http://127.0.0.1:8099${INGRESS_PREFIX}/?ok="*"does+not+trust"* ]] &&
+        refusals_are 3'
+    check "fwd-auto: /api/upstream = strip, refused" \
+        test "$(cexec sh -c 'curl -fsS http://127.0.0.1:8099/api/upstream | jq -r "[.card, .state.decisive, .state.mode] | join(\" \")"')" \
+        == "strip refused strip"
+    check "notify: no upstream notification for strip / accepted, one dismissal after the start" eval '
+        test "$(supervisor_count "${NOTE_UP_CREATE}")" == 0 && test "$(supervisor_count "${NOTE_UP_DISMISS}")" == 1'
+    # B-2: a reload that fails (the Caddyfile broken on purpose) - the card is
+    # red and everything follows the mode Caddy really runs (strip).
+    cexec cp /etc/caddy/Caddyfile /tmp/Caddyfile.good
+    cexec sh -c 'printf "broken-on-purpose {\n" >> /etc/caddy/Caddyfile'
+    # shellcheck disable=SC2034 # used in eval'd checks
+    lines="$(log_line_count)"
+    fake_trust on
+    fake_restart
+    check "reload-failed: card red (Change not applied) with the error" eval '
+        wait_for 20 upstream_card_is reload_failed && upstream_card_contains "Change not applied" &&
+        upstream_card_contains "Applying the forwarding mode pass failed"'
+    check "reload-failed: Caddy keeps strip - snippet, upstream.json (mode pass, running strip, not applied)" eval '
+        snippet_is strip && adapted "${HEADERS_STRIP}" &&
+        test "$(cexec jq -c "[.mode, .running, .applied]" /data/upstream.json)" == "[\"pass\",\"strip\",false]"'
+    check "reload-failed: requests still arrive without forwarding headers (what Caddy runs)" \
+        no_forwarding_headers "$(proxied /reload-failed-check)"
+    sleep 4
+    reload_error_logged_once() {
+        local n
+        n="$("${DOCKER}" logs "${CTR}" 2>&1 | tail -n "+$((lines + 1))" | grep -c "Applying the forwarding mode pass failed")"
+        [[ "${n}" == 1 ]] || { log "reload error logged ${n} times"; return 1; }
+    }
+    check "reload-failed: one ERROR line for it, not one per retry (control interval 1 s)" reload_error_logged_once
+    check "reload-failed: Check again -> flash error naming the failed reload" eval '
+        [[ "$(panel_post /api/upstream/check)" == "303 http://127.0.0.1:8099${INGRESS_PREFIX}/?error=Applying+the+forwarding+mode+pass+failed"* ]]'
+    cexec cp /tmp/Caddyfile.good /etc/caddy/Caddyfile
+    check "reload-failed: repaired -> the retry applies pass, card accepted, logged once" eval '
+        wait_for 15 upstream_mode_is pass && wait_for 10 upstream_card_is accepted &&
+        new_logs_contain "${lines}" "Caddy reloaded: the forwarding mode pass applies now."'
+    hidden_dismissed_twice() { test "$(supervisor_count "${NOTE_HIDDEN_DISMISS}")" == 2; }
+    check "notify: addresses passed on again -> the hidden notification dismissed" wait_for 10 hidden_dismissed_twice
+    # Back to strip (fwd-down below starts from this /data).
+    fake_trust off
+    fake_restart
+    check "fwd-auto: trust gone with a restart -> strip again" wait_for 20 upstream_mode_is strip
+    check "fwd-auto: no Traceback in the log" logs_lack "Traceback"
+    check "fwd-auto: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
+    "${DOCKER}" cp "${CTR}:/data" - >"${WORK}/data-fwd-auto.tar"
+else
+    fail "fwd-auto: add-on booted"
+fi
+show_log_on_failure "${before}"
+
+# --- restart while the upstream is down: the last known mode (strip) ----------
+log "fwd-down: new container with fwd-auto's /data, no upstream"
+before=${FAIL_COUNT}
+if [[ -s "${WORK}/data-fwd-auto.tar" ]]; then
+    boot fwd-down "$(options "${DOMAIN}" true none "" homeassistant 8124)" "${WORK}/data-fwd-auto.tar"
+    if wait_for "${BOOT_TIMEOUT}" booted; then
+        pass "fwd-down: add-on booted"
+        check "fwd-down: upstream unreachable -> the last known mode strip, card unreachable" eval '
+            snippet_is strip && adapted "${HEADERS_STRIP}" && upstream_card_is unreachable &&
+            logs_contain "The upstream homeassistant:8124 does not answer yet" &&
+            logs_contain "Forwarding headers until then: mode strip (last known)"'
+        check "fwd-down: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
+    else
+        fail "fwd-down: add-on booted"
+    fi
+else
+    fail "fwd-down: /data of fwd-auto available"
+fi
+show_log_on_failure "${before}"
+
+# --- always: every request answered 400 -> red card, notification -----------
+log "fwd-always: forwarded_headers always, the fake refuses"
+before=${FAIL_COUNT}
+OPT_FORWARDED=always
+boot_fwd fwd-always "$(options "${DOMAIN}" true none "" homeassistant 8124)"
+OPT_FORWARDED=auto
+if wait_for "${BOOT_TIMEOUT}" booted; then
+    pass "fwd-always: add-on booted"
+    check "fwd-always: refused, mode pass (broken)" eval 'refusals_are 1 && upstream_mode_is pass'
+    check "fwd-always: init-caddy's prominent block with the steps and the 2026.7 note" eval '
+        logs_contain "answers EVERY request through ${DOMAIN}" &&
+        logs_contain "add 127.0.0.1 to '"'"'Trusted proxies'"'"'" &&
+        logs_contain "Home Assistant before 2026.7: add this to configuration.yaml" &&
+        logs_contain "      - 127.0.0.1"'
+    check "fwd-always: a proxied request is answered 400 by the upstream (\"400: Bad Request\")" eval '
+        test "$(cexec curl -sk --max-time 10 --resolve "${DOMAIN}:443:127.0.0.1" -w " %{http_code}" \
+            --cert /data/certs/mTLS-client-alice.crt --key /data/certs/mTLS-client-alice.key "https://${DOMAIN}/x")" \
+            == "400: Bad Request 400"'
+    check "fwd-always: card red (broken): 400, forwarded_headers always, the steps, the auto alternative" eval '
+        upstream_card_is broken && upstream_card_contains "Every request is answered" &&
+        upstream_card_contains "<code>forwarded_headers</code> is <code>always</code>" &&
+        upstream_card_contains "Or set the app option"'
+    check "notify: the monitor raised the upstream notification at the (fake) Supervisor" \
+        wait_for 30 supervisor_got "${NOTE_UP_CREATE}"
+    check "notify: title, token, message with the domain, the steps and the YAML for old versions" supervisor_got "${NOTE_UP_CREATE}
+        and .authorization == \"Bearer ${SMOKE_SUPERVISOR_TOKEN}\"
+        and .body.title == \"Caddy mTLS: Home Assistant refuses the proxied requests\"
+        and (.body.message | contains(\"400: Bad Request\") and contains(\"**${DOMAIN}**\")
+             and contains(\"Trust X-Forwarded-For\") and contains(\"use_x_forwarded_for: true\"))"
+    # shellcheck disable=SC2034 # used in eval'd checks
+    refused_before="$(refusals)"
+    sleep 4
+    check "notify: raised once; no test requests in 4 s (always: start, comeback and Check again only)" eval '
+        test "$(supervisor_count "${NOTE_UP_CREATE}")" == 1 && refusals_are "${refused_before}"'
+    fake_trust on
+    fake_restart
+    check "fwd-always: trust + restart -> accepted, notification dismissed" eval '
+        wait_for 20 upstream_card_is accepted && wait_for 15 supervisor_got "${NOTE_UP_DISMISS}"'
+    check "fwd-always: mode stayed pass (no reload needed)" upstream_mode_is pass
+    check "fwd-always: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
+else
+    fail "fwd-always: add-on booted"
+fi
+show_log_on_failure "${before}"
+
+# --- never: headers removed whatever the upstream says ----------------------
+log "fwd-never: forwarded_headers never, the fake trusts"
+before=${FAIL_COUNT}
+OPT_FORWARDED=never
+boot_fwd fwd-never "$(options "${DOMAIN}" true none "" homeassistant 8124)" trust
+OPT_FORWARDED=auto
+if wait_for "${BOOT_TIMEOUT}" booted; then
+    pass "fwd-never: add-on booted"
+    check "fwd-never: mode strip, card never" eval 'upstream_mode_is strip && upstream_card_is never'
+    check "fwd-never: no forwarding header reaches the upstream" no_forwarding_headers "$(proxied /never-check)"
+    check "fwd-never: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
+else
+    fail "fwd-never: add-on booted"
+fi
+show_log_on_failure "${before}"
+
+# --- auto without mTLS: stays pass (broken), notification --------------------
+log "fwd-nomtls: mtls_enabled false, auto, the fake refuses"
+before=${FAIL_COUNT}
+boot_fwd fwd-nomtls "$(options home.example.com false none "" homeassistant 8124)"
+if wait_for "${BOOT_TIMEOUT}" booted; then
+    pass "fwd-nomtls: add-on booted"
+    check "fwd-nomtls: refused, auto without mTLS stays at mode pass (broken)" eval '
+        refusals_are 1 && upstream_mode_is pass && upstream_card_is broken'
+    check "fwd-nomtls: the card explains why auto does not strip and offers mTLS, not never" eval '
+        upstream_card_contains "mtls_enabled: false" && upstream_card_contains "Or turn mTLS on" &&
+        ! upstream_card_contains "forwarded_headers: never" && ! upstream_card_contains "<code>never</code>"'
+    check "fwd-nomtls: the log block offers mTLS, not never" eval '
+        logs_contain "Or turn mTLS on (mtls_enabled: true): with forwarded_headers" && logs_lack "forwarded_headers: never"'
+    check "notify: raised (mTLS off)" wait_for 30 supervisor_got "${NOTE_UP_CREATE} and (.body.message | contains(\"mtls_enabled: false\"))"
+    check "fwd-nomtls: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
+else
+    fail "fwd-nomtls: add-on booted"
+fi
+show_log_on_failure "${before}"
+
+# --- an upstream that is not Home Assistant: neutral texts (B-7) ---------------
+log "fwd-other: upstream 127.0.0.1:8124 (not Home Assistant), auto, refusing"
+before=${FAIL_COUNT}
+boot_fwd fwd-other "$(options "${DOMAIN}" true none "" 127.0.0.1 8124)"
+if wait_for "${BOOT_TIMEOUT}" booted; then
+    pass "fwd-other: add-on booted"
+    check "fwd-other: strip notice names the upstream, lower case inside sentences, card Upstream connection" eval '
+        upstream_mode_is strip &&
+        logs_contain "The upstream 127.0.0.1:8124 does not trust this add-on (127.0.0.1) as a reverse proxy." &&
+        logs_contain "and the upstream 127.0.0.1:8124 sees every visitor as 127.0.0.1." &&
+        logs_contain "let the upstream 127.0.0.1:8124 trust 127.0.0.1 as a reverse proxy" &&
+        logs_contain "(card \"Upstream connection\")"'
+    check "fwd-other: no \"The upstream\" mid-sentence, no Home Assistant card named" eval '
+        logs_lack "and The upstream" && logs_lack "let The upstream" && logs_lack "Home Assistant connection"'
+    check "fwd-other: card titled Upstream connection, no claim about Home Assistant" eval '
+        upstream_card_contains "<h2 class=\"card__title\" id=\"hc-heading\">Upstream connection</h2>" &&
+        ! upstream_card_contains "Home Assistant"'
+    check "fwd-other: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
+else
+    fail "fwd-other: add-on booted"
+fi
+show_log_on_failure "${before}"
+
+log "fwd-other-always: upstream 127.0.0.1:8124 (not Home Assistant), always, refusing"
+before=${FAIL_COUNT}
+OPT_FORWARDED=always
+boot_fwd fwd-other-always "$(options "${DOMAIN}" true none "" 127.0.0.1 8124)"
+OPT_FORWARDED=auto
+if wait_for "${BOOT_TIMEOUT}" booted; then
+    pass "fwd-other-always: add-on booted"
+    check "fwd-other-always: the 400 block names the upstream in lower case and the card's own title" eval '
+        logs_contain "The upstream 127.0.0.1:8124 answers EVERY request through ${DOMAIN}" &&
+        logs_contain "Let the upstream 127.0.0.1:8124 trust 127.0.0.1 as a reverse" &&
+        logs_contain "Or set forwarded_headers to auto: the upstream 127.0.0.1:8124 then sees" &&
+        logs_contain "Details: the add-on'"'"'s web interface (card \"Upstream connection\")." &&
+        logs_lack "forwarded_headers: never" && logs_lack "Home Assistant connection"'
+    # shellcheck disable=SC2016
+    note_other='.body.title == "Caddy mTLS: the upstream refuses the proxied requests"
+        and (.body.message | contains("card \"Upstream connection\"") and (contains("Home Assistant") | not))'
+    check "fwd-other-always: notification neutral, naming the Upstream connection card" \
+        wait_for 30 supervisor_got "${NOTE_UP_CREATE} and ${note_other}"
+    check "fwd-other-always: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
+else
+    fail "fwd-other-always: add-on booted"
+fi
+show_log_on_failure "${before}"
+
+# ==============================================================================
+# 2e. lan: the local-network HTTPS port (container port 4443, host port 9443)
+# ==============================================================================
+# The fake upstream's network namespace gets (NET_ADMIN, before the add-on
+# joins it) a default route via 10.99.0.1 - the "Docker gateway" init-caddy
+# must refuse - and loopback addresses to connect from: 10.99.0.1 (that
+# gateway), 10.99.0.2 (private), 198.51.100.7 and 2001:db8::7 (public).
+LAN_DOMAIN="${DOMAIN}"
+# lan_get <source-address> [curl args...]: "<code>" of GET https://<domain>:4443/
+# without a client certificate, connecting from <source-address>.
+lan_get() {
+    local src="$1" ip="$1"
+    shift
+    [[ "${src}" == *:* ]] && ip="[${src}]"
+    cexec curl -sk --max-time 10 --interface "${src}" --resolve "${LAN_DOMAIN}:4443:${ip}" \
+        "$@" "https://${LAN_DOMAIN}:4443/lan-check" 2>/dev/null || true
+}
+# s_client <port> <tls1_2|tls1_3> <session-arg> <file> [extra args]: the lines
+# "New, ..." / "Reused, ..." / alerts of an openssl handshake with one request.
+s_client() {
+    cexec sh -c 'printf "GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" "$4" |
+        openssl s_client -connect "127.0.0.1:$0" -servername "$4" -"$1" -ign_eof "$2" "$3" 2>&1 |
+        grep -E "^(New|Reused),|alert|HTTP/1.1 [0-9]+" || true' "$1" "$2" "$3" "$4" "${LAN_DOMAIN}"
+}
+log "lan: booting (mTLS, local-network port on, a fake Home Assistant that trusts the proxy)"
+before=${FAIL_COUNT}
+FAKE_NET_SETUP='ip addr add 10.99.0.2/24 dev lo; ip addr add 10.99.0.1/32 dev lo;
+    ip route add default via 10.99.0.1 dev lo; ip addr add 198.51.100.7/32 dev lo;
+    ip -6 addr add 2001:db8::7/128 dev lo'
+SEED_NETWORK='{"80/tcp":8080,"443/tcp":8443,"4443/tcp":9443}'
+boot_fwd lan "$(options "${DOMAIN}" true none "" homeassistant 8124)" trust
+SEED_NETWORK='{"80/tcp":8080,"443/tcp":8443}'
+FAKE_NET_SETUP=""
+if wait_for "${BOOT_TIMEOUT}" booted; then
+    pass "lan: add-on booted"
+    check "lan: site https://<domain>:4443 rendered, without client_auth, refusing the default gateway 10.99.0.1" eval '
+        cexec grep -F "https://${DOMAIN}:4443 {" /etc/caddy/Caddyfile >/dev/null &&
+        cexec grep -F "@docker_gateway remote_ip 10.99.0.1" /etc/caddy/Caddyfile >/dev/null &&
+        test "$(cexec grep -c client_auth /etc/caddy/Caddyfile)" == 1'
+    check "lan: logged (host port, URL, never forward, the refused gateway), runtime.json" eval '
+        logs_contain "4443/tcp -> 9443" && logs_contain "LAN port:    https://${DOMAIN}:9443/" &&
+        logs_contain "never forward it on the router" && logs_contain "also refused: 10.99.0.1" &&
+        test "$(cexec jq -c "[.lan_state, .lan_host_port, .lan_refused]" /run/caddy-mtls/runtime.json)" == "[\"on\",9443,[\"10.99.0.1\"]]"'
+    check "lan: admin API config: :443 requires client certificates, :4443 does not" adapted '
+        ([.apps.http.servers[] | select(.listen == [":443"]) | .. | objects | select(.mode? == "require_and_verify")] | length == 1)
+        and ([.apps.http.servers[] | select(.listen == [":4443"]) | .. | objects | select(has("client_authentication"))] | length == 0)'
+    check "lan: strict SNI-Host enforcement still on for the mTLS server (srv0), not added to others" eval '
+        logs_contain "enabling strict SNI-Host enforcement because TLS client auth is configured" &&
+        ! "${DOCKER}" logs "${CTR}" 2>&1 | grep -F "strict SNI-Host" | grep -v "\"srv0\"" >/dev/null &&
+        adapted "(.apps.http.servers.srv0.listen == [\":443\"])"'
+    check "lan: forwarding snippet imported by both sites" \
+        test "$(cexec grep -c "import /etc/caddy/forwarded-headers.caddy" /etc/caddy/Caddyfile)" == 2
+    lan_ok="$(lan_get 127.0.0.1)"
+    check "lan: no client certificate, from 127.0.0.1 -> proxied (the fake's echo)" \
+        test "$(jq -r .path <<<"${lan_ok}" 2>/dev/null)" == /lan-check
+    check "lan: headers in mode pass: X-Forwarded-For = the LAN client" \
+        test "$(echo_header "${lan_ok}" X-Forwarded-For)" == 127.0.0.1
+    check "lan: from 10.99.0.2 (private) -> proxied" \
+        test "$(jq -r .path <<<"$(lan_get 10.99.0.2)" 2>/dev/null)" == /lan-check
+    out="$(lan_get 198.51.100.7 -w ' %{http_code} %{content_type}')"
+    check "lan: from 198.51.100.7 (public IPv4) -> 403 plain text naming the address" eval '
+        [[ "${out}" == "403 Forbidden: this HTTPS port"*"came from 198.51.100.7."*" 403 text/plain"* ]]'
+    out="$(lan_get 2001:db8::7 -w ' %{http_code}')"
+    check "lan: from 2001:db8::7 (public IPv6) -> 403 naming the address" eval '
+        [[ "${out}" == "403 Forbidden:"*"came from 2001:db8::7."*" 403" ]]'
+    # shellcheck disable=SC2034 # used in an eval'd check
+    out="$(lan_get 10.99.0.1 -w ' %{http_code}')"
+    check "lan: from 10.99.0.1 (the container's default gateway: Docker's proxy) -> 403 explaining the hidden source" eval '
+        [[ "${out}" == "403 Forbidden: this connection came from 10.99.0.1, the address of Docker"*"Connect over IPv4"*" 403" ]]'
+    check "lan: refused sources never reached the upstream" \
+        test "$(fexec sh -c 'grep -c "/lan-check" /tmp/up/requests.jsonl')" == 2
+    # The mTLS port is untouched by the local-network site.
+    check "lan: port 443 without a client certificate still refused in the handshake" mtls_is 000 "" ""
+    check "lan: port 443 with alice's certificate -> proxied (200)" \
+        mtls_is 200 /data/certs/mTLS-client-alice.crt /data/certs/mTLS-client-alice.key
+    check "lan: port 443, SNI other.invalid, Host <domain>, no certificate -> no answer from the upstream" eval '
+        test "$(cexec curl -sk --max-time 5 -o /dev/null -w "%{http_code}" --resolve other.invalid:443:127.0.0.1 -H "Host: ${DOMAIN}" https://other.invalid/)" == 000'
+    check "lan: port 443 without SNI (IP address), Host <domain>, no certificate -> no answer" eval '
+        test "$(cexec curl -sk --max-time 5 -o /dev/null -w "%{http_code}" -H "Host: ${DOMAIN}" https://127.0.0.1/)" == 000'
+    check "lan: port 4443, Host other.invalid -> the upstream is not asked" eval '
+        cexec curl -sk --max-time 5 -o /dev/null --resolve "${DOMAIN}:4443:127.0.0.1" -H "Host: other.invalid" "https://${DOMAIN}:4443/sni-host-check" &&
+        ! fexec grep -F "/sni-host-check" /tmp/up/requests.jsonl >/dev/null'
+    # A TLS session of the local-network port cannot be resumed on the mTLS
+    # port (one session-ticket key in Caddy; Go refuses to resume a session
+    # without client certificates where they are required).
+    for v in tls1_3 tls1_2; do
+        cexec rm -f "/tmp/lan-${v}.sess"
+        # shellcheck disable=SC2034 # used in an eval'd check
+        first="$(s_client 4443 "${v}" -sess_out "/tmp/lan-${v}.sess")"
+        check "lan: ${v}: a session on 4443 (no certificate) with a ticket" eval '
+            [[ "${first}" == "New, "*"HTTP/1.1 200"* ]] &&
+            cexec sh -c "openssl sess_id -in /tmp/lan-${v}.sess -noout -text | grep -F \"TLS session ticket:\"" >/dev/null'
+        # shellcheck disable=SC2034 # used in an eval'd check
+        again="$(s_client 4443 "${v}" -sess_in "/tmp/lan-${v}.sess")"
+        check "lan: ${v}: control - the session resumes on 4443 (Reused)" eval '[[ "${again}" == "Reused, "* ]]'
+        # shellcheck disable=SC2034 # used in an eval'd check
+        mtls_try="$(s_client 443 "${v}" -sess_in "/tmp/lan-${v}.sess")"
+        check "lan: ${v}: the same session on 443 is not resumed, the handshake fails without a certificate" eval '
+            [[ "${mtls_try}" != *"Reused, "* && "${mtls_try}" == *alert* && "${mtls_try}" != *"HTTP/1.1"* ]]'
+    done
+    check "lan: port 80 redirects with 301 to https://<domain>/ (port 443, not 4443)" \
+        test "$(http80 -o /dev/null -w '%{http_code} %{redirect_url}' "http://${DOMAIN}/x?y=1")" == "301 https://${DOMAIN}/x?y=1"
+    check "lan: dashboard card 'Local network' on: URL, local DNS, never forward, the refused gateway" eval '
+        html="$(dashboard /)" && [[ "${html}" == *"data-state=\"on\""*"https://${DOMAIN}:9443/"* &&
+        "${html}" == *"Never forward host port 9443"* && "${html}" == *"<code>10.99.0.1</code>"* ]]'
+    # Revoking a client still takes effect at once on 443 with the LAN site.
+    check "lan: POST revoke alice -> 303" \
+        test "$(panel_post /api/clients/alice/revoke reason=keyCompromise)" == "303 http://127.0.0.1:8099${INGRESS_PREFIX}/?ok=Client+%27alice%27+revoked."
+    check "lan: alice refused on 443 at once" mtls_is 000 /data/certs/mTLS-client-alice.crt /data/certs/mTLS-client-alice.key
+    check "lan: the local-network port still answers (no certificate)" \
+        test "$(jq -r .path <<<"$(lan_get 127.0.0.1)" 2>/dev/null)" == /lan-check
+    check "lan: no Traceback, no failed validation in the log" eval 'logs_lack "Traceback" && logs_lack "failed validation"'
+    check "lan: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
+else
+    fail "lan: add-on booted"
+fi
+show_log_on_failure "${before}"
+
+# --- mTLS off with the local-network port: both sites without certificates,
+#     the plain-HTTP site still redirects to 443 ------------------------------
+log "lan-nomtls: mtls_enabled false, local-network host port 443"
+before=${FAIL_COUNT}
+SEED_NETWORK='{"80/tcp":8080,"443/tcp":8443,"4443/tcp":443}'
+boot lan-nomtls "$(options home.example.com false none "")"
+SEED_NETWORK='{"80/tcp":8080,"443/tcp":8443}'
+if wait_for "${BOOT_TIMEOUT}" booted; then
+    pass "lan-nomtls: add-on booted"
+    check "lan-nomtls: LAN site rendered, no client_auth anywhere, no gateway to refuse (--network none)" eval '
+        cexec grep -F "https://home.example.com:4443 {" /etc/caddy/Caddyfile >/dev/null &&
+        ! cexec grep -E "client_auth|@docker_gateway|mTLS-CA.crl" /etc/caddy/Caddyfile >/dev/null &&
+        logs_contain "LAN port:    https://home.example.com/ -"'
+    check "lan-nomtls: caddy validate" caddy_validate
+    check "lan-nomtls: every ACME issuer uses the sinkhole" issuers_only_sinkhole
+    check "lan-nomtls: port 80 redirects with 301 to https://<domain>/" \
+        test "$(cexec curl -s --max-time 5 --resolve home.example.com:80:127.0.0.1 -o /dev/null -w "%{http_code} %{redirect_url}" http://home.example.com/x)" \
+        == "301 https://home.example.com/x"
+    check "lan-nomtls: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
+else
+    fail "lan-nomtls: add-on booted"
+fi
+show_log_on_failure "${before}"
+
+# ==============================================================================
 # 3. DNS providers (dummy tokens, public domain, ACME sinkhole)
 # ==============================================================================
 # caddy_env_has <VAR> <value>: the running Caddy process has VAR=value.
@@ -913,10 +1499,12 @@ caddy_env_has() {
 dns_case() { # dns_case <provider> <token> <env-var=value...>
     local provider="$1" token="$2" kv secret_file_path
     shift 2
-    log "dns-${provider}: booting"
+    log "dns-${provider}: booting (local-network port on: host port 9443)"
     before=${FAIL_COUNT}
     secret_file_path="$(secret_file "secret-dns-${provider}" "${token}")"
+    SEED_NETWORK='{"80/tcp":8080,"443/tcp":8443,"4443/tcp":9443}'
     boot "dns-${provider}" "$(options home.example.com true "${provider}" "${token}" homeassistant "")"
+    SEED_NETWORK='{"80/tcp":8080,"443/tcp":8443}'
     if ! wait_for "${BOOT_TIMEOUT}" booted; then
         fail "dns-${provider}: add-on booted (Caddy runs with the dns directive)"
         show_log_on_failure "${before}"
@@ -934,8 +1522,16 @@ dns_case() { # dns_case <provider> <token> <env-var=value...>
             token="$(cat)"; dns_provider_export "$0" "${token}"
             caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1' \
         "${provider}" <"${secret_file_path}"
-    check "dns-${provider}: admin API config uses dns.providers.${provider}" \
+    check "dns-${provider}: admin API config uses dns.providers.${provider} (one automation policy for both HTTPS sites)" \
         adapted "[.. | objects | select(.provider?.name? == \"${provider}\")] | length == 1"
+    check "dns-${provider}: LAN site rendered with the same dns directive, without client_auth" eval '
+        test "$(cexec grep -cE "^[[:space:]]+dns ${provider} " /etc/caddy/Caddyfile)" == 2 &&
+        test "$(cexec grep -c "client_auth" /etc/caddy/Caddyfile)" == 1'
+    check "dns-${provider}: two HTTPS servers (:443 with client auth, :4443 without), one policy for the domain" adapted '
+        ([.apps.http.servers[] | select(.listen == [":443"]) | .tls_connection_policies[] | select(.client_authentication != null)] | length == 1)
+        and ([.apps.http.servers[] | select(.listen == [":4443"]) | .tls_connection_policies[]? | select(.client_authentication != null)] | length == 0)
+        and ([.apps.http.servers[] | select(.listen == [":4443"])] | length == 1)
+        and ([.apps.tls.automation.policies[] | select((.subjects // []) | index("home.example.com"))] | length == 1)'
     check "dns-${provider}: every ACME issuer uses the sinkhole (no Let's Encrypt / ZeroSSL)" issuers_only_sinkhole
     for kv in "$@"; do
         check "dns-${provider}: Caddy's environment has ${kv%%=*}" caddy_env_has "${kv%%=*}" "${kv#*=}"
@@ -982,6 +1578,16 @@ bad_case domain-port "$(options home.example.com:8443 true none "")" \
     "Option 'domain' must be a host name without scheme, port or path"
 bad_case upstream-port "$(options home.example.com true none "" 192.0.2.10 "")" \
     "Option 'upstream_port' is required when upstream_host is not 'homeassistant'."
+# B-1: never needs mTLS, for every upstream.
+OPT_FORWARDED=never
+bad_case never-nomtls "$(options home.example.com false none "")" \
+    "forwarded_headers: never needs mtls_enabled: true. Without client certificates the add-on never hides visitor addresses"
+check "bad-never-nomtls: the message names the alternatives (mTLS on, or auto with Home Assistant's reverse-proxy settings)" eval '
+    logs_contain "Turn mTLS on (mtls_enabled: true), or set forwarded_headers to auto" &&
+    logs_contain "Settings > System > Network > HTTP server > Reverse proxy"'
+bad_case never-nomtls-other "$(options home.example.com false none "" 192.0.2.10 8080)" \
+    "forwarded_headers: never needs mtls_enabled: true."
+OPT_FORWARDED=auto
 
 printf '\n%d passed, %d failed\n' "${PASS_COUNT}" "${FAIL_COUNT}"
 (( FAIL_COUNT == 0 ))

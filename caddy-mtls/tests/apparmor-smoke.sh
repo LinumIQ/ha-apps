@@ -16,7 +16,11 @@
 # card (Caddy's acme.log, openssl x509 on Caddy's storage, the live probe of
 # port 443), the cert-monitor (sensors and the "no public certificate"
 # notification at a fake Supervisor inside the container, then its
-# dismissal), a clean `docker stop` (< 10 s, exit 0, no s6 warnings) and a
+# dismissal), the forwarding headers (the start probe, a fake Home Assistant
+# that refuses X-Forwarded-For: the monitor's switch to mode strip with a
+# rewritten snippet and a reload, "Check again"), the local-network port
+# (lan.py, the listener on 4443), a clean `docker stop`
+# (< 10 s, exit 0, no s6 warnings) and a
 # restart as Supervisor does it (a new container with the previous /data)
 # with a new client name and a new client_cert_password (issuance and .p12
 # re-encryption at start-up). Fails on any AppArmor denial for the profile.
@@ -24,7 +28,8 @@
 # No external network traffic: the container runs with --network none and
 # ACME_CA_URL points at a closed local port. A profile that was not loaded
 # before is unloaded again on exit.
-# Env: DOCKER (default docker).
+# Env: DOCKER (default docker), SMOKE_PREFIX (container name prefix, default
+# caddy-mtls-aa-smoke).
 # ==============================================================================
 # Helper functions are called indirectly (check, wait_for, trap).
 # shellcheck disable=SC2329
@@ -35,7 +40,7 @@ PROFILE_FILE="${2:?usage: apparmor-smoke.sh <image> <apparmor.txt>}"
 DOCKER="${DOCKER:-docker}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROFILE="$(sed -n 's/^profile \([A-Za-z0-9_-]*\) .*/\1/p' "${PROFILE_FILE}" | head -n 1)"
-CTR1="caddy-mtls-aa-smoke-$$"
+CTR1="${SMOKE_PREFIX:-caddy-mtls-aa-smoke}-$$"
 CTR2="${CTR1}-restart"
 CTR="${CTR1}"
 WORK="$(mktemp -d)"
@@ -116,6 +121,9 @@ cat >"${WORK}/data/options.json" <<'JSON'
  "cert_expiry_warn_days": [30, 14, 7, 1], "cert_check_interval_hours": 6}
 JSON
 cp "${WORK}/data/options.json" "${WORK}/tmp/.bashio/addons.self.options.config.cache"
+# The add-on's network settings with the local-network port (4443/tcp) on.
+printf '%s\n' '{"name":"Caddy mTLS Proxy","network":{"80/tcp":8080,"443/tcp":8443,"4443/tcp":9443}}' \
+    >"${WORK}/tmp/.bashio/addons.self.info.cache"
 chmod -R go+rX "${WORK}"
 # Files go in owned by root (as Supervisor creates them): `docker cp` would
 # keep the runner's uid, which root could only read with CAP_DAC_OVERRIDE.
@@ -129,10 +137,11 @@ SUPERVISOR_LOG=/tmp/supervisor-requests.jsonl
     -e ACME_CA_URL=http://127.0.0.1:9/directory -e TZ=Europe/Vienna \
     -e SUPERVISOR_TOKEN=aa-smoke-token -e SUPERVISOR_URL=http://127.0.0.1:8765 \
     -e CERT_MONITOR_PUBLIC_CERT_GRACE_SECONDS=5 -e CERT_MONITOR_FAST_INTERVAL_SECONDS=2 \
+    -e CADDY_MTLS_UPSTREAM_CONTROL_SECONDS=1 -e CADDY_MTLS_UPSTREAM_TEST_SECONDS=3 \
     "${IMAGE}" >/dev/null
 copy_into "${WORK}/data" /data
 copy_into "${WORK}/tmp" /tmp
-tar -C "${SCRIPT_DIR}" --owner=0 --group=0 --numeric-owner -cf - fake-supervisor.py | "${DOCKER}" cp - "${CTR}:/tmp"
+tar -C "${SCRIPT_DIR}" --owner=0 --group=0 --numeric-owner -cf - fake-supervisor.py fake-upstream.py | "${DOCKER}" cp - "${CTR}:/tmp"
 "${DOCKER}" start "${CTR}" >/dev/null
 "${DOCKER}" exec -d "${CTR}" /usr/lib/cert-mgr/.venv/bin/python3 /tmp/fake-supervisor.py 8765 "${SUPERVISOR_LOG}"
 
@@ -151,6 +160,14 @@ state() { cexec jq -r "$1" /data/state.json 2>/dev/null; }
 check "panel healthy under ${PROFILE}" wait_for 90 health
 check "Caddy admin API up under ${PROFILE}" wait_for 30 admin_up
 check "init-caddy completed (CA, clients, CRL, Caddyfile validated)" logs_contain "Init complete:"
+# The local-network site (lan.py read the container's routes under the
+# profile) and Caddy's listener on 4443.
+check "local-network port rendered (LAN port logged)" logs_contain "LAN port:    https://home.example.com:9443/"
+lan_listening() {
+    cexec curl -fsS http://127.0.0.1:2019/config/ 2>/dev/null | jq -e '[.apps.http.servers[].listen[]] | index(":4443") != null' >/dev/null &&
+        cexec sh -c 'grep -qi ":115B " /proc/net/tcp6 /proc/net/tcp' # 0x115B = 4443, listening
+}
+check "Caddy listens on 4443 under ${PROFILE}" wait_for 30 lan_listening
 # Read from the host: the profile itself does not allow reading AppArmor labels.
 pid1="$("${DOCKER}" inspect -f '{{.State.Pid}}' "${CTR}")"
 check "PID 1 confined by ${PROFILE} (enforce)" \
@@ -176,6 +193,21 @@ cexec sh -c 'd=/data/caddy/certificates/aa-smoke/home.example.com && mkdir -p "$
         -out "$d/home.example.com.crt"' >/dev/null 2>&1 || true
 check "Public certificate card: ok (green) from Caddy's storage" wait_for 30 card_state_is ok
 check "cert-monitor: notification dismissed" wait_for 30 supervisor_got /persistent_notification/dismiss
+# forwarded_headers (2.2.0): the start probe found no upstream (mode pass);
+# a fake Home Assistant that refuses X-Forwarded-For comes up on
+# 127.0.0.1:8123 - the monitor notices, sends the test request, switches to
+# mode strip (rewrites /etc/caddy/forwarded-headers.caddy, caddy reload),
+# all under the profile.
+snippet_is() { cexec grep -qx "# Forwarding headers, mode $1 - written by the Caddy mTLS Proxy add-on" /etc/caddy/forwarded-headers.caddy 2>/dev/null; }
+check "forwarding snippet written at the start (mode pass, upstream down)" snippet_is pass
+"${DOCKER}" exec -d "${CTR}" /usr/lib/cert-mgr/.venv/bin/python3 /tmp/fake-upstream.py 8123 /tmp/up
+upstream_card_state() { cexec curl -fsS http://127.0.0.1:8099/upstream 2>/dev/null | sed -n 's/.*data-state="\([a-z_]*\)".*/\1/p' | head -n 1; }
+upstream_is_strip() { snippet_is strip && [[ "$(upstream_card_state)" == strip ]]; }
+check "upstream came up refusing: the monitor switched to mode strip (snippet + reload)" wait_for 30 upstream_is_strip
+code="$(http_code POST /api/upstream/check -H "X-Ingress-Path: ${INGRESS_PREFIX}")"
+check "Check again answered (got ${code})" test "${code}" == 303
+check "the fake upstream got the test requests (start of the watch + Check again)" \
+    test "$(cexec sh -c 'wc -l < /tmp/up/refused.log' 2>/dev/null)" -ge 2
 code="$(http_code GET /)"
 check "dashboard renders (got ${code})" test "${code}" == 200
 # The shared LinumIQ UI (stylesheets, a font, the footer logo, the app mark)

@@ -5,6 +5,118 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-11-27
+
+### Fixed
+
+- **"400: Bad Request" after selecting the client certificate.** Home
+  Assistant answers every request that carries the visitor's address
+  (`X-Forwarded-For`) with `400: Bad Request` unless it trusts the proxy -
+  and the add-on always sent that header. A freshly configured add-on
+  therefore showed a bare "400: Bad Request"; the explanation was only in
+  the logs. Now the add-on asks Home Assistant at its start whether it
+  accepts forwarded requests from the add-on (new option
+  `forwarded_headers`, default `auto`):
+  - Home Assistant trusts the add-on: visitor addresses are passed on, as
+    before.
+  - It does not, and mTLS is on (the default): the add-on removes the
+    forwarding headers (`X-Forwarded-For`, `-Proto`, `-Host`, `X-Real-IP`,
+    `Forwarded`). It works without any change in Home Assistant, which then
+    sees every visitor under the add-on's own address (for example
+    `172.30.33.3`); the web interface lists what that means (logins and
+    notifications show that address; "local network only" users and
+    webhooks also work for holders of a client certificate; IP bans after
+    failed logins would hit everyone).
+  - It does not, and mTLS is off: the addresses are still passed on (without
+    client certificates no internet visitor may look like a local device),
+    so the 400 stays - now explained in the web interface and in a Home
+    Assistant notification.
+  - `always` passes the addresses on as up to 2.1.3; `never` never does -
+    and needs mTLS: with `mtls_enabled: false` and `forwarded_headers:
+    never` the add-on refuses to start (every internet visitor would look
+    like a local device), naming the alternatives.
+- The add-on keeps watching Home Assistant (a request every 12 seconds that
+  Home Assistant does not log, over a connection Home Assistant keeps open)
+  and switches at run time, without a restart of its own, when Home
+  Assistant restarts with changed settings - also when it restarts right
+  after the add-on started, and also when it stops trusting the add-on (for
+  example when it drops unconfirmed HTTP settings after 5 minutes): that is
+  noticed at the next 12-second check, not after a minute. The header lines
+  of the proxy live in an imported file that is rewritten, then Caddy
+  reloads (open websocket connections reconnect). While Home Assistant
+  trusts the add-on, the check repeats once a minute; while it does not,
+  only at the start, after a Home Assistant restart and on **Check again** -
+  each refused check writes one line into Home Assistant's log. While Home
+  Assistant does not answer or restarts (also at the first start with Home
+  Assistant still down) the add-on asks every 2.5 seconds, for the first 10
+  minutes; after that every 12 seconds until it answers again. A slow
+  answer is not "down": Home Assistant counts as unreachable only after a
+  refused connection or two checks in a row without an answer within 5
+  seconds. A test question that gets no answer in time is asked again every
+  12 seconds, at most three times in a row (card "Too slow to decide"),
+  then again only after a Home Assistant restart, the add-on's start or
+  **Check again**.
+
+### Added
+
+- Web interface: a card **Home Assistant connection** - green while visitor
+  addresses are passed on, blue while Home Assistant sees every visitor as
+  the add-on (with the consequences), red while every request is answered
+  400, Home Assistant does not answer, or Caddy could not be reloaded for a
+  change ("Change not applied", with the error; the card then shows what
+  Caddy still runs) - with the steps to let Home Assistant trust the add-on
+  and a **Check again** button.
+- A Home Assistant notification "Caddy mTLS: Home Assistant refuses the
+  proxied requests" while every request is answered 400; it is dismissed
+  when that is over.
+- A Home Assistant notification "Caddy mTLS: Home Assistant no longer
+  trusts the app - visitor addresses are hidden" when the add-on stops
+  passing the addresses on while it runs because Home Assistant trusted it
+  and no longer does, with what that means and how to restore the trust;
+  dismissed when the addresses are passed on again and at the next start
+  (none when the add-on simply starts that way or decides for the first
+  time).
+- `tests/real-core.sh`: checks the behaviour against a real Home Assistant
+  Core 2026.11.3 (not part of CI).
+- **HTTPS in the local network without a client certificate** (optional):
+  container port `4443/tcp` serves the same domain with the same Let's
+  Encrypt certificate and no client certificate, to private source
+  addresses only (10/8, 172.16/12, 192.168/16, 127/8, 169.254/16, fc00::/7,
+  fe80::/10, ::1); everyone else gets `403 Forbidden` naming the address. It
+  also refuses the add-on's Docker gateway address, under which Docker
+  forwards IPv6 connections (and connections from the host itself) and
+  hides their real source. Off by default: it is on exactly while the port
+  has a host port (Network settings, **Show disabled ports**). Never forward
+  it on the router. The web interface has a card **Local network** (off:
+  how to turn it on; on: the address, the local DNS record, the warnings -
+  with host port 443 also: the router must forward external 443 to the
+  client-certificate port, never to host port 443). A TLS session of this
+  port cannot be resumed on the client-certificate port. Devices that come
+  through a VPN are refused there; they use the client-certificate address.
+
+### Changed
+
+- The steps for Home Assistant name its user interface: **Settings > System
+  > Network > HTTP server > Reverse proxy** (Trust X-Forwarded-For, trusted
+  proxy `172.30.33.0/24`, Save and restart, then confirm). Home Assistant
+  2026.7 and later read the `http:` block of `configuration.yaml` only once
+  and ignore a block added later; the documentation's block (now with
+  `172.30.33.0/24`, the add-on network Home Assistant's own documentation
+  uses) is for older versions.
+- The log no longer prints the `http:` block at every start: one line while
+  addresses are passed on, a short notice while Home Assistant sees every
+  visitor as the add-on, the full block only while every request is
+  answered 400.
+- Installation step 4 (adding the add-on to Home Assistant's trusted
+  proxies) is no longer required.
+- The plain-HTTP site (port 80) is rendered always, also with
+  `mtls_enabled: false` (then without the CRL): its redirect keeps pointing
+  at `https://<domain>/` (port 443) with a second HTTPS site for the domain.
+  With `mtls_enabled: false` the redirect is now `301` (was Caddy's automatic
+  `308`).
+- The add-on's log names all three host ports and the state of the
+  local-network port.
+
 ## [2.1.3] - 2026-11-24
 
 Security update. Nothing changes in the configuration, the certificates or

@@ -3,7 +3,8 @@
 # Home Assistant Add-on: Caddy mTLS Proxy
 # Init oneshot: validate config, ensure the CA, refresh /data/state.json
 # metadata, issue certificates for new names in `client_names` (every start),
-# re-encrypt .p12 bundles after a client_cert_password change, render the
+# re-encrypt .p12 bundles after a client_cert_password change, check whether
+# the upstream accepts forwarded requests (forwarded_headers), render the
 # Caddyfile, generate the CRL, populate the active-cert allowlist.
 # ==============================================================================
 set -e
@@ -25,9 +26,16 @@ readonly CADDYFILE="/etc/caddy/Caddyfile"
 # (public_cert.py). Caddy runs as root; the file is 0600.
 readonly ACME_LOG="${CADDY_DATA}/log/acme.log"
 # Facts of this start for the panel and the monitor (host ports, domain,
-# start time); /run is empty at every start.
+# upstream, start time); /run is empty at every start.
 readonly RUNTIME_DIR="/run/caddy-mtls"
 readonly RUNTIME_FILE="${RUNTIME_DIR}/runtime.json"
+# The header lines of the reverse_proxy blocks (forwarded_headers): written
+# by upstream.py at every start and rewritten at run time when the mode
+# changes (then Caddy is reloaded).
+readonly FORWARD_SNIPPET="/etc/caddy/forwarded-headers.caddy"
+readonly UPSTREAM_PY="/usr/lib/cert-mgr/upstream.py"
+readonly LAN_PY="/usr/lib/cert-mgr/lan.py"
+readonly PANEL_PYTHON="/usr/lib/cert-mgr/.venv/bin/python3"
 STARTED_AT="$(date +%s)"
 
 mkdir -p "${CERT_DIR}" "${CADDY_DATA}" "${CADDY_DATA}/log" "${RUNTIME_DIR}"
@@ -46,6 +54,8 @@ UPSTREAM_HOST="$(bashio::config 'upstream_host')"
 UPSTREAM_PORT="$(bashio::config 'upstream_port')"
 [[ "${UPSTREAM_PORT}" == "null" ]] && UPSTREAM_PORT=""
 MTLS_ENABLED="$(bashio::config 'mtls_enabled')"
+# Since 2.2.0; options saved before have no key (bashio's default applies).
+FORWARDED_HEADERS="$(bashio::config 'forwarded_headers' 'auto')"
 
 CA_COUNTRY="$(bashio::config 'ca_country')"
 CA_STATE="$(bashio::config 'ca_state')"
@@ -94,6 +104,20 @@ case "${ACME_DNS_PROVIDER}" in
     none|cloudflare|route53|hetzner) ;;
     *) bashio::exit.nok "Unknown acme_dns_provider '${ACME_DNS_PROVIDER}'." ;;
 esac
+
+case "${FORWARDED_HEADERS}" in
+    auto|always|never) ;;
+    *) bashio::exit.nok "Unknown forwarded_headers '${FORWARDED_HEADERS}' (auto, always or never)." ;;
+esac
+
+# forwarded_headers: never needs mTLS (for every upstream). Without client
+# certificates the visitors are anyone on the internet; hiding their
+# addresses would make each of them look like a local device to the
+# upstream (Home Assistant: "local network only" users, local-only webhooks,
+# trusted networks).
+if [[ "${FORWARDED_HEADERS}" == "never" ]] && ! bashio::var.true "${MTLS_ENABLED}"; then
+    bashio::exit.nok "forwarded_headers: never needs mtls_enabled: true. Without client certificates the add-on never hides visitor addresses from the upstream: every visitor from the internet would look like a device in your local network to it. Turn mTLS on (mtls_enabled: true), or set forwarded_headers to auto and let Home Assistant trust this add-on as a reverse proxy (Settings > System > Network > HTTP server > Reverse proxy; see the documentation)."
+fi
 
 if [[ "${ACME_DNS_PROVIDER}" != "none" ]] && bashio::var.is_empty "${DNS_API_TOKEN}"; then
     bashio::exit.nok "DNS API token is required when acme_dns_provider is '${ACME_DNS_PROVIDER}'."
@@ -257,6 +281,103 @@ if bashio::var.true "${MTLS_ENABLED}"; then
 fi
 
 ###############################################################################
+# Published host ports, read before rendering: the local-network site exists
+# only while container port 4443/tcp has a host port (since 2.2.0). Caddy
+# listens on 80/443/4443 inside the container; the host ports are set in the
+# add-on's Network settings (defaults 8080/8443 since 2.0.0: new Home
+# Assistant OS installations (2026.8+) serve Home Assistant itself on 80/443;
+# 4443/tcp unpublished). Outside Supervisor (no API token and no cached add-on
+# info) they are unknown - and the local-network site stays off.
+###############################################################################
+HOST_PORTS_KNOWN=false
+HTTP_HOST_PORT=""
+HTTPS_HOST_PORT=""
+LAN_HOST_PORT=""
+# on | off (no host port) | unknown (could not be read: off as well)
+LAN_STATE=unknown
+read_host_ports() {
+    local http_port https_port lan_port
+    if [[ -z "${SUPERVISOR_TOKEN:-}" ]] && ! bashio::cache.exists 'addons.self.info'; then
+        return 0
+    fi
+    http_port="$(bashio::app.port 80/tcp)" || return 0
+    https_port="$(bashio::app.port 443/tcp)" || return 0
+    [[ "${http_port}" =~ ^[0-9]+$ ]] || http_port=""
+    [[ "${https_port}" =~ ^[0-9]+$ ]] || https_port=""
+    HOST_PORTS_KNOWN=true
+    HTTP_HOST_PORT="${http_port}"
+    HTTPS_HOST_PORT="${https_port}"
+    lan_port="$(bashio::app.port 4443/tcp)" || return 0
+    if [[ "${lan_port}" =~ ^[0-9]+$ ]] && (( lan_port >= 1 && lan_port <= 65535 )); then
+        LAN_HOST_PORT="${lan_port}"
+        LAN_STATE=on
+    else
+        LAN_STATE=off
+    fi
+}
+read_host_ports || true
+
+# The local-network site answers private source addresses only (lan.py) and
+# refuses the container's default gateways although they are private:
+# Docker's userland proxy forwards IPv6 connections to a container without
+# IPv6 (and connections from the host itself) from that address, which hides
+# the real source - possibly a public IPv6 client.
+LAN_PRIVATE_RANGES=""
+LAN_REFUSED=()
+if [[ "${LAN_STATE}" == on ]]; then
+    LAN_GATEWAYS=""
+    if ! LAN_PRIVATE_RANGES="$("${PANEL_PYTHON}" "${LAN_PY}" ranges)" \
+        || ! LAN_GATEWAYS="$("${PANEL_PYTHON}" "${LAN_PY}" gateways)" \
+        || [[ ! "${LAN_PRIVATE_RANGES}" =~ ^[0-9a-fA-F.:/\ ]+$ ]]; then
+        bashio::log.warning "Could not read the container's network (lan.py): the local-network port stays off."
+        LAN_STATE=unknown
+        LAN_HOST_PORT=""
+    else
+        while IFS= read -r gateway; do
+            [[ "${gateway}" =~ ^[0-9a-fA-F.:]+$ ]] && LAN_REFUSED+=("${gateway}")
+        done <<<"${LAN_GATEWAYS}"
+    fi
+fi
+
+###############################################################################
+# Forwarding headers (option forwarded_headers, since 2.2.0). Home Assistant
+# answers a request with X-Forwarded-For "400: Bad Request" unless it trusts
+# this add-on as a reverse proxy. upstream.py asks the upstream (at most
+# about 5 s: at host boot the add-on starts before Home Assistant), decides
+# whether visitor addresses are passed on (mode pass) or the forwarding
+# headers are removed (mode strip) and writes ${FORWARD_SNIPPET}, which the
+# reverse_proxy block imports. The monitor watches the upstream afterwards
+# and switches the mode at run time (rewrite + caddy reload).
+###############################################################################
+bashio::log.info "Checking the upstream ${UPSTREAM_HOST}:${UPSTREAM_PORT} (forwarded_headers: ${FORWARDED_HEADERS})..."
+MTLS_BOOL=false
+bashio::var.true "${MTLS_ENABLED}" && MTLS_BOOL=true
+UPSTREAM_JSON=""
+if ! UPSTREAM_JSON="$(timeout 15 "${PANEL_PYTHON}" "${UPSTREAM_PY}" start \
+        --domain "${DOMAIN}" --host "${UPSTREAM_HOST}" --port "${UPSTREAM_PORT}" \
+        --mtls "${MTLS_BOOL}" --option "${FORWARDED_HEADERS}")" \
+        || ! jq -e '.card' >/dev/null 2>&1 <<<"${UPSTREAM_JSON}"; then
+    bashio::log.warning "Could not check the upstream; the monitor tries again in a few seconds."
+    UPSTREAM_JSON=""
+fi
+# upstream() <key>: a fact of the check ("" if unknown; never fails).
+upstream() { [[ -z "${UPSTREAM_JSON}" ]] || jq -r --arg k "$1" '.[$k] // "" | tostring' <<<"${UPSTREAM_JSON}"; }
+if [[ ! -s "${FORWARD_SNIPPET}" ]]; then
+    # Only when upstream.py could not run: the headers passed on (as up to
+    # 2.1.x) - removed with forwarded_headers: never; the monitor rewrites
+    # the file with its decision.
+    if [[ "${FORWARDED_HEADERS}" == "never" ]]; then
+        printf '%s\n' '# Forwarding headers, mode strip (fallback of init-caddy).' \
+            'header_up -X-Forwarded-For' 'header_up -X-Forwarded-Proto' 'header_up -X-Forwarded-Host' \
+            'header_up -X-Real-IP' 'header_up -Forwarded' >"${FORWARD_SNIPPET}"
+    else
+        printf '%s\n' '# Forwarding headers, mode pass (fallback of init-caddy).' \
+            'header_up X-Real-IP {remote_host}' 'header_up -Forwarded' >"${FORWARD_SNIPPET}"
+    fi
+    chmod 644 "${FORWARD_SNIPPET}"
+fi
+
+###############################################################################
 # Render Caddyfile
 ###############################################################################
 bashio::log.info "Rendering Caddyfile..."
@@ -291,21 +412,26 @@ fi
 # ACME client (challenge results) and the ACME issuer.
 readonly ACME_LOGGERS="tls.obtain tls.renew tls.issuance http.acme_client"
 
-TLS_DIRECTIVES=""
+# The certificate automation (identical for every HTTPS site of the domain,
+# so the public and the local-network site share one certificate and one
+# automation policy) ...
+TLS_ISSUER_DIRECTIVES=""
 if [[ "${ACME_DNS_PROVIDER}" != "none" ]]; then
     # The secret is passed via environment variables referenced through
     # Caddy's {env.X} placeholders, so it never lands in the on-disk
     # Caddyfile and cannot break the Caddyfile syntax.
-    TLS_DIRECTIVES="${TLS_DIRECTIVES}$(dns_provider_directive "${ACME_DNS_PROVIDER}" "        ")
+    TLS_ISSUER_DIRECTIVES="${TLS_ISSUER_DIRECTIVES}$(dns_provider_directive "${ACME_DNS_PROVIDER}" "        ")
 "
     # A site-level ACME issuer (created by `dns`) keeps Caddy's default
     # ZeroSSL fallback unless the CA is set on the site itself.
     if [[ -n "${ACME_CA_URL}" ]]; then
-        TLS_DIRECTIVES="${TLS_DIRECTIVES}        ca ${ACME_CA_URL}
+        TLS_ISSUER_DIRECTIVES="${TLS_ISSUER_DIRECTIVES}        ca ${ACME_CA_URL}
 "
     fi
 fi
 
+# ... and the client certificates (the public site only).
+TLS_DIRECTIVES="${TLS_ISSUER_DIRECTIVES}"
 if bashio::var.true "${MTLS_ENABLED}"; then
     TLS_DIRECTIVES="${TLS_DIRECTIVES}        client_auth {
             mode require_and_verify
@@ -331,24 +457,67 @@ if [[ -n "${TLS_DIRECTIVES}" ]]; then
     TLS_BLOCK="tls {
 ${TLS_DIRECTIVES}    }"
 fi
+LAN_TLS_BLOCK=""
+if [[ -n "${TLS_ISSUER_DIRECTIVES}" ]]; then
+    LAN_TLS_BLOCK="tls {
+${TLS_ISSUER_DIRECTIVES}    }"
+fi
 
-# Plain-HTTP CRL site. Only emitted when mTLS (and therefore the CRL) is
-# enabled. Caddy still serves the ACME HTTP-01 challenge on this listener
-# automatically; user routes only run for non-challenge requests.
-CRL_SITE=""
+# Plain-HTTP site (container port 80), rendered always since 2.2.0: the CRL
+# (with mTLS) and a redirect of everything else to https://<domain>/ - port
+# 443, the router's path. Caddy's automatic redirect is not relied on: with a
+# second HTTPS site for the domain (the local-network port) it would have to
+# pick one of the two ports. Caddy still serves the ACME HTTP-01 challenge on
+# this listener automatically; user routes only run for non-challenge
+# requests.
+CRL_HANDLER=""
 if bashio::var.true "${MTLS_ENABLED}"; then
-    CRL_SITE="
-http://${DOMAIN} {
+    CRL_HANDLER="
     @crl path /mTLS-CA.crl
     handle @crl {
         root * ${CERT_DIR}
         file_server
-    }
-    # Anything other than the public CRL endpoint is redirected to HTTPS.
-    # ACME HTTP-01 challenges are still handled automatically by Caddy
-    # before user routes, so this redirect does not break cert renewal.
+    }"
+fi
+HTTP_SITE="
+http://${DOMAIN} {${CRL_HANDLER}
+    # Anything else is redirected to HTTPS (port 443).
     handle {
         redir https://{host}{uri} permanent
+    }
+${SITE_LOG}
+}
+"
+
+# Local-network site (container port 4443, only with a host port): HTTPS
+# without client certificates, for private source addresses only. Its host
+# port must never be forwarded by the router; the private-address rule is a
+# second line (a published port is reachable over IPv6 wherever the router's
+# IPv6 firewall lets connections in).
+LAN_SITE=""
+if [[ "${LAN_STATE}" == on ]]; then
+    LAN_GATEWAY_MATCHER=""
+    LAN_GATEWAY_RULE=""
+    if (( ${#LAN_REFUSED[@]} > 0 )); then
+        LAN_GATEWAY_MATCHER="
+    @docker_gateway remote_ip ${LAN_REFUSED[*]}"
+        LAN_GATEWAY_RULE="
+        respond @docker_gateway \"403 Forbidden: this connection came from {remote_host}, the address of Docker on the Home Assistant host, which hides where the connection really comes from (an IPv6 connection, or one from the host itself). Connect over IPv4 from a device in your local network: let ${DOMAIN} resolve to the IPv4 address of the Home Assistant host.\" 403"
+    fi
+    LAN_SITE="
+# Local network (container port 4443): no client certificate, private
+# source addresses only. Never forward its host port on the router.
+https://${DOMAIN}:4443 {
+    ${LAN_TLS_BLOCK}
+${LAN_GATEWAY_MATCHER}
+    @not_private not remote_ip ${LAN_PRIVATE_RANGES}
+
+    route {${LAN_GATEWAY_RULE}
+        respond @not_private \"403 Forbidden: this HTTPS port of the Caddy mTLS Proxy answers only devices in your local network (private addresses), and this connection came from {remote_host}. From the internet, use https://${DOMAIN}/ with a client certificate.\" 403
+        reverse_proxy ${UPSTREAM_HOST}:${UPSTREAM_PORT} {
+            # Forwarding headers (forwarded_headers; rewritten at run time)
+            import ${FORWARD_SNIPPET}
+        }
     }
 ${SITE_LOG}
 }
@@ -409,11 +578,12 @@ ${DOMAIN} {
     ${TLS_BLOCK}
 
     reverse_proxy ${UPSTREAM_HOST}:${UPSTREAM_PORT} {
-        header_up X-Real-IP {remote_host}
+        # Forwarding headers (forwarded_headers; rewritten at run time)
+        import ${FORWARD_SNIPPET}
     }
 ${SITE_LOG}
 }
-${CRL_SITE}
+${HTTP_SITE}${LAN_SITE}
 CADDYFILE
 
 # Caddy's own formatting (tabs), so that `caddy validate` / `caddy run` do
@@ -469,6 +639,7 @@ fi
 bashio::log.info "Init complete:"
 bashio::log.info "  Domain:      ${DOMAIN}"
 bashio::log.info "  Upstream:    ${UPSTREAM_HOST}:${UPSTREAM_PORT} (${UPSTREAM_PORT_SOURCE})"
+bashio::log.info "  Forwarding:  forwarded_headers ${FORWARDED_HEADERS}, mode $(upstream mode || true)"
 bashio::log.info "  mTLS:        ${MTLS_ENABLED}"
 bashio::log.info "  ACME DNS:    ${ACME_DNS_PROVIDER}"
 bashio::log.info "  Log level:   ${LOG_LEVEL} (caddy=${CADDY_LOG_LEVEL})"
@@ -479,30 +650,31 @@ else
 fi
 
 ###############################################################################
-# Published host ports. Caddy listens on 80/443 inside the container; the
-# host ports are set in the add-on's Network settings (defaults 8080/8443
-# since 2.0.0: new Home Assistant OS installations (2026.8+) serve Home
-# Assistant itself on 80/443). Informational only - never fails the start,
-# and silent outside Supervisor (no API token and no cached add-on info).
+# Published host ports (read above). Informational - never fails the start.
 ###############################################################################
-HOST_PORTS_KNOWN=false
-HTTP_HOST_PORT=""
-HTTPS_HOST_PORT=""
 log_host_ports() {
-    local http_port https_port
-    if [[ -z "${SUPERVISOR_TOKEN:-}" ]] && ! bashio::cache.exists 'addons.self.info'; then
+    local http_port="${HTTP_HOST_PORT}" https_port="${HTTPS_HOST_PORT}"
+    if [[ "${HOST_PORTS_KNOWN}" != true ]]; then
         bashio::log.info "  Host ports:  unknown (no Supervisor API)"
-        return 0
+    else
+        bashio::log.info "  Host ports:  80/tcp -> ${http_port:-disabled}, 443/tcp -> ${https_port:-disabled}, 4443/tcp -> ${LAN_HOST_PORT:-disabled}"
     fi
-    http_port="$(bashio::app.port 80/tcp)" || return 0
-    https_port="$(bashio::app.port 443/tcp)" || return 0
-    [[ "${http_port}" =~ ^[0-9]+$ ]] || http_port=""
-    [[ "${https_port}" =~ ^[0-9]+$ ]] || https_port=""
-    HOST_PORTS_KNOWN=true
-    HTTP_HOST_PORT="${http_port}"
-    HTTPS_HOST_PORT="${https_port}"
-
-    bashio::log.info "  Host ports:  80/tcp -> ${http_port:-disabled}, 443/tcp -> ${https_port:-disabled}"
+    case "${LAN_STATE}" in
+        on)
+            bashio::log.info "  LAN port:    https://${DOMAIN}$([[ "${LAN_HOST_PORT}" == 443 ]] || printf ':%s' "${LAN_HOST_PORT}")/ - HTTPS without a client certificate, private source addresses only"
+            if (( ${#LAN_REFUSED[@]} > 0 )); then
+                bashio::log.info "               (also refused: ${LAN_REFUSED[*]} - Docker's address, it hides the real source)"
+            fi
+            bashio::log.notice "The local-network port (host port ${LAN_HOST_PORT}) needs no client certificate: never forward it on the router. At home, let ${DOMAIN} resolve to this host's IPv4 address (local DNS)."
+            ;;
+        off)
+            bashio::log.info "  LAN port:    off (4443/tcp has no host port; see the add-on's web interface)"
+            ;;
+        *)
+            bashio::log.info "  LAN port:    off (the host port of 4443/tcp could not be read)"
+            ;;
+    esac
+    [[ "${HOST_PORTS_KNOWN}" == true ]] || return 0
     if [[ -n "${http_port}" && -n "${https_port}" ]]; then
         bashio::log.info "  Router:      forward external TCP 80 -> <this host>:${http_port} and TCP 443 -> <this host>:${https_port}"
     fi
@@ -520,10 +692,10 @@ log_host_ports() {
 log_host_ports || true
 
 ###############################################################################
-# Facts of this start for the panel's "Public certificate" card and the
-# expiry monitor (public_cert.py): the domain, the published host ports (for
-# the port-forwarding checklist), the ACME mode and the start time (only
-# certificate events after it count). Not secret.
+# Facts of this start for the panel's cards and the monitor (public_cert.py,
+# upstream.py): the domain, the published host ports (for the port-forwarding
+# checklist), the ACME mode, the start time (only certificate events after it
+# count) and the upstream with the forwarded_headers option. Not secret.
 ###############################################################################
 jq -n \
     --arg domain "${DOMAIN}" \
@@ -535,40 +707,115 @@ jq -n \
     --arg acme_ca "${ACME_CA_URL}" \
     --arg acme_log "${ACME_LOG}" \
     --arg caddy_storage "${CADDY_DATA}" \
+    --arg upstream_host "${UPSTREAM_HOST}" \
+    --argjson upstream_port "${UPSTREAM_PORT}" \
+    --argjson mtls "${MTLS_BOOL}" \
+    --arg forwarded "${FORWARDED_HEADERS}" \
+    --arg lan_port "${LAN_HOST_PORT}" \
+    --arg lan_state "${LAN_STATE}" \
+    --arg lan_refused "${LAN_REFUSED[*]}" \
     '{domain: $domain, started_at: $started_at, host_ports_known: $ports_known,
       http_host_port: ($http_port | tonumber? // null),
       https_host_port: ($https_port | tonumber? // null),
       acme_dns_provider: $dns_provider, acme_ca: $acme_ca,
-      acme_log: $acme_log, caddy_storage: $caddy_storage}' \
+      acme_log: $acme_log, caddy_storage: $caddy_storage,
+      upstream_host: $upstream_host, upstream_port: $upstream_port,
+      mtls_enabled: $mtls, forwarded_headers: $forwarded,
+      lan_host_port: ($lan_port | tonumber? // null), lan_state: $lan_state,
+      lan_refused: ($lan_refused | split(" ") | map(select(. != "")))}' \
     > "${RUNTIME_FILE}.tmp"
 chmod 644 "${RUNTIME_FILE}.tmp"
 mv -f "${RUNTIME_FILE}.tmp" "${RUNTIME_FILE}"
 
 ###############################################################################
-# Reverse-proxy reminder for Home Assistant Core.
-# HA Core rejects requests from unknown reverse proxies with 400 Bad Request.
-# We can't edit the user's configuration.yaml safely, so emit a prominent,
-# copy-pasteable reminder on every start. Detect our own container IP so the
-# user can also whitelist a single address if they prefer it over the whole
-# Supervisor docker subnet.
+# The connection to the upstream (the panel's "Home Assistant connection"
+# card says the same, with the steps): one line while visitor addresses are
+# passed on; a short notice while it works without them; the prominent block
+# only when every request is answered "400: Bad Request".
 ###############################################################################
-# (`|| true`: bashio enables pipefail, and `hostname -i` fails when the
-# container has no network, e.g. in tests/smoke.sh.)
-ADDON_IP="$(hostname -i 2>/dev/null | awk '{print $1}')" || true
-[[ -z "${ADDON_IP}" ]] && ADDON_IP="<this add-on's container IP>"
-
-bashio::log.notice "------------------------------------------------------------"
-bashio::log.notice "Home Assistant Core must trust this add-on as a reverse"
-bashio::log.notice "proxy, otherwise it returns 400 Bad Request for every"
-bashio::log.notice "request forwarded through ${DOMAIN}."
-bashio::log.notice ""
-bashio::log.notice "Add this to /config/configuration.yaml and restart HA Core:"
-bashio::log.notice ""
-bashio::log.notice "  http:"
-bashio::log.notice "    use_x_forwarded_for: true"
-bashio::log.notice "    trusted_proxies:"
-bashio::log.notice "      - 172.30.32.0/23   # Supervisor docker network"
-bashio::log.notice "      # or just this add-on's current IP: ${ADDON_IP}"
-bashio::log.notice ""
-bashio::log.notice "See the add-on documentation for details."
-bashio::log.notice "------------------------------------------------------------"
+upstream_notice() {
+    local card source suggestion error what what_mid title
+    card="$(upstream card)"
+    source="$(upstream source_address)"
+    suggestion="$(upstream suggestion)"
+    error="$(upstream error)"
+    # How texts name the upstream: at the start of a sentence / inside one;
+    # the title of its card in the web interface.
+    what="Home Assistant"
+    what_mid="Home Assistant"
+    title="Home Assistant connection"
+    if [[ "${UPSTREAM_HOST}" != "homeassistant" ]]; then
+        what="The upstream ${UPSTREAM_HOST}:${UPSTREAM_PORT}"
+        what_mid="the upstream ${UPSTREAM_HOST}:${UPSTREAM_PORT}"
+        title="Upstream connection"
+    fi
+    case "${card}" in
+        accepted)
+            bashio::log.info "${what} accepts this add-on (${source}) as a reverse proxy: visitor addresses are passed on."
+            ;;
+        strip)
+            bashio::log.notice "${what} does not trust this add-on (${source}) as a reverse proxy. The add-on therefore removes the forwarding headers (forwarded_headers: auto, mTLS on): it works, and ${what_mid} sees every visitor as ${source}."
+            bashio::log.notice "To pass visitor addresses on, let ${what_mid} trust ${suggestion} as a reverse proxy - the steps are in the add-on's web interface (card \"${title}\")."
+            ;;
+        never)
+            bashio::log.info "forwarded_headers: never - visitor addresses are not passed on; ${what_mid} sees every visitor as ${source:-this add-on}."
+            ;;
+        unreachable)
+            if [[ "$(upstream error_kind)" == http ]]; then
+                bashio::log.warning "The upstream ${UPSTREAM_HOST}:${UPSTREAM_PORT} answers with an error (HTTP $(upstream control_status)): $(upstream effect). Forwarding headers meanwhile: mode $(upstream mode) (last known); the add-on checks again every few seconds."
+            else
+                bashio::log.warning "The upstream ${UPSTREAM_HOST}:${UPSTREAM_PORT} does not answer yet (${error:-no answer}): $(upstream effect) until it does. Forwarding headers until then: mode $(upstream mode) (last known); the add-on checks again every few seconds."
+            fi
+            ;;
+        broken)
+            bashio::log.warning "------------------------------------------------------------"
+            bashio::log.warning "${what} answers EVERY request through ${DOMAIN}"
+            bashio::log.warning "with \"400: Bad Request\": it does not trust this add-on"
+            bashio::log.warning "(${source}) as a reverse proxy, and the add-on passes the"
+            if [[ "${MTLS_BOOL}" == true ]]; then
+                bashio::log.warning "visitor addresses on (forwarded_headers: always)."
+            else
+                bashio::log.warning "visitor addresses on (mtls_enabled: false - without client"
+                bashio::log.warning "certificates no visitor may look like a local device)."
+            fi
+            bashio::log.warning ""
+            if [[ "${UPSTREAM_HOST}" == "homeassistant" ]]; then
+                bashio::log.warning "Fix it in Home Assistant: Settings > System > Network >"
+                bashio::log.warning "HTTP server > Reverse proxy: turn on 'Trust X-Forwarded-For',"
+                bashio::log.warning "add ${suggestion} to 'Trusted proxies', select Save and"
+                bashio::log.warning "'Save and restart', then confirm the new settings."
+                bashio::log.warning ""
+                bashio::log.warning "Home Assistant before 2026.7: add this to configuration.yaml"
+                bashio::log.warning "and restart Home Assistant:"
+                bashio::log.warning ""
+                bashio::log.warning "  http:"
+                bashio::log.warning "    use_x_forwarded_for: true"
+                bashio::log.warning "    trusted_proxies:"
+                bashio::log.warning "      - ${suggestion}"
+            else
+                bashio::log.warning "Let ${what_mid} trust ${suggestion} as a reverse"
+                bashio::log.warning "proxy (X-Forwarded-For)."
+            fi
+            if [[ "${MTLS_BOOL}" == true ]]; then
+                bashio::log.warning ""
+                bashio::log.warning "Or set forwarded_headers to auto: ${what_mid} then sees"
+                bashio::log.warning "every visitor as ${source}."
+            else
+                bashio::log.warning ""
+                bashio::log.warning "Or turn mTLS on (mtls_enabled: true): with forwarded_headers"
+                bashio::log.warning "auto the add-on then hides the visitor addresses."
+            fi
+            bashio::log.warning ""
+            bashio::log.warning "Details: the add-on's web interface (card \"${title}\")."
+            bashio::log.warning "------------------------------------------------------------"
+            ;;
+        *)
+            if [[ -n "${error}" ]]; then
+                bashio::log.info "${what} did not answer in time (${error}); the add-on checks again in a few seconds."
+            else
+                bashio::log.info "Connection to the upstream not checked yet; the add-on checks it in a few seconds."
+            fi
+            ;;
+    esac
+}
+upstream_notice || true

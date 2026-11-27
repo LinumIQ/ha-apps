@@ -25,6 +25,7 @@ CERT_MGR = Path(
 sys.path.insert(0, str(CERT_MGR))
 
 import public_cert  # noqa: E402
+import upstream  # noqa: E402
 
 try:
     import jinja2
@@ -213,6 +214,11 @@ class RenderTests(unittest.TestCase):
             "ca_crt_exists": True, "crl_exists": True, "flash_error": "<b>x</b>", "flash_ok": None,
             "pc": pc, "pc_checklist": public_cert.checklist(pc), "pc_retry_hint": public_cert.retry_hint(pc),
             "pc_time": public_cert.local_time,
+            "hc": upstream.card_context(
+                upstream.Settings("home.example.org", "homeassistant", 8123, True, "auto"),
+                upstream.State(upstream="homeassistant:8123", result="refused", decisive="refused",
+                               mode="strip", reachable=True, source_address="172.30.33.3"),
+            ),
         }
 
     def test_dashboard(self):
@@ -226,6 +232,8 @@ class RenderTests(unittest.TestCase):
                 self.assertNotIn("\U0001f510", html)  # the old emoji header icon
                 self.assertIn(f'data-state="{state}"', html)
                 self.assertLess(html.index('id="public-cert"'), html.index("Certificate Authority"))
+                self.assertLess(html.index('id="public-cert"'), html.index('id="upstream"'))
+                self.assertLess(html.index('id="upstream"'), html.index("Certificate Authority"))
                 self.assertIn("&lt;b&gt;x&lt;/b&gt;", html)
                 footer = html[html.index('<footer class="app-footer">'):]
                 self.assertIn('src="static/shared/brand/linumiq-logo.png"', footer)
@@ -243,6 +251,145 @@ class RenderTests(unittest.TestCase):
         self.assertIn('class="card pc pc--missing"', html)
         self.assertNotIn("<html", html)
         self.assertNotIn("app-footer", html)
+
+
+@unittest.skipIf(jinja2 is None, "Jinja2 not installed (run inside the add-on image)")
+class UpstreamCardTests(unittest.TestCase):
+    """The "Home Assistant connection" card in each state (app.py's
+    upstream_context with upstream.State values)."""
+
+    NOW = RenderTests.NOW
+
+    @classmethod
+    def setUpClass(cls):
+        cls.env = jinja2.Environment(loader=jinja2.FileSystemLoader(str(TEMPLATES)), autoescape=True)
+
+    def render(self, card, option="auto", mtls=True, host="homeassistant", **state):
+        settings = upstream.Settings("home.example.org", host, 8123, mtls, option)
+        st = None
+        if card != "none":
+            defaults = {
+                "accepted": dict(result="accepted", decisive="accepted", mode="pass", reachable=True),
+                "strip": dict(result="refused", decisive="refused", mode="strip", reachable=True),
+                "broken": dict(result="refused", decisive="refused", mode="pass", reachable=True),
+                "never": dict(result="refused", decisive="refused", mode="strip", reachable=True),
+                "unreachable": dict(result="unreachable", decisive="refused", mode="strip", reachable=False,
+                                    error="[Errno 111] Connection refused", error_kind="connect"),
+                "reload_failed": dict(result="refused", decisive="refused", mode="strip", running="pass",
+                                      applied=False, reachable=True, reload_error="Error: loading config: x"),
+                "too_slow": dict(reachable=True, slow_tests=3),
+                "unknown": dict(),
+            }[card]
+            defaults.update(source_address="172.30.33.3", checked_at=self.NOW - 30)
+            defaults.update(state)
+            st = upstream.State(upstream=settings.target, **defaults)
+        context = {"hc": upstream.card_context(settings, st)}
+        self.assertEqual(context["hc"]["card"], "unknown" if card == "none" else card)
+        return self.env.get_template("_upstream.html").render(context)
+
+    def test_fragment(self):
+        html = self.render("strip")
+        self.assertTrue(html.lstrip().startswith("<section"), html[:60])
+        self.assertIn('id="upstream"', html)
+        self.assertIn('class="card hc hc--strip"', html)
+        self.assertIn('data-state="strip"', html)
+        self.assertIn('data-mode="strip"', html)
+        self.assertIn('<form method="post" action="api/upstream/check"', html)
+        self.assertIn('class="btn" type="submit">Check again</button>', html)
+        self.assertNotIn("<html", html)
+        for url in ATTR_URL_RE.findall(html):
+            self.assertFalse(ABSOLUTE_RE.match(url), url)
+
+    def test_states(self):
+        expectations = {
+            "accepted": ["Home Assistant connection", "status--success", "Connected",
+                         "Home Assistant accepts this add-on as a reverse proxy"],
+            "strip": ["status--info", "It works", "sees every visitor as\n    <code>172.30.33.3</code>",
+                      "Can only log in from the local network", "ip_bans.yaml",
+                      "add 172.30.33.0/24 to &#34;Trusted proxies&#34;", "Save and restart",
+                      "use_x_forwarded_for: true", "    - 172.30.33.0/24", "Check again"],
+            "broken": ["status--danger", "Refused (400)", "400: Bad Request",
+                       "<code>forwarded_headers</code> is <code>always</code>",
+                       "Settings &gt; System &gt; Network", "Or set the app option"],
+            "never": ["Addresses not passed on", "forwarded_headers: never", "172.30.33.3"],
+            "unreachable": ["status--danger", "Unreachable", "<code>homeassistant:8123</code> does not answer",
+                            "Connection refused", "502 Bad Gateway", "mode <code>strip</code>"],
+            "reload_failed": ["status--danger", "Change not applied", 'role="alert"',
+                              "Applying the forwarding mode strip failed", "Error: loading config: x",
+                              'every request is answered "400: Bad Request"', 'data-mode="pass"'],
+            "too_slow": ["status--warn", "Too slow to decide", "hc--too_slow",
+                         "answers the test request too slowly to decide", "3\n    test requests in a row",
+                         "stopped\n    retrying on its own", "mode <code>pass</code>", "Check again"],
+            "unknown": ["Not checked yet"],
+        }
+        for card, needles in expectations.items():
+            with self.subTest(card=card):
+                html = self.render(card, option={"broken": "always", "never": "never"}.get(card, "auto"))
+                self.assertIn(f'data-state="{card}"', html)
+                for needle in needles:
+                    self.assertIn(needle, html)
+
+    def test_broken_without_mtls_offers_no_never(self):
+        """B-1: never needs mTLS - not offered while it is off."""
+        html = self.render("broken", option="auto", mtls=False)
+        self.assertIn("mtls_enabled: false", html)
+        self.assertIn("Or turn mTLS on", html)
+        self.assertNotIn("Or set the app option", html)
+        self.assertNotIn("<code>never</code>", html)
+        self.assertNotIn("forwarded_headers: never", html)
+
+    def test_strip_names_both_kinds_of_visitors(self):
+        """B-9: not "every visitor has a client certificate"."""
+        html = self.render("strip")
+        self.assertIn("visitors on the public\n    port have a client certificate", html)
+        self.assertIn("local-network port come\n    from private addresses", html)
+        self.assertNotIn("every visitor has a", html)
+
+    def test_slow_unreachable_claims_no_502(self):
+        """B-6."""
+        html = self.render("unreachable", error="timed out", error_kind="timeout")
+        self.assertIn("visitors&#39; requests wait for it or fail", html)
+        self.assertNotIn("502", html)
+
+    def test_retry_wording_is_true(self):
+        """The red card names no interval it does not keep."""
+        html = self.render("reload_failed")
+        self.assertIn("retries on its own at each regular check", html)
+        self.assertNotIn("every few seconds", html)
+
+    def test_error_answer_is_an_answer(self):
+        """A 5xx: "answers with an error (HTTP 503)", not "does not answer"."""
+        html = self.render("unreachable", error="answered HTTP 503", error_kind="http", control_status=503)
+        self.assertIn("<code>homeassistant:8123</code> answers with an error</strong>\n    (HTTP 503)", html)
+        self.assertIn("visitors get its error answers", html)
+        self.assertNotIn("does not answer", html)
+
+    def test_unreachable_other_upstream_names_it(self):
+        """"While Home Assistant starts or restarts" only for Home Assistant."""
+        html = self.render("unreachable", host="192.0.2.10")
+        self.assertIn("While the upstream 192.0.2.10:8123 starts or restarts this is normal", html)
+        self.assertNotIn("Home Assistant", html)
+        html = self.render("unreachable")
+        self.assertIn("While Home Assistant starts or restarts this is normal", html)
+
+    def test_other_upstream_is_neutral(self):
+        html = self.render("broken", option="always", host="192.0.2.10")
+        self.assertIn("Upstream connection", html)
+        self.assertIn("the upstream 192.0.2.10:8123", html)
+        self.assertNotIn("Home Assistant", html)
+        self.assertNotIn("configuration.yaml", html)
+
+    def test_not_started(self):
+        html = self.env.get_template("_upstream.html").render({"hc": upstream.card_context(None, None)})
+        self.assertIn("still starting", html)
+        self.assertNotIn("<form", html)
+
+    def test_dashboard_reloads_both_cards(self):
+        index = (TEMPLATES / "index.html").read_text()
+        self.assertIn('{% include "_upstream.html" %}', index)
+        self.assertLess(index.index('"_public_cert.html"'), index.index('"_upstream.html"'))
+        self.assertIn('fetch("upstream"', index)
+        self.assertIn('fetch("public-cert"', index)
 
 
 if __name__ == "__main__":
