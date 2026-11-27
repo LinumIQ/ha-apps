@@ -16,9 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that presents an active client certificate **or** carries the header with
   exactly the key; every other request gets `403 Forbidden`. A presented
   certificate is still checked in the TLS handshake as before (a revoked
-  one ends the connection, also with the key), and the key check also
-  requires the fingerprint of an active certificate, regenerated from the
-  allowlist before every reload. The key: 32-256 characters of
+  one ends the connection, also with the key), and the HTTP check accepts
+  a certificate only by the fingerprint of an active one (a list
+  regenerated from the allowlist before every reload). The key: 32-256
+  characters of
   `A-Z a-z 0-9 . _ ~ + / = -`, never in the generated configuration, a log
   line or the web interface (Caddy reads it from a 0600 file per request).
   The header is removed before Home Assistant sees the request. While a key

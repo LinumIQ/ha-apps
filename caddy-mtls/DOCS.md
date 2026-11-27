@@ -483,11 +483,13 @@ every client. **Switching it off:** empty `header_auth_key` and restart.
   absent`, `refused: no certificate, header present with a wrong value` or
   `refused: certificate not in the active list` (without mTLS: `refused:
   header absent` / `refused: header present with a wrong value`).
-- The key is kept in the add-on's options (Supervisor) and, while the add-on
-  runs, in one file inside the add-on (mode 0600) that Caddy reads per
-  request. It is not in the generated Caddyfile, Caddy's saved
-  configuration, the log, the web interface (which shows only its length)
-  or a notification.
+- The key is kept in the add-on's options - by the Supervisor, and included
+  in backups of the add-on, like `client_cert_password` and `dns_api_token`
+  - and, while the add-on runs, inside its container (in the option cache of
+  the add-on's scripts, and in a file with mode 0600 that Caddy reads per
+  request). It is not in the generated
+  Caddyfile, Caddy's saved configuration, the log, the web interface (which
+  shows only its length) or a notification.
 
 ### Visitors without a certificate, browsers
 
@@ -520,8 +522,9 @@ front of Home Assistant's login page; the log and the card say so.
 
 Without a key, nobody without a client certificate gets past the TLS
 handshake: Caddy reads no HTTP request of theirs. With a key, the handshake
-completes for everybody, so Caddy's HTTP handling (HTTP/1.1, HTTP/2,
-HTTP/3) is reachable from the internet and the key check decides. The key
+completes for everybody, so Caddy's HTTP handling (HTTP/1.1 and HTTP/2) is
+reachable from the internet and the key check decides (HTTP/3 is not
+reachable: the add-on publishes TCP ports only, no UDP port). The key
 is a static secret sent in every request and seen by everything on the way
 (the phone app, a TLS-inspecting proxy); Caddy compares it with a plain
 string comparison and limits no attempts - hence the minimum of 32
