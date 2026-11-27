@@ -48,9 +48,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only at the start, after a Home Assistant restart and on **Check again** -
   each refused check writes one line into Home Assistant's log. While Home
   Assistant does not answer or restarts (also at the first start with Home
-  Assistant still down) the add-on asks every 2.5 seconds. A slow answer is
-  not "down": Home Assistant counts as unreachable only after a refused
-  connection or two checks in a row without an answer within 5 seconds.
+  Assistant still down) the add-on asks every 2.5 seconds, for the first 10
+  minutes; after that every 12 seconds until it answers again. A slow
+  answer is not "down": Home Assistant counts as unreachable only after a
+  refused connection or two checks in a row without an answer within 5
+  seconds. A test question that gets no answer in time is asked again every
+  12 seconds, at most three times in a row (card "Too slow to decide"),
+  then again only after a Home Assistant restart, the add-on's start or
+  **Check again**.
 
 ### Added
 
@@ -66,9 +71,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when that is over.
 - A Home Assistant notification "Caddy mTLS: Home Assistant no longer
   trusts the app - visitor addresses are hidden" when the add-on stops
-  passing the addresses on while it runs, with what that means and how to
-  restore the trust; dismissed when the addresses are passed on again and
-  at the next start (none when the add-on simply starts that way).
+  passing the addresses on while it runs because Home Assistant trusted it
+  and no longer does, with what that means and how to restore the trust;
+  dismissed when the addresses are passed on again and at the next start
+  (none when the add-on simply starts that way or decides for the first
+  time).
 - `tests/real-core.sh`: checks the behaviour against a real Home Assistant
   Core 2026.11.3 (not part of CI).
 - **HTTPS in the local network without a client certificate** (optional):

@@ -212,10 +212,16 @@ the header):
   the add-on starts before Home Assistant): the add-on keeps the last known
   mode and decides as soon as Home Assistant answers. While Home Assistant
   does not answer or restarts, the add-on asks every 2.5 seconds, so few
-  requests are answered 400 before it decides. A Home Assistant that is
-  only slow (no answer within 5 seconds) counts as "does not answer" after
-  two unanswered questions in a row, or at once when the connection is
-  refused; a pause of up to about 15 seconds changes nothing.
+  requests are answered 400 before it decides; after 10 minutes without an
+  answer it asks every 12 seconds until Home Assistant answers again. A
+  Home Assistant that is only slow (no answer within 5 seconds) counts as
+  "does not answer" after two unanswered questions in a row, or at once
+  when the connection is refused; a pause of up to about 15 seconds changes
+  nothing. If only the test question (the one with a visitor address) gets
+  no answer within 5 seconds, the add-on asks it again every 12 seconds;
+  after three such questions in a row it stops and the card says **Too slow
+  to decide**, until Home Assistant restarts, the add-on starts or you
+  select **Check again**.
 
 The add-on keeps watching: it asks Home Assistant every 12 seconds with a
 request that Home Assistant does not log, over a connection that Home
@@ -229,10 +235,15 @@ also asks once a minute, which Home Assistant does not log. While Home
 Assistant does not trust it, the add-on asks only at its start, after a
 Home Assistant restart (or after Home Assistant did not answer twice in a
 row) and when you select **Check again** - **each of these questions writes
-one line into Home Assistant's log** (the one quoted above).
+one line into Home Assistant's log** (the one quoted above). An upstream
+other than Home Assistant that closes idle connections itself is not
+watched for restarts: after changing its trusted proxies, select **Check
+again** (or restart the add-on).
 
 When the add-on stops passing visitor addresses on while it runs (Home
-Assistant no longer trusts it), it raises a Home Assistant notification
+Assistant trusted it and no longer does; not when it decides for the first
+time, for example after a start while Home Assistant was down), it raises
+a Home Assistant notification
 **"Caddy mTLS: Home Assistant no longer trusts the app - visitor addresses
 are hidden"** with what that means and how to restore the trust. The
 notification disappears when the addresses are passed on again (and at the
@@ -841,9 +852,10 @@ caddy-mtls/tests/real-core.sh caddy-mtls-test [ghcr.io/linumiq/amd64-addon-caddy
   client's real address in Core's log; removing them switches back; the
   websocket (`/api/websocket`) works through the proxy in both modes. With
   the monitor's default intervals: the first start with Core down (the
-  switch within 5 s of Core's first answer), a Core restart right after the
-  add-on's start, trust removed while passing addresses on (noticed within
-  one control interval, the "addresses hidden" notification), Core paused
+  switch within 5 s of Core's first answer, no "addresses hidden"
+  notification), a Core restart right after the add-on's start, trust
+  removed while passing addresses on (noticed within one control interval,
+  the "addresses hidden" notification), Core paused
   for 15 s (nothing happens) and for 40 s (unreachable, no 502 claim). It
   counts the lines that each phase writes into Core's log.
   `REALCORE_PREFIX`, `REALCORE_SUBNET` and `REALCORE_EVIDENCE` set the name
