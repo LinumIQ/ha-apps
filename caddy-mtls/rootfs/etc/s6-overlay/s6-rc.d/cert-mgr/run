@@ -47,7 +47,7 @@ export CERT_DIR="/data/certs"
 export STATE_FILE="/data/state.json"
 export STATE_LOCK="/data/state.json.lock"
 export CADDYFILE="/etc/caddy/Caddyfile"
-export CADDY_ADMIN="localhost:2019"
+export CADDY_ADMIN="127.0.0.1:2019"
 export OPENSSL_CA_CNF="/etc/caddy/openssl-ca.cnf"
 export DOMAIN \
        CA_COUNTRY CA_STATE CA_LOCALITY CA_ORGANIZATION CA_COMMON_NAME \

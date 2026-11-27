@@ -828,8 +828,10 @@ ${TLS_ISSUER_DIRECTIVES}        client_auth {
         root ${CADDY_DATA}
     }
 
-    # Loopback-only admin API so cert-mgr can reload Caddy in-place.
-    admin localhost:2019
+    # Loopback-only admin API so cert-mgr can reload Caddy in-place - on
+    # 127.0.0.1 explicitly (since 2.3.0): in this container "localhost"
+    # resolves to ::1 first, where something else could listen.
+    admin 127.0.0.1:2019
 
     # A stop or reload waits at most 10 s for open requests (default:
     # forever), so the add-on always stops within Supervisor's timeout.

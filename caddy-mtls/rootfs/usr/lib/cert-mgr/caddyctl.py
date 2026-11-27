@@ -58,7 +58,7 @@ ACTIVE_DIR = Path(os.environ.get("CADDY_MTLS_ACTIVE_DIR", "/data/certs/active"))
 FINGERPRINT_FILE = Path(os.environ.get("CADDY_MTLS_FINGERPRINT_FILE", "/etc/caddy/client-fingerprints.caddy"))
 CADDY_BIN = os.environ.get("CADDY_BIN", "/usr/bin/caddy")
 CADDYFILE = Path(os.environ.get("CADDYFILE", "/etc/caddy/Caddyfile"))
-CADDY_ADMIN = os.environ.get("CADDY_ADMIN", "localhost:2019")
+CADDY_ADMIN = os.environ.get("CADDY_ADMIN", "127.0.0.1:2019")
 OPENSSL_BIN = os.environ.get("OPENSSL_BIN", "openssl")
 
 #: {http.request.tls.client.fingerprint} of a connection without a client

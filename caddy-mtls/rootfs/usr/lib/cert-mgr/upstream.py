@@ -65,7 +65,7 @@ SNIPPET_FILE = Path(os.environ.get("CADDY_MTLS_FORWARD_SNIPPET", "/etc/caddy/for
 LOCK_FILE = Path(os.environ.get("CADDY_MTLS_UPSTREAM_LOCK", "/run/caddy-mtls/upstream.lock"))
 CADDY_BIN = os.environ.get("CADDY_BIN", "/usr/bin/caddy")
 CADDYFILE = Path(os.environ.get("CADDYFILE", "/etc/caddy/Caddyfile"))
-CADDY_ADMIN = os.environ.get("CADDY_ADMIN", "localhost:2019")
+CADDY_ADMIN = os.environ.get("CADDY_ADMIN", "127.0.0.1:2019")
 
 OPTIONS = ("auto", "always", "never")
 PASS = "pass"

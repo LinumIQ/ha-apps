@@ -301,11 +301,28 @@ class IntegrityTest(unittest.TestCase):
             c["logging"]["logs"]["default"]["level"] = "ERROR"
         self.assert_rule(4, "ok", default_changed)
 
+    def test_rule_4_no_server_of_your_own(self) -> None:
+        """B-1: a site of yours on another port or with bind gets a server
+        of its own: it could take the admin endpoint (2019), the web
+        interface (8099) or the add-on's site on one address."""
+        for listen in ([":2019"], [":8099"], ["127.0.0.1:443"], [":8444"]):
+            with self.subTest(listen=listen):
+                def add(c, listen=listen):
+                    c["apps"]["http"]["servers"]["mine"] = {"listen": listen, "routes": [
+                        {"match": [{"host": ["other.localhost"]}], "handle": [{"handler": "static_response"}]}]}
+                with self.assertRaises(customconf.Violation) as ctx:
+                    self.mutated("ok", add)
+                self.assertEqual(ctx.exception.rule, 4)
+                self.assertIn(f"listens on {listen[0]}", ctx.exception.message)
+                self.assertIn("only the add-on's own ports 80, 443", ctx.exception.message)
+
     def test_rule_2_more_ways_to_answer_the_domain(self) -> None:
         catch_all = {"handle": [{"handler": "static_response", "body": "x"}]}
         self.assert_rule(2, "ok", lambda c: self.server(c, ":443")["routes"].append(catch_all))
         self.assert_rule(2, "ok", lambda c: self.server(c, ":443").setdefault("errors", {}).update(routes=[catch_all]))
-        self.assert_rule(2, "ok", lambda c: c["apps"]["http"]["servers"].update(
+        # (A server of its own for the domain is refused as a server of
+        # its own already: rule 4, test_rule_4_no_server_of_your_own.)
+        self.assert_rule(4, "ok", lambda c: c["apps"]["http"]["servers"].update(
             extra={"listen": [":8444"], "routes": [{"match": [{"host": ["caddy-mtls-smoke.localhost"]}],
                                                     "handle": [{"handler": "reverse_proxy"}]}]}))
         # Another host name on the same listener is fine.

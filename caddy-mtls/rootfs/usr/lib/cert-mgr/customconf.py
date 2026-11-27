@@ -703,15 +703,21 @@ def check(adapted: dict[str, Any], reference: dict[str, Any], *, domain: str, up
             elif ah_ref.get(key) != ah_got.get(key):
                 raise Violation(4, f"{where}: the automatic HTTPS setting {key} changed", "global.caddy")
     rules.append("1: the add-on's routes for the domain unchanged, custom handlers only at their place")
-    # 2: servers that only the custom files create.
+    # 4 (B-1): no server of its own for a site of yours. Every server must
+    # listen exactly where one of the add-on's does: another port can take
+    # one of the add-on's own listeners inside the container (2019: Caddy's
+    # admin endpoint - a reload would go to your site and report success;
+    # 8099: the web interface), and `bind` splits off a server that takes
+    # the add-on's site on that address.
     for name_got, srv_got in servers_got.items():
         if name_got in matched:
             continue
-        routes = list(srv_got.get("routes") or []) + list(((srv_got.get("errors") or {}).get("routes")) or [])
-        if any(route_may_match(r, domain) for r in routes):
-            raise Violation(2, f"a site on {srv_got.get('listen')} can answer {domain} (every site in sites.caddy "
-                               "needs a host name other than the add-on's)",
-                            "sites.caddy" if "sites.caddy" in files else only)
+        listen = ", ".join(str(a) for a in srv_got.get("listen") or []) or "(no address)"
+        raise Violation(4, f"a site of yours listens on {listen}: your sites can use only the add-on's own ports "
+                           "80, 443 and (while the local-network port is on) 4443, without bind - the add-on "
+                           "publishes no other port, and ports such as 2019 (Caddy's admin interface) and 8099 "
+                           "(this web interface) belong to the add-on",
+                        "sites.caddy" if "sites.caddy" in files else only)
     rules.append("2: no other route can answer the domain")
     # The adapter merges host names with the same TLS settings into one
     # policy: its subjects may grow by a site you add, its settings may not.

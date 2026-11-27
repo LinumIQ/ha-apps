@@ -64,7 +64,7 @@ logging.basicConfig(
 
 CERT_DIR = Path(os.environ.get("CERT_DIR", "/data/certs"))
 STATE_FILE = Path(os.environ.get("STATE_FILE", "/data/state.json"))
-CADDY_ADMIN = os.environ.get("CADDY_ADMIN", "localhost:2019")
+CADDY_ADMIN = os.environ.get("CADDY_ADMIN", "127.0.0.1:2019")
 CADDY_BIN = os.environ.get("CADDY_BIN", "/usr/bin/caddy")
 CADDYFILE = Path(os.environ.get("CADDYFILE", "/etc/caddy/Caddyfile"))
 HELPER_SCRIPT = Path("/etc/s6-overlay/scripts/lib/cert-helpers.sh")

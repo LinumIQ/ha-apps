@@ -2382,8 +2382,8 @@ for c in admin-off admin-other storage; do
     if wait_for "${BOOT_TIMEOUT}" booted; then
         pass "custom-${c}: add-on booted"
         save_fixture "${c}" key
-        check "custom-${c}: the add-on's own setting wins ($(custom_state .state)): admin on localhost:2019, storage /data/caddy, a reload works" eval '
-            admin_up && adapted "(.admin.listen == \"localhost:2019\") and (.storage.root == \"/data/caddy\") and ((.admin.disabled // false) == false)" &&
+        check "custom-${c}: the add-on's own setting wins ($(custom_state .state)): admin on 127.0.0.1:2019, storage /data/caddy, a reload works" eval '
+            admin_up && adapted "(.admin.listen == \"127.0.0.1:2019\") and (.storage.root == \"/data/caddy\") and ((.admin.disabled // false) == false)" &&
             test "$(panel_post /api/clients name=carol)" == "303 http://127.0.0.1:8099${INGRESS_PREFIX}/?ok=Client+%27carol%27+created."'
         check "custom-${c}: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
     else
