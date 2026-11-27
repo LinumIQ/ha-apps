@@ -207,11 +207,19 @@ fi
 # (0600) or removes that file, and prints on/off, the name and the key's
 # length.
 ###############################################################################
+# Fail closed: anything but the expected facts on stdout refuses the start
+# (a feature silently "off" would leave a site without mTLS unprotected).
 HEADER_AUTH_JSON=""
+HEADER_AUTH_ERR="$(mktemp)"
 if ! HEADER_AUTH_JSON="$("${PANEL_PYTHON}" "${HEADERAUTH_PY}" setup \
-        --options /data/options.json --key-file "${HEADER_KEY_FILE}" 2>&1)"; then
-    bashio::exit.nok "${HEADER_AUTH_JSON:-header authentication: the options could not be checked}"
+        --options /data/options.json --key-file "${HEADER_KEY_FILE}" 2>"${HEADER_AUTH_ERR}")" \
+    || ! jq -e '(.enabled | type) == "boolean" and (.name | type) == "string"
+            and (.key_length | type) == "number"' >/dev/null 2>&1 <<<"${HEADER_AUTH_JSON}"; then
+    HEADER_AUTH_MESSAGE="$(head -c 2000 "${HEADER_AUTH_ERR}")"
+    rm -f "${HEADER_AUTH_ERR}"
+    bashio::exit.nok "${HEADER_AUTH_MESSAGE:-header authentication: the options could not be checked}"
 fi
+rm -f "${HEADER_AUTH_ERR}"
 HEADER_AUTH=false
 [[ "$(jq -r '.enabled' <<<"${HEADER_AUTH_JSON}")" == true ]] && HEADER_AUTH=true
 HEADER_AUTH_NAME="$(jq -r '.name' <<<"${HEADER_AUTH_JSON}")"
