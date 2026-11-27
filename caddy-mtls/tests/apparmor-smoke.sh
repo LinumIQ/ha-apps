@@ -179,11 +179,7 @@ check "Caddy listens on 4443 under ${PROFILE}" wait_for 30 lan_listening
 check "header authentication on: key file 0600 (headerauth.py), the list of active certificates written (caddyctl.py)" eval '
     test "$(cexec stat -c %a /etc/caddy/header-auth.key)" == 600 &&
     cexec grep -E "^not vars \{http.request.tls.client.fingerprint\} [0-9a-f]{64} [0-9a-f]{64}$" /etc/caddy/client-fingerprints.caddy >/dev/null'
-printf 'X-Custom-PSK: %s\n' "$(cat "${WORK}/key")" | "${DOCKER}" exec -i "${CTR}" sh -c 'cat > /tmp/h-key'
-gate() { # gate [curl args]: the status of a request to the public site
-    cexec curl -sk --max-time 10 -o /dev/null -w '%{http_code}' --resolve home.example.com:443:127.0.0.1 \
-        "$@" https://home.example.com/gate-check 2>/dev/null || true
-}
+
 # Read from the host: the profile itself does not allow reading AppArmor labels.
 pid1="$("${DOCKER}" inspect -f '{{.State.Pid}}' "${CTR}")"
 check "PID 1 confined by ${PROFILE} (enforce)" \
@@ -224,9 +220,6 @@ code="$(http_code POST /api/upstream/check -H "X-Ingress-Path: ${INGRESS_PREFIX}
 check "Check again answered (got ${code})" test "${code}" == 303
 check "the fake upstream got the test requests (start of the watch + Check again)" \
     test "$(cexec sh -c 'wc -l < /tmp/up/refused.log' 2>/dev/null)" -ge 2
-check "the gate under ${PROFILE}: no certificate/no key 403, the key 200, alice's certificate 200" eval '
-    test "$(gate)" == 403 && test "$(gate -H @/tmp/h-key)" == 200 &&
-    test "$(gate --cert /data/certs/mTLS-client-alice.crt --key /data/certs/mTLS-client-alice.key)" == 200'
 code="$(http_code GET /)"
 check "dashboard renders (got ${code})" test "${code}" == 200
 # The shared LinumIQ UI (stylesheets, a font, the footer logo, the app mark)
@@ -259,10 +252,11 @@ reloaded() { (( $(log_count 'stopped previous server') >= reloads_before + 2 ));
 check "Caddy reloaded twice (forced reload)" wait_for 15 reloaded
 # shellcheck disable=SC2034 # used in eval'd checks
 carol_fp="$(cexec sh -c 'openssl x509 -in /data/certs/mTLS-client-carol.crt -outform DER | sha256sum | cut -d" " -f1')"
-check "the list regenerated before those reloads (carol in it, bob out), carol's certificate passes the gate" eval '
+# shellcheck disable=SC2034 # used in eval'd checks
+bob_fp="$(cexec sh -c 'openssl x509 -in /data/certs/mTLS-client-bob.crt -outform DER | sha256sum | cut -d" " -f1')"
+check "the list regenerated before those reloads (caddyctl.py under ${PROFILE}): carol in it, bob out" eval '
     cexec grep -F "${carol_fp}" /etc/caddy/client-fingerprints.caddy >/dev/null &&
-    test "$(gate --cert /data/certs/mTLS-client-carol.crt --key /data/certs/mTLS-client-carol.key)" == 200 &&
-    test "$(gate --cert /data/certs/mTLS-client-bob.crt --key /data/certs/mTLS-client-bob.key)" == 000'
+    ! cexec grep -F "${bob_fp}" /etc/caddy/client-fingerprints.caddy >/dev/null'
 check "the key is not in the log" eval '! "${DOCKER}" logs "${CTR}" 2>&1 | grep -F -f "${WORK}/key" >/dev/null' 
 check "no 'config is unchanged' (reload was forced)" logs_lack "config is unchanged"
 check "no 'permission denied' in the log" logs_lack "ermission denied"
@@ -282,10 +276,13 @@ stop_container() {
 check "clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_container
 
 # Restart: a new container under the profile with the previous /data, a new
-# client name and a new client_cert_password.
+# client name and a new client_cert_password - and a .localhost domain, so
+# that Caddy's internal issuer gives it a certificate at once and the
+# header-authentication gate answers HTTPS requests (no upstream: 502 = let
+# through, 403 = refused by the gate, 000 = refused in the handshake).
 "${DOCKER}" cp "${CTR}:/data" - >"${WORK}/data.tar"
-sed -e 's/"client_names": \["alice", "bob"\]/"client_names": ["alice", "bob", "dave"]/' \
-    -e 's/"aa-smoke-password"/"aa-smoke-password-2"/' "${WORK}/data/options.json" >"${WORK}/options.json"
+jq '.client_names += ["dave"] | .client_cert_password = "aa-smoke-password-2" | .domain = "caddy-mtls-aa.localhost"' \
+    "${WORK}/data/options.json" >"${WORK}/options.json"
 mv "${WORK}/options.json" "${WORK}/data/options.json"
 cp "${WORK}/data/options.json" "${WORK}/tmp/.bashio/addons.self.options.config.cache"
 chmod -R go+rX "${WORK}"
@@ -305,6 +302,19 @@ check "restart: dave (new in client_names) issued" \
     test "$(state '.clients[] | select(.name == "dave") | .status')" == active
 check "restart: .p12 bundles re-encrypted with the new password" \
     logs_contain "Re-encrypted the .p12 bundle of client 'alice'"
+printf 'X-Custom-PSK: %s\n' "$(cat "${WORK}/key")" | "${DOCKER}" exec -i "${CTR}" sh -c 'cat > /tmp/h-key'
+gate() { # gate [curl args]: the status of a request to the public site
+    cexec curl -sk --max-time 10 -o /dev/null -w '%{http_code}' --resolve caddy-mtls-aa.localhost:443:127.0.0.1 \
+        "$@" https://caddy-mtls-aa.localhost/gate-check 2>/dev/null || true
+}
+gate_up() { [[ "$(gate --http1.1)" == 403 ]]; }
+check "restart: the gate under ${PROFILE}: no certificate/no key 403" wait_for 60 gate_up
+check "restart: the gate: the key passes (502: no upstream), alice and carol pass, revoked bob fails in the handshake" eval '
+    test "$(gate -H @/tmp/h-key)" == 502 &&
+    test "$(gate --cert /data/certs/mTLS-client-alice.crt --key /data/certs/mTLS-client-alice.key)" == 502 &&
+    test "$(gate --cert /data/certs/mTLS-client-carol.crt --key /data/certs/mTLS-client-carol.key)" == 502 &&
+    test "$(gate --cert /data/certs/mTLS-client-bob.crt --key /data/certs/mTLS-client-bob.key)" == 000'
+check "restart: the key is not in the log" eval '! "${DOCKER}" logs "${CTR}" 2>&1 | grep -F -f "${WORK}/key" >/dev/null'
 check "restart: no 'permission denied' in the log" logs_lack "ermission denied"
 check "restart: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_container
 sleep 1
