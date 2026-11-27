@@ -483,13 +483,13 @@ every client. **Switching it off:** empty `header_auth_key` and restart.
   absent`, `refused: no certificate, header present with a wrong value` or
   `refused: certificate not in the active list` (without mTLS: `refused:
   header absent` / `refused: header present with a wrong value`).
-- The key is kept in the add-on's options - by the Supervisor, and included
-  in backups of the add-on, like `client_cert_password` and `dns_api_token`
-  - and, while the add-on runs, inside its container (in the option cache of
-  the add-on's scripts, and in a file with mode 0600 that Caddy reads per
-  request). It is not in the generated
-  Caddyfile, Caddy's saved configuration, the log, the web interface (which
-  shows only its length) or a notification.
+- The key is kept in the add-on's options (by the Supervisor, and included
+  in backups of the add-on, like `client_cert_password` and
+  `dns_api_token`) and, while the add-on runs, inside its container (in the
+  option cache of the add-on's scripts, and in a file with mode 0600 that
+  Caddy reads per request). It is not in the generated Caddyfile, Caddy's
+  saved configuration, the log, the web interface (which shows only its
+  length) or a notification.
 
 ### Visitors without a certificate, browsers
 
