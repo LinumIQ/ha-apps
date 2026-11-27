@@ -11,6 +11,7 @@ A Home Assistant add-on that provides a Caddy reverse proxy with mutual TLS (mTL
 - 🔐 **mTLS Authentication** - Require client certificates for access
 - 📱 **Easy Distribution** - certificate downloads in the add-on's web interface (Home Assistant sidebar, administrators only)
 - 🚦 **Certificate status** - the web interface shows whether the Let's Encrypt certificate exists, and if not, the last error and what to check in the router; a Home Assistant notification while it is missing
+- 🔁 **No Home Assistant configuration needed** - the add-on asks Home Assistant whether it trusts it as a reverse proxy and adapts (option `forwarded_headers`); the web interface shows whether Home Assistant sees the visitors' own addresses and how to turn that on
 - 🌐 **DNS Challenge Support** - Cloudflare, Route53, and Hetzner for when port 80 is unavailable
 - 👥 **Multiple Users** - Generate individual certificates for each user/device
 - 🏠 **Home Assistant Native** - Full integration with HA add-on system
@@ -28,6 +29,11 @@ A Home Assistant add-on that provides a Caddy reverse proxy with mutual TLS (mTL
    ```
 4. **Start** the add-on
 5. **Download** client certificates from the add-on web interface
+6. Optional: let Home Assistant see each visitor's own address - the card
+   **Home Assistant connection** in the web interface shows the steps
+   (Settings > System > Network > HTTP server > Reverse proxy). Without it the
+   add-on still works; Home Assistant then sees every visitor under the
+   add-on's address. See [DOCS.md](DOCS.md#home-assistant-core-configuration).
 
 ## Configuration
 
@@ -63,6 +69,10 @@ dns_api_token: ""
 # Logging: Caddy's access log (one line per request) is off by default
 log_level: info
 access_log: false
+
+# Visitor addresses for Home Assistant (X-Forwarded-For): auto passes them on
+# when Home Assistant trusts the add-on, otherwise (with mTLS) removes them
+forwarded_headers: auto # or: always, never
 ```
 
 ## Network Requirements

@@ -13,6 +13,7 @@ This add-on provides a Caddy reverse proxy with mutual TLS (mTLS) authentication
 - ♻️ **Certificate Revocation List (CRL)** - revoked clients are rejected on the next handshake without restarts
 - 📅 **Expiration Notifications** - per-cert sensors and persistent notifications as expiry approaches
 - 🚦 **Public certificate status** - the web UI shows whether the Let's Encrypt certificate exists; if not, the last error and a port-forwarding checklist (plus a Home Assistant notification)
+- 🔁 **Works without editing Home Assistant** (since 2.2.0) - the add-on asks Home Assistant whether it trusts it as a reverse proxy and adapts; the web UI shows what Home Assistant sees and how to pass real visitor addresses on
 
 ## Requirements
 
@@ -70,38 +71,113 @@ port 80:
 1. Add this repository to your Home Assistant add-on store
 2. Install the "Caddy mTLS Proxy" add-on
 3. Configure the required options (see Configuration section)
-4. **Add the add-on to Home Assistant Core's trusted reverse proxies**
-   (see [Home Assistant Core Configuration](#home-assistant-core-configuration)
-   below) - without this, requests proxied through this add-on will be
-   rejected with `400 Bad Request` by Home Assistant Core.
-5. Start the add-on
+4. Start the add-on
+5. Open the add-on's web interface (Home Assistant sidebar): the card
+   **Home Assistant connection** shows whether Home Assistant gets the
+   visitors' own addresses, and how to change that (see
+   [Home Assistant Core Configuration](#home-assistant-core-configuration)).
+   Until 2.1.x this step was a requirement: without it, every request was
+   answered `400: Bad Request`. Since 2.2.0 the add-on works without it.
 
 ## Home Assistant Core Configuration
 
-Because this add-on terminates TLS and forwards requests to Home Assistant
-Core, you must tell Home Assistant Core to trust the add-on as a reverse
-proxy. Otherwise Home Assistant rejects the forwarded requests with
-`400 Bad Request` (and silently logs `Received X-Forwarded-For header from
-untrusted proxy`).
+The add-on forwards each request to Home Assistant. A reverse proxy normally
+adds the visitor's address to the request (the header `X-Forwarded-For`), so
+that Home Assistant can show and check the real address. Home Assistant
+accepts that header **only from a proxy it trusts**; from any other proxy it
+answers every request with **`400: Bad Request`** and writes a line such as
+`A request from a reverse proxy was received from 172.30.33.3, but your HTTP
+integration is not set-up for reverse proxies` into its log.
 
-Add the following to `/config/configuration.yaml` (the file is editable
-via the **File editor**, **Studio Code Server**, or **Samba** add-ons) and
-restart Home Assistant Core:
+### What the add-on does (option `forwarded_headers`, since 2.2.0)
+
+| `forwarded_headers` | Visitor addresses | Home Assistant needs to trust the add-on |
+| ------------------- | ----------------- | ---------------------------------------- |
+| `auto` (default)    | passed on if Home Assistant trusts the add-on; otherwise (with mTLS) removed | no |
+| `always`            | always passed on  | yes - otherwise every request is answered `400: Bad Request` |
+| `never`             | never passed on   | no |
+
+With `auto`, the add-on asks Home Assistant at every start whether it
+accepts forwarded requests from the add-on (a request with and one without
+the header):
+
+- **Home Assistant trusts the add-on**: visitor addresses are passed on.
+  Home Assistant sees each visitor's own address (logins, notifications,
+  "local network only" users, IP bans work per visitor).
+- **Home Assistant does not trust the add-on, mTLS on** (the default): the
+  add-on removes the forwarding headers. It works, and **Home Assistant sees
+  every visitor under the add-on's own address** (for example
+  `172.30.33.3`). Every visitor has a client certificate, so this is an
+  acceptable default, but it has consequences, which the web interface
+  lists:
+  - Logins, the "Login attempt failed" notifications and Home Assistant's
+    logs show the add-on's address instead of the visitor's.
+  - Home Assistant counts that address as a device in your local network:
+    users marked **Can only log in from the local network** can log in, and
+    webhooks marked **Only accessible from the local network** accept
+    requests, from every device with a client certificate.
+  - If you set a limit of login attempts (IP banning), too many failed
+    logins ban the add-on's address - that is everyone who uses the add-on -
+    until you delete it from `ip_bans.yaml` and restart Home Assistant.
+  - If you use the trusted networks login provider and its networks include
+    the add-on's address, every device with a client certificate logs in
+    without a password.
+- **Home Assistant does not trust the add-on, mTLS off**: the addresses are
+  still passed on, so every request is answered `400: Bad Request`. Without
+  client certificates the visitors are anyone on the internet; they must
+  never look like a device in your local network. The web interface and a
+  Home Assistant notification say what to do.
+- **Home Assistant does not answer** (for example while it starts - at boot
+  the add-on starts before Home Assistant): the add-on keeps the last known
+  mode and decides as soon as Home Assistant answers.
+
+The add-on keeps watching: when Home Assistant restarts (which is how a
+changed HTTP setting takes effect), the add-on asks again and switches
+without a restart of its own (Caddy reloads its configuration; open
+websocket connections, for example of the Home Assistant app, reconnect).
+While Home Assistant trusts the add-on it asks once a minute, which Home
+Assistant does not log. While Home Assistant does not trust it, the add-on
+asks only at its start, after a Home Assistant restart and when you select
+**Check again** - **each of these questions writes one line into Home
+Assistant's log** (the one quoted above).
+
+### Passing the real visitor addresses on (recommended)
+
+Let Home Assistant trust the add-on as a reverse proxy. **Home Assistant
+2026.7 and later** keep these settings in the user interface:
+
+1. In Home Assistant, open **Settings > System > Network**.
+2. In the **HTTP server** card, open **Reverse proxy**, turn on **Trust
+   X-Forwarded-For** and add `172.30.33.0/24` to **Trusted proxies** (the
+   network of the add-ons on Home Assistant OS; the add-on's web interface
+   shows the exact value for your installation).
+3. Select **Save**, then **Save and restart**.
+4. When Home Assistant is back, select **Confirm** in the dialog **Confirm
+   new HTTP server configuration** within 5 minutes. Otherwise Home
+   Assistant restores the previous settings and restarts again.
+
+The add-on notices the restart and switches to passing the addresses on; or
+select **Check again** in its web interface.
+
+> **Home Assistant 2026.7 and later read the `http:` block of
+> `configuration.yaml` only once**: at the first start of 2026.7 or later
+> they import it (as a change to confirm within 5 minutes) and from then on
+> ignore it - a block added later only brings the repair "HTTP YAML
+> configuration is ignored after migration". Use the steps above.
+
+**Home Assistant before 2026.7**: add this to `/config/configuration.yaml`
+(merge it into an existing `http:` section) and restart Home Assistant:
 
 ```yaml
 http:
   use_x_forwarded_for: true
   trusted_proxies:
-    # Supervisor's internal Docker network. Covers this add-on regardless
-    # of which IP the Supervisor assigns to it on each restart.
-    - 172.30.32.0/23
+    - 172.30.33.0/24
 ```
 
-If you already have an `http:` section, merge the two keys into it
-instead of duplicating the section. The exact container IP of this
-add-on is also printed in the add-on log on every start, in case you
-prefer to whitelist a specific address instead of the whole Supervisor
-network.
+Up to 2.1.x this documentation suggested `172.30.32.0/23` (Supervisor's
+whole network, which includes `172.30.33.0/24`); an existing entry with that
+network works as well.
 
 ## Configuration
 
@@ -123,6 +199,7 @@ network.
 | `client_cert_password`      | `LinumIQ`        | Password for .p12 files - set your own; changing it re-encrypts the existing bundles at the next start (see [Changing the certificate password](#changing-the-certificate-password)) |
 | `log_level`                 | `info`           | Add-on / Caddy log verbosity (`trace`, `debug`, `info`, `notice`, `warning`, `error`, `fatal`); `debug` and `trace` also turn the access logs on |
 | `access_log`                | `false`          | Log every proxied request (Caddy's access log, ~1.5 KB per request); see [Logs](#logs)                                  |
+| `forwarded_headers`         | `auto`           | Whether Home Assistant gets each visitor's own address (`auto`, `always`, `never`); see [Home Assistant Core Configuration](#home-assistant-core-configuration) |
 | `cert_expiry_warn_days`     | `[30, 14, 7, 1]` | List of days-before-expiry thresholds at which to fire a notification (one notification per crossed threshold per cert) |
 | `cert_check_interval_hours` | `6`              | How often the `cert-monitor` service polls certificate metadata and publishes sensor states (`1`-`168`)                 |
 
@@ -342,6 +419,13 @@ the Supervisor ingress IP):
 
 - **Public certificate** - the card described in
   [Public certificate status](#public-certificate-status-since-201).
+- **Home Assistant connection** (since 2.2.0) - whether Home Assistant
+  accepts this add-on as a reverse proxy and sees each visitor's address,
+  or sees every visitor as the add-on (and what that means), or answers
+  every request `400: Bad Request` (red, also a Home Assistant
+  notification), or does not answer at all; with the steps to change it and
+  **Check again**. See
+  [Home Assistant Core Configuration](#home-assistant-core-configuration).
 
 - **Add a client** - issues a new client certificate, adds it to the
   active allowlist and reloads Caddy in-place. A name has 1-64 characters
@@ -439,6 +523,19 @@ most once - rotating the certificate (which changes its serial) resets
 the state.
 
 ## Troubleshooting
+
+### "400: Bad Request"
+
+A bare page with `400: Bad Request` (after selecting the client certificate)
+comes from Home Assistant, not from the add-on: Home Assistant received the
+visitor's address from a proxy it does not trust. Open the add-on's web
+interface: the card **Home Assistant connection** is red and says why -
+`forwarded_headers: always`, or mTLS is off (then the add-on never hides the
+visitor addresses). Let Home Assistant trust the add-on (see
+[Passing the real visitor addresses on](#passing-the-real-visitor-addresses-on-recommended)),
+or with mTLS on set `forwarded_headers` to `auto`. Up to 2.1.x this was the
+answer to every request until Home Assistant trusted the add-on; since 2.2.0
+`forwarded_headers: auto` avoids it.
 
 ### No public certificate / "not reachable over HTTPS"
 
@@ -548,8 +645,18 @@ The image can be started without Supervisor (this is what the smoke tests in
   `CERT_MONITOR_PUBLIC_CERT_GRACE_SECONDS` (default 120) and
   `CERT_MONITOR_FAST_INTERVAL_SECONDS` (default 60) shorten the public
   certificate notification's delay and check interval for the tests.
+- `CADDY_MTLS_UPSTREAM_CONTROL_SECONDS` (default 12) and
+  `CADDY_MTLS_UPSTREAM_TEST_SECONDS` (default 60) (environment variables,
+  test-only): how often the monitor watches Home Assistant (a request without
+  forwarding headers, which Home Assistant does not log) and, while Home
+  Assistant trusts the add-on under `forwarded_headers: auto`, how often it
+  repeats the test request.
+- Without the Supervisor API the add-on reaches `homeassistant:8123`
+  (`upstream_port` unset) only where a host of that name exists; the tests
+  set `upstream_host`/`upstream_port` or provide the name.
 
-Tests (both need docker; run them against an image built from this directory):
+Tests (all but the unit tests need docker; run them against an image built
+from this directory):
 
 ```sh
 docker build --build-arg BUILD_FROM=ghcr.io/hassio-addons/base:21.0.11 \
@@ -557,6 +664,8 @@ docker build --build-arg BUILD_FROM=ghcr.io/hassio-addons/base:21.0.11 \
 caddy-mtls/tests/smoke.sh caddy-mtls-test
 caddy-mtls/tests/apparmor-smoke.sh caddy-mtls-test caddy-mtls/apparmor.txt
 python3 -m unittest discover -s caddy-mtls/tests/unit -v
+# not in CI (pulls Home Assistant Core, about 2 GB; about 10 minutes):
+caddy-mtls/tests/real-core.sh caddy-mtls-test [ghcr.io/linumiq/amd64-addon-caddy-mtls:2.1.3]
 ```
 
 - `tests/smoke.sh <image>` boots the image several times with
@@ -571,7 +680,17 @@ python3 -m unittest discover -s caddy-mtls/tests/unit -v
   access log by default, silent health probes, `access_log: true`), the
   "Public certificate" card in all states and its notification at a fake
   Supervisor, clean stops (< 10 s, exit code 0, no s6 warnings) and a Caddy
-  crash (the add-on ends with exit code 137).
+  crash (the add-on ends with exit code 137). For `forwarded_headers` it
+  runs a fake Home Assistant (`tests/fake-upstream.py`: refuses
+  `X-Forwarded-For` with `400: Bad Request` unless told to trust the proxy,
+  echoes the request headers otherwise) in a container whose network
+  namespace the add-on shares: the start probe, the headers that arrive in
+  each mode (spoofed client headers included), the switch at run time in
+  both directions (after a "restart" of the fake and by the periodic test),
+  the number of refused requests (= Home Assistant log lines) per phase,
+  "Check again", the card in every state, the notification, the last known
+  mode while the upstream is down, `always`, `never` and `auto` without
+  mTLS.
   Prints PASS/FAIL per check; exit 0 = all passed, 1 = a check failed,
   2 = usage error.
 - `tests/apparmor-smoke.sh <image> <apparmor.txt>` (needs root or sudo and an
@@ -583,7 +702,26 @@ python3 -m unittest discover -s caddy-mtls/tests/unit -v
 - `tests/unit/` (standard library only, also run by CI): the expiry
   monitor's entity ids and notification thresholds, the public certificate
   state (Caddy's log events, storage, checklist) and the notification's
-  state machine with a mocked Supervisor.
+  state machine with a mocked Supervisor; the forwarding headers
+  (`upstream.py`: the probe's classification against a fake Home Assistant
+  on 127.0.0.1, the decision for every combination of option, mTLS and the
+  last result, the snippet, the state file, the trusted-proxy suggestion,
+  the monitor's cadence and noise rules over a simulated day, the
+  notification); the panel's templates (with Jinja2, inside the image).
+- `tests/real-core.sh <image> [<2.1.x image>]` (not in CI) runs Home
+  Assistant Core 2026.11.3 on an `--internal` Docker network as
+  `homeassistant:8123`, onboards a test user and checks against it: 2.1.x
+  answered `400: Bad Request`; `always` is red with a notification; `auto`
+  loads the page through the mTLS port with the add-on's address in Core's
+  log; an `http:` block in `configuration.yaml` is ignored by Core (repair
+  "yaml_still_present_after_migration"); the reverse-proxy settings set
+  through Core's own API (what **Settings > System > Network > HTTP server**
+  does) make the running add-on switch to passing addresses on, with the
+  client's real address in Core's log; removing them switches back; the
+  websocket (`/api/websocket`) works through the proxy in both modes. It
+  counts the lines that each phase writes into Core's log.
+  `REALCORE_PREFIX`, `REALCORE_SUBNET` and `REALCORE_EVIDENCE` set the name
+  prefix, the test network and a directory for the logs.
 
 ## Maintainers: Python dependencies
 

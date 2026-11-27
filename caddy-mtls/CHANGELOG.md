@@ -5,6 +5,72 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-11-27
+
+### Fixed
+
+- **"400: Bad Request" after selecting the client certificate.** Home
+  Assistant answers every request that carries the visitor's address
+  (`X-Forwarded-For`) with `400: Bad Request` unless it trusts the proxy -
+  and the add-on always sent that header. A freshly configured add-on
+  therefore showed a bare "400: Bad Request"; the explanation was only in
+  the logs. Now the add-on asks Home Assistant at its start whether it
+  accepts forwarded requests from the add-on (new option
+  `forwarded_headers`, default `auto`):
+  - Home Assistant trusts the add-on: visitor addresses are passed on, as
+    before.
+  - It does not, and mTLS is on (the default): the add-on removes the
+    forwarding headers (`X-Forwarded-For`, `-Proto`, `-Host`, `X-Real-IP`,
+    `Forwarded`). It works without any change in Home Assistant, which then
+    sees every visitor under the add-on's own address (for example
+    `172.30.33.3`); the web interface lists what that means (logins and
+    notifications show that address; "local network only" users and
+    webhooks also work for holders of a client certificate; IP bans after
+    failed logins would hit everyone).
+  - It does not, and mTLS is off: the addresses are still passed on (without
+    client certificates no internet visitor may look like a local device),
+    so the 400 stays - now explained in the web interface and in a Home
+    Assistant notification.
+  - `always` passes the addresses on as up to 2.1.3; `never` never does.
+- The add-on keeps watching Home Assistant (a request every 12 seconds that
+  Home Assistant does not log) and switches at run time, without a restart
+  of its own, when Home Assistant restarts with changed settings: the
+  header lines of the proxy live in an imported file that is rewritten,
+  then Caddy reloads (open websocket connections reconnect). While Home
+  Assistant trusts the add-on, the check repeats once a minute; while it
+  does not, only at the start, after a Home Assistant restart and on
+  **Check again** - each refused check writes one line into Home
+  Assistant's log.
+
+### Added
+
+- Web interface: a card **Home Assistant connection** - green while visitor
+  addresses are passed on, blue while Home Assistant sees every visitor as
+  the add-on (with the consequences), red while every request is answered
+  400 or Home Assistant does not answer - with the steps to let Home
+  Assistant trust the add-on and a **Check again** button.
+- A Home Assistant notification "Caddy mTLS: Home Assistant refuses the
+  proxied requests" while every request is answered 400; it is dismissed
+  when that is over.
+- `tests/real-core.sh`: checks the behaviour against a real Home Assistant
+  Core 2026.11.3 (not part of CI).
+
+### Changed
+
+- The steps for Home Assistant name its user interface: **Settings > System
+  > Network > HTTP server > Reverse proxy** (Trust X-Forwarded-For, trusted
+  proxy `172.30.33.0/24`, Save and restart, then confirm). Home Assistant
+  2026.7 and later read the `http:` block of `configuration.yaml` only once
+  and ignore a block added later; the documentation's block (now with
+  `172.30.33.0/24`, the add-on network Home Assistant's own documentation
+  uses) is for older versions.
+- The log no longer prints the `http:` block at every start: one line while
+  addresses are passed on, a short notice while Home Assistant sees every
+  visitor as the add-on, the full block only while every request is
+  answered 400.
+- Installation step 4 (adding the add-on to Home Assistant's trusted
+  proxies) is no longer required.
+
 ## [2.1.3] - 2026-11-24
 
 Security update. Nothing changes in the configuration, the certificates or

@@ -1,0 +1,166 @@
+{#- "Home Assistant connection" card: rendered into index.html and alone by
+    GET upstream, which the dashboard fetches every 30 s. hc: app.py
+    upstream_context (card state, upstream.Settings, upstream.State, texts). -#}
+{%- set labels = {
+  "accepted": "Connected",
+  "strip": "Connected - addresses hidden",
+  "broken": "Refused (400)",
+  "never": "Addresses not passed on",
+  "unreachable": "Unreachable",
+  "unknown": "Not checked yet",
+} -%}
+{%- set badges = {
+  "accepted": "success",
+  "strip": "info",
+  "broken": "danger",
+  "never": "info",
+  "unreachable": "danger",
+  "unknown": "info",
+} -%}
+{%- set s = hc.settings -%}
+{%- set st = hc.state -%}
+<section
+  class="card hc hc--{{ hc.card }}"
+  id="upstream"
+  aria-labelledby="hc-heading"
+  aria-live="polite"
+  data-state="{{ hc.card }}"
+  data-mode="{{ st.mode if st else '' }}"
+>
+  <div class="card__header">
+    <h2 class="card__title" id="hc-heading">
+      {%- if s and not s.is_home_assistant %}Upstream connection{% else %}Home Assistant connection{% endif -%}
+    </h2>
+    <span class="status status--{{ badges[hc.card] }} hc-badge--{{ hc.card }}">{{ labels[hc.card] }}</span>
+  </div>
+
+  {% if not s %}
+  <p class="hc__lead">
+    The connection state is not available yet: the app is still starting.
+  </p>
+  {% else %}
+  {% set Name = hc.name[:1] | upper ~ hc.name[1:] %}
+
+  {% if hc.card == "accepted" %}
+  <p class="hc__lead">
+    {{ Name }} accepts this add-on as a reverse proxy: visitor addresses are
+    passed on, so {{ hc.name }} sees each visitor's own address.
+  </p>
+
+  {% elif hc.card == "strip" %}
+  <p class="hc__lead">
+    <strong>It works</strong>, and {{ hc.name }} sees every visitor as
+    <code>{{ hc.source }}</code>. {{ Name }} does not trust this add-on as a
+    reverse proxy, so the add-on does not pass visitor addresses on
+    (<code>forwarded_headers: auto</code> with mTLS: every visitor has a
+    client certificate).
+  </p>
+  <p class="hc__note"><strong>What this means:</strong></p>
+  <ul class="hc__list">
+    {% for item in hc.consequences %}
+    <li>{{ item }}</li>
+    {% endfor %}
+  </ul>
+  <p class="hc__note"><strong>To pass the real visitor addresses on instead:</strong></p>
+  {% include "_upstream_steps.html" %}
+
+  {% elif hc.card == "broken" %}
+  <p class="hc__lead">
+    <strong>Every request is answered "400: Bad Request"</strong> by
+    {{ hc.name }}: the add-on passes the visitor's address on
+    (X-Forwarded-For), but {{ hc.name }} does not trust this add-on
+    (<code>{{ hc.source }}</code>) as a reverse proxy.
+    {% if s.option == "always" %}The add-on passes the addresses on because
+    <code>forwarded_headers</code> is <code>always</code>.
+    {% else %}The add-on never hides the visitor addresses while mTLS is off
+    (<code>mtls_enabled: false</code>): every visitor from the internet would
+    then look like a device in your local network.{% endif %}
+  </p>
+  <p class="hc__note"><strong>To fix it:</strong></p>
+  {% include "_upstream_steps.html" %}
+  {% if s.mtls %}
+  <p class="hc__note">
+    Or set the app option <code>forwarded_headers</code> to
+    <code>auto</code> (or <code>never</code>): {{ hc.name }} then sees every
+    visitor as <code>{{ hc.source }}</code>, with these consequences:
+  </p>
+  <ul class="hc__list">
+    {% for item in hc.consequences %}
+    <li>{{ item }}</li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="hc__note">
+    <code>forwarded_headers: never</code> would also stop the 400, but
+    without mTLS {{ hc.name }} would then treat <strong>everyone on the
+    internet</strong> as a device in your local network (users who may only
+    log in from the local network, local-only webhooks, trusted networks).
+    Not recommended.
+  </p>
+  {% endif %}
+
+  {% elif hc.card == "never" %}
+  <p class="hc__lead">
+    Visitor addresses are not passed on (<code>forwarded_headers: never</code>
+    in the app's configuration): {{ hc.name }} sees every visitor as
+    <code>{{ hc.source }}</code>.
+    {% if st and st.decisive == "accepted" %}{{ Name }} would accept them:
+    with <code>forwarded_headers: auto</code> the add-on passes them on.{% endif %}
+  </p>
+  <ul class="hc__list">
+    {% for item in hc.consequences %}
+    <li>{{ item }}</li>
+    {% endfor %}
+    {% if not s.mtls %}
+    <li><strong>mTLS is off:</strong> this applies to everyone on the
+    internet, not only to holders of a client certificate.</li>
+    {% endif %}
+  </ul>
+
+  {% elif hc.card == "unreachable" %}
+  <p class="hc__lead">
+    <strong>The upstream <code>{{ s.target }}</code> does not answer</strong>
+    ({{ st.error or "no answer" }}), so visitors get "502 Bad Gateway".
+    While Home Assistant starts or restarts this is normal: the add-on asks
+    every few seconds and decides about the forwarding headers as soon as it
+    answers (until then: mode <code>{{ st.mode }}</code>, the last known).
+  </p>
+
+  {% else %}
+  <p class="hc__lead">
+    Not checked yet: the add-on asks {{ hc.name }} in a few seconds.
+  </p>
+  {% endif %}
+
+  <dl class="meta-list hc__facts">
+    <div class="meta-list__row">
+      <dt class="meta-list__label">Upstream</dt>
+      <dd class="meta-list__value"><code>{{ s.target }}</code></dd>
+    </div>
+    <div class="meta-list__row">
+      <dt class="meta-list__label">forwarded_headers</dt>
+      <dd class="meta-list__value">
+        <code>{{ s.option }}</code> - visitor addresses
+        {% if st and st.mode == "strip" %}removed{% else %}passed on{% endif %}
+        {% if st and not st.applied %}(reloading Caddy failed; the add-on retries){% endif %}
+      </dd>
+    </div>
+    {% if st and st.checked_at %}
+    <div class="meta-list__row">
+      <dt class="meta-list__label">Last check</dt>
+      <dd class="meta-list__value">
+        {{ hc.time(st.checked_at) }}: {{ st.decisive or "-" }}
+      </dd>
+    </div>
+    {% endif %}
+  </dl>
+
+  <form method="post" action="api/upstream/check" class="hc__check">
+    <button class="btn" type="submit">Check again</button>
+    <span class="hc__check-hint">
+      Asks {{ hc.name }} now{% if s.is_home_assistant %} (if it refuses, its
+      log gets one line){% endif %}.
+    </span>
+  </form>
+  {% endif %}
+</section>

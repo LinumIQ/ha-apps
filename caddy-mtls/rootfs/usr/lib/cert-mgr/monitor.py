@@ -18,6 +18,16 @@ raises a persistent notification with the last ACME error and a port
 forwarding checklist, and dismisses it as soon as the certificate exists. The
 add-on log gets one line per change of that state.
 
+It watches the upstream (upstream.py) as well: a control request every
+UPSTREAM_CONTROL_INTERVAL seconds on a kept-alive connection; when the
+upstream answers again after it was unreachable or restarted, the test
+request (does it accept forwarded requests?), which switches the forwarding
+mode at run time. Under forwarded_headers: auto in mode pass the test runs
+every UPSTREAM_TEST_INTERVAL seconds instead (Home Assistant logs nothing
+while it trusts the add-on). While every request is answered "400: Bad
+Request" (refused, mode pass) a persistent notification is raised; it is
+dismissed when that is over.
+
 Failure to reach the Supervisor never crashes the loop - we log and try
 again on the next iteration.
 
@@ -43,6 +53,7 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 
 import public_cert
+import upstream
 
 LOG = logging.getLogger("cert-monitor")
 logging.basicConfig(
@@ -68,6 +79,13 @@ PUBLIC_CERT_FAST_INTERVAL = int(os.environ.get("CERT_MONITOR_FAST_INTERVAL_SECON
 PUBLIC_CERT_GRACE_SECONDS = int(os.environ.get("CERT_MONITOR_PUBLIC_CERT_GRACE_SECONDS", "120"))
 FAST_LANE_SECONDS = int(os.environ.get("CERT_MONITOR_FAST_LANE_SECONDS", "1800"))
 PUBLIC_CERT_NOTIFICATION_ID = "caddy_mtls_public_certificate"
+
+# Upstream watch (upstream.py): the control request's interval, the test
+# request's interval in mode pass under auto, the notification of the state
+# "every request is answered 400". (Overridable for tests only.)
+UPSTREAM_CONTROL_INTERVAL = float(os.environ.get("CADDY_MTLS_UPSTREAM_CONTROL_SECONDS", "12"))
+UPSTREAM_TEST_INTERVAL = float(os.environ.get("CADDY_MTLS_UPSTREAM_TEST_SECONDS", "60"))
+UPSTREAM_NOTIFICATION_ID = "caddy_mtls_upstream_refuses"
 
 # Tracks which (cert_id, threshold_days) pairs we've already notified for
 # in the current state, so we don't spam HA on every loop iteration.
@@ -405,6 +423,154 @@ class PublicCertWatch:
         return INTERVAL_SECONDS
 
 
+def upstream_notification(settings: upstream.Settings, state: upstream.State) -> tuple[str, str]:
+    """Title and Markdown text of the "every request is answered 400"
+    notification."""
+    name = upstream.upstream_name(settings)
+    source = state.source_address or "this add-on"
+    suggestion = upstream.trusted_proxy_suggestion(state.source_address)
+    title = (
+        "Caddy mTLS: Home Assistant refuses the proxied requests"
+        if settings.is_home_assistant
+        else "Caddy mTLS: the upstream refuses the proxied requests"
+    )
+    why = (
+        "forwarded_headers is `always`"
+        if settings.option == "always"
+        else "mTLS is off (`mtls_enabled: false`), so the add-on never hides the visitor "
+        "addresses: every internet visitor would look like a local device"
+    )
+    lines = [
+        f'Every request through **{settings.domain}** is answered "400: Bad Request": '
+        f"{name} does not trust this add-on ({source}) as a reverse proxy, and the add-on "
+        f"passes the visitor addresses on ({why}).",
+        "",
+        "To fix it:",
+    ]
+    lines += [f"{n}. {step}" for n, step in enumerate(upstream.fix_steps(settings, suggestion), 1)]
+    if settings.is_home_assistant:
+        lines += [
+            "",
+            "Home Assistant before 2026.7: add this to `configuration.yaml` instead and "
+            "restart Home Assistant:",
+            "",
+            "```yaml",
+            upstream.yaml_block(suggestion).rstrip("\n"),
+            "```",
+        ]
+    if settings.option == "always" and settings.mtls:
+        lines += [
+            "",
+            f"Or set the app option `forwarded_headers` to `auto`: {name} then sees every "
+            f"visitor as {source}.",
+        ]
+    lines += [
+        "",
+        "The app's web interface (Caddy mTLS, card \"Home Assistant connection\") shows the "
+        "details and checks again.",
+    ]
+    return title, "\n".join(lines)
+
+
+_CARD_LOG = {
+    "accepted": (logging.INFO, "{name} accepts this add-on ({source}) as a reverse proxy: visitor addresses are passed on (mode pass)."),
+    "strip": (logging.WARNING, "{name} does not trust this add-on ({source}) as a reverse proxy: the forwarding headers are removed (mode strip), {name} sees every visitor as {source}."),
+    "broken": (logging.WARNING, "{name} answers every request with 400 Bad Request: it does not trust this add-on ({source}) as a reverse proxy (see the web interface)."),
+    "never": (logging.INFO, "forwarded_headers: never - visitor addresses are not passed on."),
+    "unreachable": (logging.WARNING, "The upstream {target} does not answer ({error}): visitors get 502 Bad Gateway."),
+}
+
+
+class UpstreamWatch:
+    """The monitor's side of upstream.py: picks the request (control on the
+    kept-alive channel, or the periodic test under auto in mode pass), logs
+    one line per change of the card state, raises the notification while
+    every request is answered 400 (refused, mode pass) and dismisses it when
+    that is over (also once after a start, for a notification of a previous
+    run)."""
+
+    def __init__(self, started: float, reload: upstream.Reload | None = upstream.caddy_reload) -> None:
+        self.reload = reload
+        self.channel: upstream.ControlChannel | None = None
+        self.card: str | None = None
+        self.next_test = started + UPSTREAM_TEST_INTERVAL
+        self._raised = False
+        self._dismiss_pending = True
+
+    def tick(self, now: float) -> float:
+        """One look; returns the seconds until the next one."""
+        settings = upstream.Settings.load()
+        if settings is None:
+            return UPSTREAM_CONTROL_INTERVAL
+        if self.channel is None or self.channel.settings != settings:
+            if self.channel is not None:
+                self.channel.close()
+            self.channel = upstream.ControlChannel(settings)
+        state = upstream.load_state(settings)
+        if state is not None and not state.applied:
+            outcome = upstream.retry_apply(settings, reload=self.reload)
+        elif self._periodic(settings, state):
+            # The kept-alive connection would idle; a test request every
+            # minute watches the upstream (and logs nothing in Home
+            # Assistant while it trusts the add-on).
+            self.channel.close()
+            if now < self.next_test:
+                return self.next_test - now
+            outcome = upstream.check(settings, test=True, reload=self.reload)
+            self.next_test = now + UPSTREAM_TEST_INTERVAL
+        else:
+            outcome = upstream.watch_once(settings, self.channel, reload=self.reload)
+            self.next_test = now + UPSTREAM_TEST_INTERVAL
+        self._report(settings, outcome)
+        if self._periodic(settings, outcome.state):
+            return max(1.0, self.next_test - now)
+        return UPSTREAM_CONTROL_INTERVAL
+
+    @staticmethod
+    def _periodic(settings: upstream.Settings, state: upstream.State | None) -> bool:
+        return (
+            settings.option == "auto"
+            and state is not None
+            and state.reachable is True
+            and state.decisive == upstream.ACCEPTED
+            and state.mode == upstream.PASS
+            and state.applied
+        )
+
+    def _report(self, settings: upstream.Settings, outcome: upstream.Outcome) -> None:
+        state = outcome.state
+        if outcome.switched:
+            LOG.warning(
+                "Forwarding headers: mode %s -> %s (%s answered the test request with %s).",
+                outcome.previous_mode,
+                state.mode,
+                settings.target,
+                state.test_status if state.test_status is not None else "-",
+            )
+        if outcome.reload_error:
+            LOG.error("Reloading Caddy for the forwarding mode failed (retried): %s", outcome.reload_error)
+        if self.card is None:
+            self.card = outcome.previous_card
+        if outcome.card != self.card:
+            level, text = _CARD_LOG.get(outcome.card, (logging.INFO, "Connection to {target}: {card}."))
+            name = upstream.upstream_name(settings)
+            LOG.log(level, text.format(
+                name=name[:1].upper() + name[1:],
+                source=state.source_address or "this add-on", target=settings.target,
+                error=state.error or "no answer", card=outcome.card,
+            ))
+            self.card = outcome.card
+        if outcome.card == "broken":
+            self._dismiss_pending = False
+            if not self._raised:
+                title, message = upstream_notification(settings, state)
+                self._raised = _send_notification(title, message, UPSTREAM_NOTIFICATION_ID)
+        elif outcome.card in ("accepted", "strip", "never") and (self._raised or self._dismiss_pending):
+            if _dismiss_notification(UPSTREAM_NOTIFICATION_ID):
+                self._raised = False
+                self._dismiss_pending = False
+
+
 def main() -> None:
     LOG.info(
         "cert-monitor starting (interval=%ds thresholds=%s state=%s)",
@@ -414,6 +580,7 @@ def main() -> None:
     )
     started = time.monotonic()
     watch = PublicCertWatch(started)
+    upstream_watch = UpstreamWatch(started)
     # On startup, Home Assistant Core may not yet be ready (Supervisor
     # returns 502 Bad Gateway while HA boots). Retry quickly with
     # exponential backoff until the first publication succeeds, instead
@@ -422,7 +589,7 @@ def main() -> None:
     max_backoff = 300
     initial_done = False
     retry_logged = False
-    next_expiry = next_public = started
+    next_expiry = next_public = next_upstream = started
     while True:
         now = time.monotonic()
         if now >= next_expiry:
@@ -454,7 +621,13 @@ def main() -> None:
             except Exception as exc:  # noqa: BLE001 - never crash the loop
                 LOG.exception("public certificate check failed: %s", exc)
             next_public = now + watch.interval(now)
-        time.sleep(max(1.0, min(next_expiry, next_public) - time.monotonic()))
+        if now >= next_upstream:
+            try:
+                next_upstream = now + upstream_watch.tick(now)
+            except Exception as exc:  # noqa: BLE001 - never crash the loop
+                LOG.exception("upstream check failed: %s", exc)
+                next_upstream = now + UPSTREAM_CONTROL_INTERVAL
+        time.sleep(max(0.5, min(next_expiry, next_public, next_upstream) - time.monotonic()))
 
 
 if __name__ == "__main__":

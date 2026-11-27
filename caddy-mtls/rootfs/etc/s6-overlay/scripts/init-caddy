@@ -3,7 +3,8 @@
 # Home Assistant Add-on: Caddy mTLS Proxy
 # Init oneshot: validate config, ensure the CA, refresh /data/state.json
 # metadata, issue certificates for new names in `client_names` (every start),
-# re-encrypt .p12 bundles after a client_cert_password change, render the
+# re-encrypt .p12 bundles after a client_cert_password change, check whether
+# the upstream accepts forwarded requests (forwarded_headers), render the
 # Caddyfile, generate the CRL, populate the active-cert allowlist.
 # ==============================================================================
 set -e
@@ -25,9 +26,15 @@ readonly CADDYFILE="/etc/caddy/Caddyfile"
 # (public_cert.py). Caddy runs as root; the file is 0600.
 readonly ACME_LOG="${CADDY_DATA}/log/acme.log"
 # Facts of this start for the panel and the monitor (host ports, domain,
-# start time); /run is empty at every start.
+# upstream, start time); /run is empty at every start.
 readonly RUNTIME_DIR="/run/caddy-mtls"
 readonly RUNTIME_FILE="${RUNTIME_DIR}/runtime.json"
+# The header lines of the reverse_proxy blocks (forwarded_headers): written
+# by upstream.py at every start and rewritten at run time when the mode
+# changes (then Caddy is reloaded).
+readonly FORWARD_SNIPPET="/etc/caddy/forwarded-headers.caddy"
+readonly UPSTREAM_PY="/usr/lib/cert-mgr/upstream.py"
+readonly PANEL_PYTHON="/usr/lib/cert-mgr/.venv/bin/python3"
 STARTED_AT="$(date +%s)"
 
 mkdir -p "${CERT_DIR}" "${CADDY_DATA}" "${CADDY_DATA}/log" "${RUNTIME_DIR}"
@@ -46,6 +53,8 @@ UPSTREAM_HOST="$(bashio::config 'upstream_host')"
 UPSTREAM_PORT="$(bashio::config 'upstream_port')"
 [[ "${UPSTREAM_PORT}" == "null" ]] && UPSTREAM_PORT=""
 MTLS_ENABLED="$(bashio::config 'mtls_enabled')"
+# Since 2.2.0; options saved before have no key (bashio's default applies).
+FORWARDED_HEADERS="$(bashio::config 'forwarded_headers' 'auto')"
 
 CA_COUNTRY="$(bashio::config 'ca_country')"
 CA_STATE="$(bashio::config 'ca_state')"
@@ -93,6 +102,11 @@ fi
 case "${ACME_DNS_PROVIDER}" in
     none|cloudflare|route53|hetzner) ;;
     *) bashio::exit.nok "Unknown acme_dns_provider '${ACME_DNS_PROVIDER}'." ;;
+esac
+
+case "${FORWARDED_HEADERS}" in
+    auto|always|never) ;;
+    *) bashio::exit.nok "Unknown forwarded_headers '${FORWARDED_HEADERS}' (auto, always or never)." ;;
 esac
 
 if [[ "${ACME_DNS_PROVIDER}" != "none" ]] && bashio::var.is_empty "${DNS_API_TOKEN}"; then
@@ -257,6 +271,37 @@ if bashio::var.true "${MTLS_ENABLED}"; then
 fi
 
 ###############################################################################
+# Forwarding headers (option forwarded_headers, since 2.2.0). Home Assistant
+# answers a request with X-Forwarded-For "400: Bad Request" unless it trusts
+# this add-on as a reverse proxy. upstream.py asks the upstream (at most
+# about 5 s: at host boot the add-on starts before Home Assistant), decides
+# whether visitor addresses are passed on (mode pass) or the forwarding
+# headers are removed (mode strip) and writes ${FORWARD_SNIPPET}, which the
+# reverse_proxy block imports. The monitor watches the upstream afterwards
+# and switches the mode at run time (rewrite + caddy reload).
+###############################################################################
+bashio::log.info "Checking the upstream ${UPSTREAM_HOST}:${UPSTREAM_PORT} (forwarded_headers: ${FORWARDED_HEADERS})..."
+MTLS_BOOL=false
+bashio::var.true "${MTLS_ENABLED}" && MTLS_BOOL=true
+UPSTREAM_JSON=""
+if ! UPSTREAM_JSON="$(timeout 15 "${PANEL_PYTHON}" "${UPSTREAM_PY}" start \
+        --domain "${DOMAIN}" --host "${UPSTREAM_HOST}" --port "${UPSTREAM_PORT}" \
+        --mtls "${MTLS_BOOL}" --option "${FORWARDED_HEADERS}")" \
+        || ! jq -e '.card' >/dev/null 2>&1 <<<"${UPSTREAM_JSON}"; then
+    bashio::log.warning "Could not check the upstream; the monitor tries again in a few seconds."
+    UPSTREAM_JSON=""
+fi
+# upstream() <key>: a fact of the check ("" if unknown; never fails).
+upstream() { [[ -z "${UPSTREAM_JSON}" ]] || jq -r --arg k "$1" '.[$k] // "" | tostring' <<<"${UPSTREAM_JSON}"; }
+if [[ ! -s "${FORWARD_SNIPPET}" ]]; then
+    # Only when upstream.py could not run: today's behaviour (headers passed
+    # on); the monitor rewrites the file with its decision.
+    printf '%s\n' '# Forwarding headers, mode pass (fallback of init-caddy).' \
+        'header_up X-Real-IP {remote_host}' 'header_up -Forwarded' >"${FORWARD_SNIPPET}"
+    chmod 644 "${FORWARD_SNIPPET}"
+fi
+
+###############################################################################
 # Render Caddyfile
 ###############################################################################
 bashio::log.info "Rendering Caddyfile..."
@@ -409,7 +454,8 @@ ${DOMAIN} {
     ${TLS_BLOCK}
 
     reverse_proxy ${UPSTREAM_HOST}:${UPSTREAM_PORT} {
-        header_up X-Real-IP {remote_host}
+        # Forwarding headers (forwarded_headers; rewritten at run time)
+        import ${FORWARD_SNIPPET}
     }
 ${SITE_LOG}
 }
@@ -469,6 +515,7 @@ fi
 bashio::log.info "Init complete:"
 bashio::log.info "  Domain:      ${DOMAIN}"
 bashio::log.info "  Upstream:    ${UPSTREAM_HOST}:${UPSTREAM_PORT} (${UPSTREAM_PORT_SOURCE})"
+bashio::log.info "  Forwarding:  forwarded_headers ${FORWARDED_HEADERS}, mode $(upstream mode || true)"
 bashio::log.info "  mTLS:        ${MTLS_ENABLED}"
 bashio::log.info "  ACME DNS:    ${ACME_DNS_PROVIDER}"
 bashio::log.info "  Log level:   ${LOG_LEVEL} (caddy=${CADDY_LOG_LEVEL})"
@@ -520,10 +567,10 @@ log_host_ports() {
 log_host_ports || true
 
 ###############################################################################
-# Facts of this start for the panel's "Public certificate" card and the
-# expiry monitor (public_cert.py): the domain, the published host ports (for
-# the port-forwarding checklist), the ACME mode and the start time (only
-# certificate events after it count). Not secret.
+# Facts of this start for the panel's cards and the monitor (public_cert.py,
+# upstream.py): the domain, the published host ports (for the port-forwarding
+# checklist), the ACME mode, the start time (only certificate events after it
+# count) and the upstream with the forwarded_headers option. Not secret.
 ###############################################################################
 jq -n \
     --arg domain "${DOMAIN}" \
@@ -535,40 +582,90 @@ jq -n \
     --arg acme_ca "${ACME_CA_URL}" \
     --arg acme_log "${ACME_LOG}" \
     --arg caddy_storage "${CADDY_DATA}" \
+    --arg upstream_host "${UPSTREAM_HOST}" \
+    --argjson upstream_port "${UPSTREAM_PORT}" \
+    --argjson mtls "${MTLS_BOOL}" \
+    --arg forwarded "${FORWARDED_HEADERS}" \
     '{domain: $domain, started_at: $started_at, host_ports_known: $ports_known,
       http_host_port: ($http_port | tonumber? // null),
       https_host_port: ($https_port | tonumber? // null),
       acme_dns_provider: $dns_provider, acme_ca: $acme_ca,
-      acme_log: $acme_log, caddy_storage: $caddy_storage}' \
+      acme_log: $acme_log, caddy_storage: $caddy_storage,
+      upstream_host: $upstream_host, upstream_port: $upstream_port,
+      mtls_enabled: $mtls, forwarded_headers: $forwarded}' \
     > "${RUNTIME_FILE}.tmp"
 chmod 644 "${RUNTIME_FILE}.tmp"
 mv -f "${RUNTIME_FILE}.tmp" "${RUNTIME_FILE}"
 
 ###############################################################################
-# Reverse-proxy reminder for Home Assistant Core.
-# HA Core rejects requests from unknown reverse proxies with 400 Bad Request.
-# We can't edit the user's configuration.yaml safely, so emit a prominent,
-# copy-pasteable reminder on every start. Detect our own container IP so the
-# user can also whitelist a single address if they prefer it over the whole
-# Supervisor docker subnet.
+# The connection to the upstream (the panel's "Home Assistant connection"
+# card says the same, with the steps): one line while visitor addresses are
+# passed on; a short notice while it works without them; the prominent block
+# only when every request is answered "400: Bad Request".
 ###############################################################################
-# (`|| true`: bashio enables pipefail, and `hostname -i` fails when the
-# container has no network, e.g. in tests/smoke.sh.)
-ADDON_IP="$(hostname -i 2>/dev/null | awk '{print $1}')" || true
-[[ -z "${ADDON_IP}" ]] && ADDON_IP="<this add-on's container IP>"
-
-bashio::log.notice "------------------------------------------------------------"
-bashio::log.notice "Home Assistant Core must trust this add-on as a reverse"
-bashio::log.notice "proxy, otherwise it returns 400 Bad Request for every"
-bashio::log.notice "request forwarded through ${DOMAIN}."
-bashio::log.notice ""
-bashio::log.notice "Add this to /config/configuration.yaml and restart HA Core:"
-bashio::log.notice ""
-bashio::log.notice "  http:"
-bashio::log.notice "    use_x_forwarded_for: true"
-bashio::log.notice "    trusted_proxies:"
-bashio::log.notice "      - 172.30.32.0/23   # Supervisor docker network"
-bashio::log.notice "      # or just this add-on's current IP: ${ADDON_IP}"
-bashio::log.notice ""
-bashio::log.notice "See the add-on documentation for details."
-bashio::log.notice "------------------------------------------------------------"
+upstream_notice() {
+    local card source suggestion error what
+    card="$(upstream card)"
+    source="$(upstream source_address)"
+    suggestion="$(upstream suggestion)"
+    error="$(upstream error)"
+    what="Home Assistant"
+    [[ "${UPSTREAM_HOST}" == "homeassistant" ]] || what="The upstream ${UPSTREAM_HOST}:${UPSTREAM_PORT}"
+    case "${card}" in
+        accepted)
+            bashio::log.info "${what} accepts this add-on (${source}) as a reverse proxy: visitor addresses are passed on."
+            ;;
+        strip)
+            bashio::log.notice "${what} does not trust this add-on (${source}) as a reverse proxy. The add-on therefore removes the forwarding headers (forwarded_headers: auto, mTLS on): it works, and ${what} sees every visitor as ${source}."
+            bashio::log.notice "To pass visitor addresses on, let ${what} trust ${suggestion} as a reverse proxy - the steps are in the add-on's web interface (Home Assistant connection)."
+            ;;
+        never)
+            bashio::log.info "forwarded_headers: never - visitor addresses are not passed on; ${what} sees every visitor as ${source:-this add-on}."
+            ;;
+        unreachable)
+            bashio::log.warning "The upstream ${UPSTREAM_HOST}:${UPSTREAM_PORT} does not answer yet (${error:-no answer}): visitors get 502 Bad Gateway until it does. Forwarding headers until then: mode $(upstream mode) (last known); the add-on checks again every few seconds."
+            ;;
+        broken)
+            bashio::log.warning "------------------------------------------------------------"
+            bashio::log.warning "${what} answers EVERY request through ${DOMAIN}"
+            bashio::log.warning "with \"400: Bad Request\": it does not trust this add-on"
+            bashio::log.warning "(${source}) as a reverse proxy, and the add-on passes the"
+            if [[ "${FORWARDED_HEADERS}" == "always" ]]; then
+                bashio::log.warning "visitor addresses on (forwarded_headers: always)."
+            else
+                bashio::log.warning "visitor addresses on (mtls_enabled: false - without client"
+                bashio::log.warning "certificates no visitor may look like a local device)."
+            fi
+            bashio::log.warning ""
+            if [[ "${UPSTREAM_HOST}" == "homeassistant" ]]; then
+                bashio::log.warning "Fix it in Home Assistant: Settings > System > Network >"
+                bashio::log.warning "HTTP server > Reverse proxy: turn on 'Trust X-Forwarded-For',"
+                bashio::log.warning "add ${suggestion} to 'Trusted proxies', select Save and"
+                bashio::log.warning "'Save and restart', then confirm the new settings."
+                bashio::log.warning ""
+                bashio::log.warning "Home Assistant before 2026.7: add this to configuration.yaml"
+                bashio::log.warning "and restart Home Assistant:"
+                bashio::log.warning ""
+                bashio::log.warning "  http:"
+                bashio::log.warning "    use_x_forwarded_for: true"
+                bashio::log.warning "    trusted_proxies:"
+                bashio::log.warning "      - ${suggestion}"
+            else
+                bashio::log.warning "Let the upstream trust ${suggestion} as a reverse proxy"
+                bashio::log.warning "(X-Forwarded-For), or set forwarded_headers: never."
+            fi
+            if [[ "${FORWARDED_HEADERS}" == "always" && "${MTLS_BOOL}" == true ]]; then
+                bashio::log.warning ""
+                bashio::log.warning "Or set forwarded_headers to auto: ${what} then sees"
+                bashio::log.warning "every visitor as ${source}."
+            fi
+            bashio::log.warning ""
+            bashio::log.warning "Details: the add-on's web interface (Home Assistant connection)."
+            bashio::log.warning "------------------------------------------------------------"
+            ;;
+        *)
+            bashio::log.info "Connection to the upstream not checked yet; the add-on checks it in a few seconds."
+            ;;
+    esac
+}
+upstream_notice || true

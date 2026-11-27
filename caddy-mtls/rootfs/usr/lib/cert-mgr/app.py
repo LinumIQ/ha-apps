@@ -4,10 +4,12 @@ Caddy mTLS Proxy - certificate management web UI.
 Runs on the Home Assistant ingress port (8099), only reachable via the
 Supervisor's ingress proxy at 172.30.32.2. Provides a dashboard with the
 state of the public (Let's Encrypt) server certificate (public_cert.py,
-refreshed every 30 s), the CA and client certificate metadata, client bundle
-downloads, regenerating or revoking individual client certs, and (with a
-typed confirmation) regenerating the entire CA (the mTLS CA - the public
-server certificate is Caddy's).
+refreshed every 30 s), the connection to Home Assistant (upstream.py: does
+it accept forwarded requests, are visitor addresses passed on; refreshed
+every 30 s, "Check again"), the CA and client certificate metadata, client
+bundle downloads, regenerating or revoking individual client certs, and
+(with a typed confirmation) regenerating the entire CA (the mTLS CA - the
+public server certificate is Caddy's).
 
 All mutations:
   1. Run the matching shell helper inside the existing cert-helpers.sh
@@ -44,6 +46,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import BaseHTTPMiddleware
 
 import public_cert
+import upstream
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -291,6 +294,12 @@ def _public_cert_context() -> dict[str, Any]:
     }
 
 
+def _upstream_context() -> dict[str, Any]:
+    """Template variables of the "Home Assistant connection" card."""
+    settings = upstream.Settings.load()
+    return {"hc": upstream.card_context(settings, upstream.load_state(settings) if settings else None)}
+
+
 # Sync (def) routes run in the thread pool: they read files and call openssl.
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request) -> Any:
@@ -309,6 +318,7 @@ def index(request: Request) -> Any:
             "flash_error": flash_error,
             "flash_ok": flash_ok,
             **_public_cert_context(),
+            **_upstream_context(),
         },
     )
 
@@ -318,6 +328,33 @@ def public_cert_card(request: Request) -> Any:
     """The "Public certificate" card alone (the dashboard reloads it every
     30 s)."""
     return templates.TemplateResponse(request, "_public_cert.html", _public_cert_context())
+
+
+@app.get("/upstream", response_class=HTMLResponse)
+def upstream_card(request: Request) -> Any:
+    """The "Home Assistant connection" card alone (reloaded every 30 s)."""
+    return templates.TemplateResponse(request, "_upstream.html", _upstream_context())
+
+
+@app.get("/api/upstream")
+def api_upstream() -> dict[str, Any]:
+    settings = upstream.Settings.load()
+    state = upstream.load_state(settings) if settings else None
+    return {
+        "card": upstream.card_state(settings, state) if settings else "unknown",
+        "option": settings.option if settings else None,
+        "target": settings.target if settings else None,
+        "state": None if state is None else {
+            "result": state.result,
+            "decisive": state.decisive,
+            "mode": state.mode,
+            "applied": state.applied,
+            "reachable": state.reachable,
+            "source_address": state.source_address,
+            "checked_at": state.checked_at,
+            "error": state.error,
+        },
+    }
 
 
 @app.get("/api/public-cert")
@@ -553,6 +590,46 @@ async def regenerate_client(request: Request, name: str):
             "Check the add-on logs."
         )
     return _redirect_home(request, ok=f"Client '{name}' regenerated.")
+
+
+_CHECK_RESULT = {
+    "accepted": "{Name} accepts this add-on as a reverse proxy: visitor addresses are passed on.",
+    "strip": "{Name} does not trust this add-on as a reverse proxy: visitor addresses are not passed on.",
+    "broken": "{Name} does not trust this add-on as a reverse proxy: every request is answered 400.",
+    "never": "Checked. Visitor addresses are not passed on (forwarded_headers: never).",
+    "unreachable": "{target} does not answer: {error}",
+    "unknown": "Checked; the result is not known yet.",
+}
+
+
+@app.post("/api/upstream/check")
+def check_upstream(request: Request):
+    """ "Check again": the test request (Home Assistant logs one line if it
+    refuses it), switch the forwarding mode if needed, reload Caddy."""
+    settings = upstream.Settings.load()
+    if settings is None:
+        raise FlashError("The add-on has not finished starting yet; try again in a moment.")
+    try:
+        outcome = upstream.check(settings, test=True)
+    except TimeoutError:
+        raise FlashError("Another check is running; try again in a moment.") from None
+    if outcome.reload_error:
+        LOG.error("caddy reload for the forwarding mode failed: %s", outcome.reload_error)
+        raise FlashError(
+            "The forwarding mode changed, but reloading Caddy failed (the add-on "
+            "retries). Check the add-on logs."
+        )
+    name = upstream.upstream_name(settings)
+    message = _CHECK_RESULT.get(outcome.card, _CHECK_RESULT["unknown"]).format(
+        Name=name[:1].upper() + name[1:],
+        target=settings.target,
+        error=outcome.state.error or "no answer",
+    )
+    if outcome.switched:
+        message += f" Forwarding mode: {outcome.previous_mode} -> {outcome.state.mode}."
+    if outcome.card == "unreachable":
+        raise FlashError(message)
+    return _redirect_home(request, ok=message)
 
 
 @app.post("/api/ca/regenerate")

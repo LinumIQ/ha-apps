@@ -25,6 +25,7 @@ CERT_MGR = Path(
 sys.path.insert(0, str(CERT_MGR))
 
 import public_cert  # noqa: E402
+import upstream  # noqa: E402
 
 try:
     import jinja2
@@ -213,6 +214,11 @@ class RenderTests(unittest.TestCase):
             "ca_crt_exists": True, "crl_exists": True, "flash_error": "<b>x</b>", "flash_ok": None,
             "pc": pc, "pc_checklist": public_cert.checklist(pc), "pc_retry_hint": public_cert.retry_hint(pc),
             "pc_time": public_cert.local_time,
+            "hc": upstream.card_context(
+                upstream.Settings("home.example.org", "homeassistant", 8123, True, "auto"),
+                upstream.State(upstream="homeassistant:8123", result="refused", decisive="refused",
+                               mode="strip", reachable=True, source_address="172.30.33.3"),
+            ),
         }
 
     def test_dashboard(self):
@@ -226,6 +232,8 @@ class RenderTests(unittest.TestCase):
                 self.assertNotIn("\U0001f510", html)  # the old emoji header icon
                 self.assertIn(f'data-state="{state}"', html)
                 self.assertLess(html.index('id="public-cert"'), html.index("Certificate Authority"))
+                self.assertLess(html.index('id="public-cert"'), html.index('id="upstream"'))
+                self.assertLess(html.index('id="upstream"'), html.index("Certificate Authority"))
                 self.assertIn("&lt;b&gt;x&lt;/b&gt;", html)
                 footer = html[html.index('<footer class="app-footer">'):]
                 self.assertIn('src="static/shared/brand/linumiq-logo.png"', footer)
@@ -243,6 +251,99 @@ class RenderTests(unittest.TestCase):
         self.assertIn('class="card pc pc--missing"', html)
         self.assertNotIn("<html", html)
         self.assertNotIn("app-footer", html)
+
+
+@unittest.skipIf(jinja2 is None, "Jinja2 not installed (run inside the add-on image)")
+class UpstreamCardTests(unittest.TestCase):
+    """The "Home Assistant connection" card in each state (app.py's
+    upstream_context with upstream.State values)."""
+
+    NOW = RenderTests.NOW
+
+    @classmethod
+    def setUpClass(cls):
+        cls.env = jinja2.Environment(loader=jinja2.FileSystemLoader(str(TEMPLATES)), autoescape=True)
+
+    def render(self, card, option="auto", mtls=True, host="homeassistant", **state):
+        settings = upstream.Settings("home.example.org", host, 8123, mtls, option)
+        st = None
+        if card != "none":
+            defaults = {
+                "accepted": dict(result="accepted", decisive="accepted", mode="pass", reachable=True),
+                "strip": dict(result="refused", decisive="refused", mode="strip", reachable=True),
+                "broken": dict(result="refused", decisive="refused", mode="pass", reachable=True),
+                "never": dict(result="refused", decisive="refused", mode="strip", reachable=True),
+                "unreachable": dict(result="unreachable", decisive="refused", mode="strip", reachable=False,
+                                    error="[Errno 111] Connection refused"),
+                "unknown": dict(),
+            }[card]
+            defaults.update(source_address="172.30.33.3", checked_at=self.NOW - 30)
+            defaults.update(state)
+            st = upstream.State(upstream=settings.target, **defaults)
+        context = {"hc": upstream.card_context(settings, st)}
+        self.assertEqual(context["hc"]["card"], "unknown" if card == "none" else card)
+        return self.env.get_template("_upstream.html").render(context)
+
+    def test_fragment(self):
+        html = self.render("strip")
+        self.assertTrue(html.lstrip().startswith("<section"), html[:60])
+        self.assertIn('id="upstream"', html)
+        self.assertIn('class="card hc hc--strip"', html)
+        self.assertIn('data-state="strip"', html)
+        self.assertIn('data-mode="strip"', html)
+        self.assertIn('<form method="post" action="api/upstream/check"', html)
+        self.assertIn('class="btn" type="submit">Check again</button>', html)
+        self.assertNotIn("<html", html)
+        for url in ATTR_URL_RE.findall(html):
+            self.assertFalse(ABSOLUTE_RE.match(url), url)
+
+    def test_states(self):
+        expectations = {
+            "accepted": ["Home Assistant connection", "status--success", "Connected",
+                         "Home Assistant accepts this add-on as a reverse proxy"],
+            "strip": ["status--info", "It works", "sees every visitor as\n    <code>172.30.33.3</code>",
+                      "Can only log in from the local network", "ip_bans.yaml",
+                      "add 172.30.33.0/24 to &#34;Trusted proxies&#34;", "Save and restart",
+                      "use_x_forwarded_for: true", "    - 172.30.33.0/24", "Check again"],
+            "broken": ["status--danger", "Refused (400)", "400: Bad Request",
+                       "<code>forwarded_headers</code> is <code>always</code>",
+                       "Settings &gt; System &gt; Network", "Or set the app option"],
+            "never": ["Addresses not passed on", "forwarded_headers: never", "172.30.33.3"],
+            "unreachable": ["status--danger", "Unreachable", "<code>homeassistant:8123</code> does not answer",
+                            "Connection refused", "502 Bad Gateway", "mode <code>strip</code>"],
+            "unknown": ["Not checked yet"],
+        }
+        for card, needles in expectations.items():
+            with self.subTest(card=card):
+                html = self.render(card, option={"broken": "always", "never": "never"}.get(card, "auto"))
+                self.assertIn(f'data-state="{card}"', html)
+                for needle in needles:
+                    self.assertIn(needle, html)
+
+    def test_broken_without_mtls_warns_against_never(self):
+        html = self.render("broken", option="auto", mtls=False)
+        self.assertIn("mtls_enabled: false", html)
+        self.assertIn("everyone on the\n    internet", html)
+        self.assertNotIn("Or set the app option", html)
+
+    def test_other_upstream_is_neutral(self):
+        html = self.render("broken", option="always", host="192.0.2.10")
+        self.assertIn("Upstream connection", html)
+        self.assertIn("the upstream 192.0.2.10:8123", html)
+        self.assertNotIn("Home Assistant", html)
+        self.assertNotIn("configuration.yaml", html)
+
+    def test_not_started(self):
+        html = self.env.get_template("_upstream.html").render({"hc": upstream.card_context(None, None)})
+        self.assertIn("still starting", html)
+        self.assertNotIn("<form", html)
+
+    def test_dashboard_reloads_both_cards(self):
+        index = (TEMPLATES / "index.html").read_text()
+        self.assertIn('{% include "_upstream.html" %}', index)
+        self.assertLess(index.index('"_public_cert.html"'), index.index('"_upstream.html"'))
+        self.assertIn('fetch("upstream"', index)
+        self.assertIn('fetch("public-cert"', index)
 
 
 if __name__ == "__main__":

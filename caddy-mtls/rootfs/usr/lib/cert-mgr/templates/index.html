@@ -18,6 +18,8 @@
 {% block content %}
       {% include "_public_cert.html" %}
 
+      {% include "_upstream.html" %}
+
       <section class="card" aria-labelledby="ca-heading">
         <div class="card__header">
           <h2 class="card__title" id="ca-heading">Certificate Authority</h2>
@@ -199,20 +201,32 @@
 
 {% block scripts %}
     <script>
-      // Reload the "Public certificate" card every 30 s (relative URL: it
-      // stays inside the ingress path), so the result of a fixed port
-      // forwarding shows up without reloading the page.
+      // Reload the "Public certificate" and "Home Assistant connection"
+      // cards every 30 s (relative URLs: they stay inside the ingress path),
+      // so the result of a fixed port forwarding or a changed Home Assistant
+      // setting shows up without reloading the page. A card whose
+      // configuration.yaml block is open is left alone.
       (function () {
         if (!window.fetch) return;
+        function text(r) {
+          return r.ok ? r.text() : null;
+        }
+        function replace(id) {
+          return function (html) {
+            var card = document.getElementById(id);
+            if (html && card && !card.querySelector("details[open]")) {
+              card.outerHTML = html;
+            }
+          };
+        }
         setInterval(function () {
           fetch("public-cert", { credentials: "same-origin", cache: "no-store" })
-            .then(function (r) {
-              return r.ok ? r.text() : null;
-            })
-            .then(function (html) {
-              var card = document.getElementById("public-cert");
-              if (html && card) card.outerHTML = html;
-            })
+            .then(text)
+            .then(replace("public-cert"))
+            .catch(function () {});
+          fetch("upstream", { credentials: "same-origin", cache: "no-store" })
+            .then(text)
+            .then(replace("upstream"))
             .catch(function () {});
         }, 30000);
       })();

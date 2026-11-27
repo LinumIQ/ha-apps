@@ -3,7 +3,7 @@
 # https://developers.home-assistant.io/docs/add-ons/configuration/
 
 name: "Caddy mTLS Proxy"
-version: "2.1.3"
+version: "2.2.0"
 slug: "caddy_mtls"
 description: >-
   Caddy reverse proxy with mutual TLS (mTLS) client certificate authentication
@@ -76,6 +76,7 @@ options:
   dns_api_token: ""
   log_level: "info"
   access_log: false
+  forwarded_headers: "auto"
   cert_expiry_warn_days:
     - 30
     - 14
@@ -104,6 +105,10 @@ schema:
   dns_api_token: password?
   log_level: list(trace|debug|info|notice|warning|error|fatal)?
   access_log: bool
+  # auto: pass the visitor's address on (X-Forwarded-For) if the upstream
+  # accepts it, else (with mTLS) remove the forwarding headers; always /
+  # never: pass on / remove regardless (since 2.2.0).
+  forwarded_headers: list(auto|always|never)
   cert_expiry_warn_days:
     - int(1,365)
   cert_check_interval_hours: int(1,168)

@@ -1,0 +1,26 @@
+{#- The steps that make the upstream trust this add-on (part of
+    _upstream.html). -#}
+<ol class="hc__steps">
+  {% for step in hc.steps %}
+  <li>{{ step }}</li>
+  {% endfor %}
+  <li>
+    The add-on notices the restart and checks again by itself; or select
+    <strong>Check again</strong> below.
+  </li>
+</ol>
+{% if hc.settings.is_home_assistant %}
+<details class="disclosure hc__yaml">
+  <summary>Home Assistant before 2026.7: configuration.yaml</summary>
+  <div class="disclosure__body">
+    <p>
+      Older versions read these settings from
+      <code>configuration.yaml</code>: add this block (merge it into an
+      existing <code>http:</code> section) and restart Home Assistant. Since
+      2026.7 Home Assistant imports such a block only once and ignores it
+      afterwards.
+    </p>
+    <pre><code>{{ hc.yaml }}</code></pre>
+  </div>
+</details>
+{% endif %}

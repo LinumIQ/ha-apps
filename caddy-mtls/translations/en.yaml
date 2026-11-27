@@ -126,3 +126,17 @@ configuration:
       about 1.5 KB per request - loading the Home Assistant frontend makes
       several hundred). Off by default; turn it on to debug a connection
       problem.
+
+  forwarded_headers:
+    name: Forwarding Headers
+    description: >-
+      Whether Home Assistant gets each visitor's own address
+      (X-Forwarded-For). Home Assistant answers "400: Bad Request" when it
+      gets one from a proxy it does not trust.
+      auto (default): the add-on asks Home Assistant; if it trusts the
+      add-on, addresses are passed on; if not, and mTLS is on, they are
+      removed and Home Assistant sees every visitor as the add-on.
+      always: always passed on (Home Assistant must trust the add-on).
+      never: never passed on.
+      The add-on's web interface shows the state and how to let Home
+      Assistant trust the add-on.

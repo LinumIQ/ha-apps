@@ -159,7 +159,7 @@ RUN if [ -e /etc/s6-overlay/s6-rc.d/user ] \
         /etc/s6-overlay/s6-rc.d/cert-monitor/run \
     && /usr/lib/cert-mgr/.venv/bin/python3 -m compileall -q \
         /usr/lib/cert-mgr/app.py /usr/lib/cert-mgr/monitor.py \
-        /usr/lib/cert-mgr/public_cert.py
+        /usr/lib/cert-mgr/public_cert.py /usr/lib/cert-mgr/upstream.py
 
 # Health monitoring: probe Caddy's local admin API and the cert-mgr
 # ingress port. We deliberately avoid hitting the public HTTPS port
