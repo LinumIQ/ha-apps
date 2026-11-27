@@ -77,17 +77,21 @@ class OptionError(ValueError):
 
 
 def name_error(name: str) -> str | None:
-    """Why ``name`` cannot be the header's name, or None."""
+    """Why ``name`` cannot be the header's name, or None. Never quotes the
+    value - a key pasted into this field by mistake would be printed - only
+    its length."""
     if not NAME_RE.fullmatch(name):
         return (
-            f"header_auth_name {json.dumps(name)} is not a header name for this add-on: 1-64 "
+            f"header_auth_name ({len(name)} characters) is not a header name for this add-on: 1-64 "
             f"characters, a letter first, then letters, digits or '-' (for example {DEFAULT_NAME})."
         )
     lower = name.lower()
     if lower in RESERVED_NAMES or lower.startswith(RESERVED_PREFIXES):
         return (
-            f"header_auth_name {json.dumps(name)} is a header that browsers, Home Assistant or the "
-            f"proxy itself use; choose a name of your own, for example {DEFAULT_NAME}."
+            "header_auth_name is a header that browsers, Home Assistant or the proxy itself use "
+            "(Authorization, Cookie, Host, Origin, X-Real-IP and the like, or a name starting with "
+            "Accept, Content-, Sec-, Proxy-, If-, Cache-, X-Forwarded-, X-Hass, X-Ingress, X-Supervisor, "
+            f"X-HA- or CF-); choose a name of your own, for example {DEFAULT_NAME}."
         )
     return None
 

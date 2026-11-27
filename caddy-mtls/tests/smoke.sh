@@ -2080,8 +2080,13 @@ check "bad-auth-short: the refusal says how to make a key" logs_contain "openssl
 bad_auth blank "${AUTH_KEY:0:20} ${AUTH_KEY:20}" "header_auth_key contains a character that is not allowed"
 bad_auth star "${AUTH_KEY}*" "header_auth_key contains a character that is not allowed"
 bad_auth linebreak "${AUTH_KEY}"$'\n' "header_auth_key contains a character that is not allowed"
-bad_auth name "${AUTH_KEY}" 'header_auth_name "X_Custom" is not a header name for this add-on' X_Custom
-bad_auth reserved "${AUTH_KEY}" 'header_auth_name "x-forwarded-for" is a header that browsers, Home Assistant or the proxy itself use' x-forwarded-for
+bad_auth name "${AUTH_KEY}" 'header_auth_name (8 characters) is not a header name for this add-on' X_Custom
+bad_auth reserved "${AUTH_KEY}" 'header_auth_name is a header that browsers, Home Assistant or the proxy itself use' x-forwarded-for
+# B-9: a key pasted into header_auth_name is not printed (only its length).
+NAME_MARKER="fakename.NOT-A-SECRET.$(rand_hex)"
+bad_case auth-key-as-name "$(OPT_HEADER_KEY_FILE="${AUTH_KEY_RAW}" OPT_HEADER_NAME="${NAME_MARKER}" options "${DOMAIN}" true none "")" \
+    "header_auth_name (${#NAME_MARKER} characters) is not a header name for this add-on" \
+    "$(secret_file pattern-name-marker "${NAME_MARKER}")"
 fi
 
 # ==============================================================================

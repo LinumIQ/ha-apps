@@ -65,6 +65,17 @@ class NameTest(unittest.TestCase):
                 self.assertIsNotNone(error)
                 self.assertIn("browsers, Home Assistant or the proxy", error)
 
+    def test_the_value_is_never_quoted(self) -> None:
+        """B-9: a key pasted into header_auth_name by mistake is in no
+        message; the length may be."""
+        marker = fake_key(43)  # not a valid name: it contains '.'
+        error = headerauth.name_error(marker)
+        self.assertIn("(43 characters)", error)
+        self.assertNotIn(marker, error)
+        self.assertNotIn(marker[:12], error)
+        reserved = "X-Forwarded-" + "abcdefghij" * 3
+        self.assertNotIn(reserved, headerauth.name_error(reserved))
+
     def test_names_that_only_look_reserved(self) -> None:
         for name in ("X-Hosted", "Hostname-Key", "My-Authorization", "X-Real-IPv6x", "Datex", "X-Hae"):
             with self.subTest(name=name):
@@ -158,6 +169,7 @@ class SetupTest(unittest.TestCase):
             "star": dict(header_auth_key=key + "*"),
             "placeholder": dict(header_auth_key="{env.HOME}" + key),
             "bad name": dict(header_auth_name="X_Key", header_auth_key=key),
+            "key pasted into the name": dict(header_auth_name=key, header_auth_key=key),
             "reserved name": dict(header_auth_name="Authorization", header_auth_key=key),
         }
         for case, options in cases.items():
