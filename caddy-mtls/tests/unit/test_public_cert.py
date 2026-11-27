@@ -296,5 +296,29 @@ class StorageTest(unittest.TestCase):
             self.assertEqual(status.certificate.issuer if status.certificate else None, "Let's Encrypt, Inc. (E7)")
 
 
+class RuntimeTest(unittest.TestCase):
+    def test_config_slug_and_folder(self) -> None:
+        """2.3.0: the add-on's folder in app_configs from the Supervisor's
+        slug; unknown (outside Supervisor, a runtime.json of 2.2.0, garbage)
+        -> no folder."""
+        cases = {
+            "2644ca2c_caddy_mtls": "app_configs/2644ca2c_caddy_mtls",
+            "local_caddy_mtls": "app_configs/local_caddy_mtls",
+            None: "",
+            "": "",
+            "null": "app_configs/null",  # init-caddy never writes "null" (filtered there)
+            "../etc": "",
+            "a/b": "",
+            "x" * 101: "",
+            7: "",
+        }
+        for slug, folder in cases.items():
+            with self.subTest(slug=slug):
+                data = {"domain": DOMAIN, "started_at": 1.0}
+                if slug is not None:
+                    data["config_slug"] = slug
+                self.assertEqual(public_cert.Runtime.from_dict(data).config_folder, folder)
+
+
 if __name__ == "__main__":
     unittest.main()

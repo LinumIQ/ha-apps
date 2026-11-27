@@ -86,6 +86,16 @@ class Runtime:
     lan_host_port: int | None = None
     lan_state: str = "off"
     lan_refused: tuple[str, ...] = ()
+    # The add-on's slug = its folder in Home Assistant's app configuration
+    # folders (app_configs/<slug>/, /config inside the add-on; since 2.3.0).
+    # "" outside Supervisor.
+    config_slug: str = ""
+
+    @property
+    def config_folder(self) -> str:
+        """The add-on's configuration folder as the Samba / SSH apps show
+        it (``app_configs/<slug>``), or "" when the slug is unknown."""
+        return f"app_configs/{self.config_slug}" if self.config_slug else ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Runtime:
@@ -107,7 +117,16 @@ class Runtime:
             lan_host_port=port(data.get("lan_host_port")),
             lan_state=lan_state if lan_state in ("on", "off", "unknown") else "off",
             lan_refused=tuple(str(a) for a in refused) if isinstance(refused, list) else (),
+            config_slug=_slug(data.get("config_slug")),
         )
+
+
+_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
+
+
+def _slug(value: Any) -> str:
+    """A slug from runtime.json, or "" (missing or malformed)."""
+    return value if isinstance(value, str) and _SLUG_RE.fullmatch(value) else ""
 
 
 @dataclass(frozen=True)

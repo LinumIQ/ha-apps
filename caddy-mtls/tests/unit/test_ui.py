@@ -245,6 +245,19 @@ class RenderTests(unittest.TestCase):
                     if ABSOLUTE_RE.match(url):
                         self.assertIn(url, ALLOWED_ABSOLUTE)
 
+    def test_certificate_copies_folder(self):
+        """2.3.0 (Method 2): the real folder of the certificate copies, only
+        when the slug is known."""
+        rt = public_cert.Runtime(domain="home.example.org", started_at=self.NOW, config_slug="2644ca2c_caddy_mtls")
+        html = self.env.get_template("index.html").render(self._context("ok") | {"rt": rt, "lan_rt": rt})
+        self.assertIn("<code>app_configs/2644ca2c_caddy_mtls/certs/</code>", html)
+        self.assertIn("<code>/app_configs/2644ca2c_caddy_mtls/certs/</code>", html)
+        self.assertIn('class="clients__mirror"', html)
+        for rt in (None, public_cert.Runtime(domain="home.example.org", started_at=self.NOW)):
+            with self.subTest(rt=rt):
+                html = self.env.get_template("index.html").render(self._context("ok") | {"rt": rt, "lan_rt": rt})
+                self.assertNotIn("clients__mirror", html)
+
     def test_card_alone_is_a_fragment(self):
         html = self.env.get_template("_public_cert.html").render(self._context("missing"))
         self.assertTrue(html.lstrip().startswith("<section"), html[:60])

@@ -156,6 +156,16 @@
           {% endfor %}
         </div>
 
+        {% if rt and rt.config_folder %}
+        <p class="clients__mirror">
+          At every start the add-on also copies the CA certificate, the CRL
+          and the active clients' <code>.p12</code> bundles to the folder
+          <code>{{ rt.config_folder }}/certs/</code> (Samba share
+          <code>app_configs</code>; in the SSH app
+          <code>/app_configs/{{ rt.config_slug }}/certs/</code>).
+        </p>
+        {% endif %}
+
         <h3>Add new client</h3>
         <form method="post" action="api/clients" class="form-inline">
           <div class="field">

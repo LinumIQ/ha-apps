@@ -116,6 +116,13 @@ EXTRA_CREATE_ARGS=()
 BOOT_NETWORK=none
 # The add-on's network settings as Supervisor reports them (bashio's cache).
 SEED_NETWORK='{"80/tcp":8080,"443/tcp":8443}'
+# The add-on's slug as Supervisor reports it (empty: none in the cache, as
+# outside Supervisor).
+SEED_SLUG=local_caddy_mtls
+# A function called with the directory that becomes /config (the
+# addon_config mapping) before it is copied in; set: /config exists even
+# without a previous /data.
+BOOT_CONFIG_HOOK=""
 PASS_COUNT=0
 FAIL_COUNT=0
 
@@ -219,7 +226,8 @@ boot() {
     # bashio's cache with the options (and the add-on info with the default
     # host ports, which init-caddy logs) so it never needs to.
     cp "${dir}/data/options.json" "${dir}/tmp/.bashio/addons.self.options.config.cache"
-    jq -n --argjson network "${SEED_NETWORK}" '{name: "Caddy mTLS Proxy", network: $network}' \
+    jq -n --argjson network "${SEED_NETWORK}" --arg slug "${SEED_SLUG}" \
+        '{name: "Caddy mTLS Proxy", network: $network} + (if $slug == "" then {} else {slug: $slug} end)' \
         >"${dir}/tmp/.bashio/addons.self.info.cache"
     # Home Assistant Core's info (port), only when a case sets CORE_INFO.
     if [[ -n "${CORE_INFO:-}" ]]; then
@@ -232,7 +240,12 @@ boot() {
         "${EXTRA_CREATE_ARGS[@]+"${EXTRA_CREATE_ARGS[@]}"}" "${IMAGE}" >/dev/null
     if [[ -n "${3:-}" ]]; then
         "${DOCKER}" cp - "${CTR}:/" <"$3"
+    fi
+    if [[ -n "${3:-}" || -n "${BOOT_CONFIG_HOOK}" ]]; then
         mkdir -p "${dir}/root/config"
+        if [[ -n "${BOOT_CONFIG_HOOK}" ]]; then
+            "${BOOT_CONFIG_HOOK}" "${dir}/root/config"
+        fi
         tar -C "${dir}/root" --owner=0 --group=0 --numeric-owner -cf - config | "${DOCKER}" cp - "${CTR}:/"
     fi
     # Files go in owned by root, as Supervisor creates them.
@@ -738,9 +751,24 @@ OPT_CLIENT_NAMES='["alice", "bob", "dave-phone", "bad name!", "..", ".hidden", "
 "${DOCKER}" cp "${CTR}:/data" - >"${WORK}/data-main.tar"
 log "restart: new container with main's /data (client_names + dave-phone and invalid names, new client_cert_password)"
 before=${FAIL_COUNT}
+# /config/certs as a 2.2.0 left it: the bundle of bob (revoked since), and a
+# file of the user's own.
+seed_stale_bundles() {
+    mkdir -p "$1/certs"
+    printf 'stale bundle\n' >"$1/certs/mTLS-client-bob.p12"
+    printf 'my notes\n' >"$1/certs/notes.txt"
+}
+BOOT_CONFIG_HOOK=seed_stale_bundles
 boot restart "$(options "${DOMAIN}" true none "")" "${WORK}/data-main.tar"
+BOOT_CONFIG_HOOK=""
 if wait_for "${BOOT_TIMEOUT}" booted; then
     pass "restart: add-on booted (invalid client_names entries do not block the start)"
+    check "Method 2: the copy of revoked bob's bundle removed at the start (logged), the user's own file kept" eval '
+        file_absent /config/certs/mTLS-client-bob.p12 && file_exists /config/certs/notes.txt &&
+        logs_contain "Removed the copy of '"'"'bob'"'"' from /config/certs (the client is not active)."'
+    check "Method 2: runtime.json has the slug, the dashboard names the folder of the copies" eval '
+        test "$(cexec jq -r .config_slug /run/caddy-mtls/runtime.json)" == local_caddy_mtls &&
+        [[ "$(cexec curl -fsS --max-time 10 http://127.0.0.1:8099/ 2>/dev/null)" == *"<code>app_configs/local_caddy_mtls/certs/</code>"* ]]'
     check "M5: dave-phone (new in client_names) issued: state active, key/p12 600, active/ pem" eval '
         test "$(state ".clients[] | select(.name == \"dave-phone\") | .status")" == active &&
         test "$(state ".clients[] | select(.name == \"dave-phone\") | .serial")" == "$(crt_serial /data/certs/mTLS-client-dave-phone.crt)" &&
@@ -823,11 +851,15 @@ log "no-mtls: booting (mtls_enabled: false, log_level debug)"
 before=${FAIL_COUNT}
 CORE_INFO='{"port": 80, "ssl": false}'
 OPT_LOG_LEVEL=debug
+SEED_SLUG=""
 boot no-mtls "$(options home.example.com false none "" homeassistant "")"
+SEED_SLUG=local_caddy_mtls
 OPT_LOG_LEVEL=info
 CORE_INFO=""
 if wait_for "${BOOT_TIMEOUT}" booted; then
     pass "no-mtls: add-on booted"
+    check "no-mtls: no slug from the Supervisor -> config_slug null" \
+        test "$(cexec jq -r .config_slug /run/caddy-mtls/runtime.json)" == null
     check "no-mtls: caddy validate /etc/caddy/Caddyfile" caddy_validate
     check "no-mtls: no client_auth, no CRL site, no tls block in the Caddyfile" \
         eval '! cexec grep -E "client_auth|mTLS-CA.crl|^ *tls \{" /etc/caddy/Caddyfile >/dev/null'

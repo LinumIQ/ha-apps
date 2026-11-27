@@ -336,6 +336,12 @@
   font-style: italic;
 }
 
+.clients__mirror {
+  margin: var(--space-4) 0 0;
+  color: var(--color-text-muted);
+  font-size: var(--text-sm);
+}
+
 .empty-state {
   padding: var(--space-6) var(--space-4);
   background: var(--color-surface-alt);

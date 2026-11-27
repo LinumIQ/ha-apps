@@ -419,9 +419,34 @@ no longer work with the add-on.
 
 ### Method 2: File Access
 
-Certificates are also available at:
+At every start (with mTLS on) the add-on copies these files into the `certs`
+folder of its own configuration folder in Home Assistant:
 
-- `/addon_configs/local_caddy_mtls/certs/` (via Samba or SSH add-ons)
+- `mTLS-CA.crt` - the CA certificate,
+- `mTLS-CA.crl` - the certificate revocation list,
+- `mTLS-client-<name>.p12` - the bundle of each **active** client.
+
+The folder is `app_configs/<slug>/certs/`. The slug ends in `_caddy_mtls`:
+it is `2644ca2c_caddy_mtls` when you added the repository as
+`https://github.com/LinumIQ/ha-apps`, and `local_caddy_mtls` for a local
+copy in the `local_apps` (formerly `addons`) folder. The web interface shows
+the exact folder under **Client certificates**. To reach it:
+
+- **Samba share** app: the share `app_configs`, folder
+  `<slug>/certs/` (the old share name `addon_configs` still works);
+- **Terminal & SSH** app: `/app_configs/<slug>/certs/` (before version 10.5
+  of that app: `/addon_configs/<slug>/certs/`);
+- **File editor** app: `/app_configs/<slug>/certs/`, only with its option
+  `enforce_basepath: false`.
+
+Older versions of Home Assistant (Supervisor before 2026.7) call the folder
+`addon_configs` instead of `app_configs`.
+
+The copy is refreshed only when the add-on starts: a client you create,
+regenerate or revoke in the web interface, and a regenerated CA, show up there
+after the next restart. Since 2.3.0 the bundle of a client that is no longer
+active is removed from the folder at the start (before, it stayed there).
+The copies are for download only: deleting them revokes nothing.
 
 ## Installing Client Certificates
 
@@ -578,8 +603,8 @@ again, so pick a new name for a replacement device.
 public - set your own). After you change it, the add-on checks at the next
 start whether each active client's bundle opens with the new password and
 re-encrypts every one that does not (the log shows one line per bundle);
-the copies in the add-on's `certs` folder in `/addon_configs/` are refreshed
-too. Download the bundles again and give your users the new password -
+the copies in the add-on's `certs` folder (`app_configs/<slug>/certs/`, see
+[Method 2: File Access](#method-2-file-access)) are refreshed too. Download the bundles again and give your users the new password -
 bundles they downloaded before keep the old one.
 
 ## Certificate Revocation
@@ -600,8 +625,8 @@ bundle and issues new certificates for the **active** clients - download
 and distribute them again. Revoked clients stay revoked; revoke the clients
 you want to drop for good before regenerating the CA.
 
-Deleting files in the add-on's `certs` folder in `/addon_configs/` or
-removing names from `client_names` revokes nothing: that folder only holds
+Deleting files in the add-on's `certs` folder (`app_configs/<slug>/certs/`)
+or removing names from `client_names` revokes nothing: that folder only holds
 copies for download.
 
 ## Expiration Notifications

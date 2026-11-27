@@ -309,6 +309,7 @@ def index(request: Request) -> Any:
     crl_exists = (CERT_DIR / "mTLS-CA.crl").exists()
     flash_error = request.query_params.get("error") or None
     flash_ok = request.query_params.get("ok") or None
+    runtime = public_cert.read_runtime()
     return templates.TemplateResponse(
         request,
         "index.html",
@@ -320,8 +321,10 @@ def index(request: Request) -> Any:
             "flash_ok": flash_ok,
             **_public_cert_context(),
             **_upstream_context(),
-            # The "Local network" card (the facts of this start).
-            "lan_rt": public_cert.read_runtime(),
+            # The facts of this start: the "Local network" card, the
+            # add-on's configuration folder (the certificate copies).
+            "lan_rt": runtime,
+            "rt": runtime,
         },
     )
 

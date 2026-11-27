@@ -317,6 +317,24 @@ read_host_ports() {
 }
 read_host_ports || true
 
+# The add-on's own folder in Home Assistant's app configuration folders (on
+# the host app_configs/<slug>/, called addon_configs before Supervisor
+# 2026.7; /config in here): the slug ends in _caddy_mtls and starts with the
+# repository's hash (local_ for a local copy). The panel shows the real
+# folder; unknown outside Supervisor.
+CONFIG_SLUG=""
+read_config_slug() {
+    local slug
+    if [[ -z "${SUPERVISOR_TOKEN:-}" ]] && ! bashio::cache.exists 'addons.self.info'; then
+        return 0
+    fi
+    slug="$(bashio::app.slug)" || return 0
+    if [[ "${slug}" != null && "${slug}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$ ]]; then
+        CONFIG_SLUG="${slug}"
+    fi
+}
+read_config_slug || true
+
 # The local-network site answers private source addresses only (lan.py) and
 # refuses the container's default gateways although they are private:
 # Docker's userland proxy forwards IPv6 connections to a container without
@@ -603,7 +621,10 @@ if (( VALIDATE_RC != 0 )); then
 fi
 
 ###############################################################################
-# Mirror certs to /config for user access via the Samba/SSH/file editor add-ons.
+# Mirror certs to /config for user access via the Samba/SSH/file editor apps
+# (on the host: app_configs/<slug>/certs/). Only here, at the start: a client
+# added, revoked or regenerated in the web interface shows up in (or leaves)
+# the copy at the next start.
 ###############################################################################
 if bashio::var.true "${MTLS_ENABLED}" && [[ -d "/config" ]]; then
     bashio::log.info "Mirroring certificates to /config/certs..."
@@ -621,8 +642,10 @@ if bashio::var.true "${MTLS_ENABLED}" && [[ -d "/config" ]]; then
         chmod 644 /config/certs/mTLS-CA.crl 2>/dev/null || true
     fi
 
+    declare -A MIRRORED_CLIENTS=()
     while IFS= read -r client_name; do
         [[ -z "${client_name}" ]] && continue
+        MIRRORED_CLIENTS["${client_name}"]=1
         src="${CERT_DIR}/mTLS-client-${client_name}.p12"
         dst="/config/certs/mTLS-client-${client_name}.p12"
         if [[ -f "${src}" ]] && cp "${src}" "${dst}"; then
@@ -631,6 +654,19 @@ if bashio::var.true "${MTLS_ENABLED}" && [[ -d "/config" ]]; then
             bashio::log.warning "Could not copy '${src}' to /config/certs"
         fi
     done < <(state_active_clients)
+
+    # The bundles of clients that are no longer active (revoked, or not
+    # re-issued with a regenerated CA) leave the copy (since 2.3.0; before,
+    # they stayed there for good). Only the add-on's own file names.
+    for dst in /config/certs/mTLS-client-*.p12; do
+        [[ -f "${dst}" && ! -L "${dst}" ]] || continue
+        client_name="${dst#/config/certs/mTLS-client-}"
+        client_name="${client_name%.p12}"
+        [[ -n "${MIRRORED_CLIENTS["${client_name}"]:-}" ]] && continue
+        if rm -f -- "${dst}"; then
+            bashio::log.info "Removed the copy of '${client_name}' from /config/certs (the client is not active)."
+        fi
+    done
 fi
 
 ###############################################################################
@@ -714,6 +750,7 @@ jq -n \
     --arg lan_port "${LAN_HOST_PORT}" \
     --arg lan_state "${LAN_STATE}" \
     --arg lan_refused "${LAN_REFUSED[*]}" \
+    --arg config_slug "${CONFIG_SLUG}" \
     '{domain: $domain, started_at: $started_at, host_ports_known: $ports_known,
       http_host_port: ($http_port | tonumber? // null),
       https_host_port: ($https_port | tonumber? // null),
@@ -722,7 +759,8 @@ jq -n \
       upstream_host: $upstream_host, upstream_port: $upstream_port,
       mtls_enabled: $mtls, forwarded_headers: $forwarded,
       lan_host_port: ($lan_port | tonumber? // null), lan_state: $lan_state,
-      lan_refused: ($lan_refused | split(" ") | map(select(. != "")))}' \
+      lan_refused: ($lan_refused | split(" ") | map(select(. != ""))),
+      config_slug: (if $config_slug == "" then null else $config_slug end)}' \
     > "${RUNTIME_FILE}.tmp"
 chmod 644 "${RUNTIME_FILE}.tmp"
 mv -f "${RUNTIME_FILE}.tmp" "${RUNTIME_FILE}"

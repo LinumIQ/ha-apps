@@ -132,7 +132,9 @@ administrators only):
   download and distribute again. Revoked clients stay revoked - revoke the
   clients you want to drop for good *before* regenerating the CA.
 
-Deleting certificate files in `/addon_configs/` or removing names from
+Deleting certificate files in the add-on's configuration folder
+(`app_configs/<slug>/certs/`, see
+[DOCS.md](DOCS.md#method-2-file-access)) or removing names from
 `client_names` revokes nothing: that folder only holds copies for download,
 and the CA and the list of accepted certificates live in the add-on's own
 storage. See [DOCS.md](DOCS.md#certificate-revocation).
