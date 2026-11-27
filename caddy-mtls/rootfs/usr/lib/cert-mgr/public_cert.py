@@ -55,7 +55,7 @@ _SUCCESS_MESSAGES = {"certificate obtained successfully", "certificate renewed s
 _ERROR_LEVELS = {"error", "fatal", "panic", "dpanic"}
 _ACME_ERROR_PREFIX = "urn:ietf:params:acme:error:"
 # An ACME problem as certmagic prints it in "error" strings, e.g.
-# "HTTP 400 urn:ietf:params:acme:error:connection - 86.62.32.88: Error getting
+# "HTTP 400 urn:ietf:params:acme:error:connection - 203.0.113.10: Error getting
 # validation data" (optionally after "[<domain>] Obtain: ").
 _PROBLEM_IN_TEXT = re.compile(
     r"HTTP \d+ urn:ietf:params:acme:error:(?P<type>[A-Za-z0-9_.-]+) - (?P<detail>.*)", re.S
