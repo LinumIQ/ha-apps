@@ -59,12 +59,19 @@ profile caddy_mtls flags=(attach_disconnected,mediate_deleted) {
   /etc/caddy/client-fingerprints.caddy rw,
   /etc/caddy/.client-fingerprints.caddy.* rw,
   /etc/caddy/Caddyfile rw,
+  # Custom Caddyfile snippets (2.3.0): the reference rendering of the
+  # integrity check, the checked copies (customconf.py) that Caddy imports.
+  /etc/caddy/Caddyfile.reference rw,
+  /etc/caddy/custom/ rw,
+  /etc/caddy/custom/* rw,
 
   # Persistent add-on data and config
   /data/** rwk,
   /ssl/** rwk,
   /share/** rwk,
   /config/** rwk,
+  # (includes /config/caddy/: the user's custom snippets are read - lstat
+  # first, regular files only - and README.txt is written there.)
 
   # Deny dangerous operations
   deny /sys/kernel/security/** wl,

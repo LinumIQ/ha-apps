@@ -24,6 +24,7 @@ CERT_MGR = Path(
 )
 sys.path.insert(0, str(CERT_MGR))
 
+import customconf  # noqa: E402
 import headerauth  # noqa: E402
 import public_cert  # noqa: E402
 import upstream  # noqa: E402
@@ -221,6 +222,7 @@ class RenderTests(unittest.TestCase):
                                mode="strip", reachable=True, source_address="172.30.33.3"),
             ),
             "ha": headerauth.card_context({"domain": "home.example.org", "mtls_enabled": True}),
+            "cc": customconf.card_context({"state": "none", "files": [], "ignored": []}),
         }
 
     def test_dashboard(self):
@@ -479,6 +481,55 @@ class HeaderAuthCardTests(unittest.TestCase):
         self.assertNotIn("fetch(", helper)
         self.assertNotIn("XMLHttpRequest", helper)
         self.assertNotIn("onclick", (TEMPLATES / "_headerauth.html").read_text())
+
+
+@unittest.skipIf(jinja2 is None, "Jinja2 not installed (run inside the add-on image)")
+class CustomCardTests(unittest.TestCase):
+    """The "Custom Caddy configuration" card (2.3.0): hidden without files,
+    loaded (files, folder, restart), rejected (danger, Caddy's message, what
+    to do), ignored entries."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.env = jinja2.Environment(loader=jinja2.FileSystemLoader(str(TEMPLATES)), autoescape=True)
+
+    def render(self, state):
+        return self.env.get_template("_custom.html").render({"cc": customconf.card_context(state)})
+
+    def test_hidden_without_files(self):
+        self.assertEqual(self.render({"state": "none", "files": [], "ignored": []}).strip(), "")
+
+    def test_loaded(self):
+        html = self.render({"state": "loaded", "folder": "app_configs/2644ca2c_caddy_mtls/caddy",
+                            "files": [{"name": "site.caddy", "bytes": 120}, {"name": "sites.caddy", "bytes": 40}]})
+        for needle in ('id="custom-config"', 'data-state="loaded"', "status--success", ">In use<",
+                       "<code>caddy/site.caddy</code> (120 bytes)", "Restart the add-on to apply changes",
+                       "<code>app_configs/2644ca2c_caddy_mtls/caddy/</code>",
+                       "<code>/app_configs/2644ca2c_caddy_mtls/caddy/</code>"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, html)
+
+    def test_rejected(self):
+        html = self.render({"state": "rejected", "folder": "app_configs/local_caddy_mtls/caddy",
+                            "files": [{"name": "site.caddy", "bytes": 12}], "error_file": "site.caddy",
+                            "error": "adapting config: File to import not found: x, at caddy/site.caddy:2 <b>"})
+        for needle in ('data-state="rejected"', "status--danger", ">Not in use<", 'role="alert"',
+                       "Your custom files are NOT in use.", "at caddy/site.caddy:2 &lt;b&gt;",
+                       "correct\n    <code>site.caddy</code>", "restart the app",
+                       "Do not rely on a\n    snippet for a restriction"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, html)
+
+    def test_ignored_only(self):
+        html = self.render({"state": "none", "files": [], "folder": None,
+                            "ignored": [{"name": "lan.caddy", "reason": "larger than 256 KiB"}]})
+        self.assertIn('data-state="none"', html)
+        self.assertIn("<code>caddy/lan.caddy</code>: larger than 256 KiB", html)
+        self.assertIn("caddy/ in the add-on&#39;s configuration folder", html)
+
+    def test_dashboard_includes_it(self):
+        index = (TEMPLATES / "index.html").read_text()
+        self.assertLess(index.index('"_headerauth.html"'), index.index('"_custom.html"'))
 
 
 class UpstreamTextsTests(unittest.TestCase):

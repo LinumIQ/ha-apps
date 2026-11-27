@@ -47,6 +47,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import BaseHTTPMiddleware
 
 import caddyctl
+import customconf
 import headerauth
 import public_cert
 import upstream
@@ -323,6 +324,9 @@ def index(request: Request) -> Any:
             # The "Header authentication" card (name, key length - never
             # the key).
             "ha": headerauth.card_context(_runtime_json()),
+            # The "Custom Caddy configuration" card (only when files
+            # counted or were ignored).
+            "cc": customconf.card_context(customconf.read_state()),
         },
     )
 

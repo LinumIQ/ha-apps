@@ -1,0 +1,63 @@
+{#- "Custom Caddy configuration" card (since 2.3.0), shown only when custom
+    files counted or entries were ignored. cc: customconf.card_context (the
+    state of this start: loaded | rejected | none, the files, the ignored
+    entries, Caddy's message, the host folder). -#}
+{%- if cc.show -%}
+{%- set labels = {"loaded": "In use", "rejected": "Not in use", "none": "None in use"} -%}
+{%- set badges = {"loaded": "success", "rejected": "danger", "none": "warn"} -%}
+{%- set folder = cc.folder or "caddy/ in the add-on's configuration folder" -%}
+<section
+  class="card cc cc--{{ cc.state }}"
+  id="custom-config"
+  aria-labelledby="cc-heading"
+  data-state="{{ cc.state }}"
+>
+  <div class="card__header">
+    <h2 class="card__title" id="cc-heading">Custom Caddy configuration</h2>
+    <span class="status status--{{ badges[cc.state] }}">{{ labels[cc.state] }}</span>
+  </div>
+
+  {% if cc.state == "rejected" %}
+  <div class="cc__error" role="alert">
+    <strong>Your custom files are NOT in use.</strong> Caddy or the add-on's
+    integrity check rejected them, so the add-on runs with its own
+    configuration only - one rejected file drops all of them.
+    <code class="cc__error-text">{{ cc.error }}</code>
+  </div>
+  <p class="cc__note"><strong>What to do:</strong> correct
+    {% if cc.error_file %}<code>{{ cc.error_file }}</code>{% else %}the file{% endif %}
+    in <code>{{ folder }}/</code> and restart the app. Do not rely on a
+    snippet for a restriction without checking this card after the restart.</p>
+  {% elif cc.state == "loaded" %}
+  <p class="cc__lead">
+    Applied when the add-on started, after Caddy and the add-on's integrity
+    check accepted them. <strong>Restart the add-on to apply changes</strong>
+    to these files.
+  </p>
+  {% else %}
+  <p class="cc__lead">No custom file is in use.</p>
+  {% endif %}
+
+  {% if cc.files %}
+  <ul class="cc__list">
+    {% for f in cc.files %}
+    <li><code>caddy/{{ f.name }}</code> ({{ f.bytes }} bytes)</li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+  {% if cc.ignored %}
+  <p class="cc__note"><strong>Ignored:</strong></p>
+  <ul class="cc__list">
+    {% for i in cc.ignored %}
+    <li><code>caddy/{{ i.name }}</code>: {{ i.reason }}</li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+  <p class="cc__note">
+    Folder: <code>{{ folder }}/</code>{% if cc.folder %} (Samba share
+    <code>app_configs</code>; in the SSH app <code>/{{ cc.folder }}/</code>){% endif %}.
+    Its <code>README.txt</code> and the documentation (section "Custom
+    Caddyfile snippets") describe the four files.
+  </p>
+</section>
+{%- endif -%}

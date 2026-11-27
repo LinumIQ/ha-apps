@@ -31,4 +31,7 @@ if [[ "${ACME_DNS_PROVIDER}" != "none" ]]; then
 fi
 
 bashio::log.info "Starting Caddy server..."
+# Caddy needs no access to the Supervisor; a custom Caddyfile snippet (2.3.0)
+# could read its environment through {env.*} placeholders.
+unset SUPERVISOR_TOKEN HASSIO_TOKEN
 exec /usr/bin/caddy run --config /etc/caddy/Caddyfile --adapter caddyfile

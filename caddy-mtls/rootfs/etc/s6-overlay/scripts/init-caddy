@@ -4,8 +4,10 @@
 # Init oneshot: validate config, ensure the CA, refresh /data/state.json
 # metadata, issue certificates for new names in `client_names` (every start),
 # re-encrypt .p12 bundles after a client_cert_password change, check whether
-# the upstream accepts forwarded requests (forwarded_headers), render the
-# Caddyfile, generate the CRL, populate the active-cert allowlist.
+# the upstream accepts forwarded requests (forwarded_headers), set up header
+# authentication (the key file, the list of active certificates), collect and
+# check the custom Caddyfile snippets, render the Caddyfile, generate the
+# CRL, populate the active-cert allowlist.
 # ==============================================================================
 set -e
 
@@ -53,6 +55,13 @@ readonly PANEL_PYTHON="/usr/lib/cert-mgr/.venv/bin/python3"
 # reload).
 readonly HEADER_KEY_FILE="/etc/caddy/header-auth.key"
 readonly FINGERPRINT_FILE="/etc/caddy/client-fingerprints.caddy"
+# Custom Caddyfile snippets (since 2.3.0): the user's files in /config/caddy,
+# their checked copies (the Caddyfile imports these, never the user's files)
+# and the state for the panel and the monitor.
+readonly CUSTOMCONF_PY="/usr/lib/cert-mgr/customconf.py"
+readonly CUSTOM_SRC="/config/caddy"
+readonly CUSTOM_DIR="/etc/caddy/custom"
+readonly CUSTOM_STATE="${RUNTIME_DIR}/custom.json"
 STARTED_AT="$(date +%s)"
 
 mkdir -p "${CERT_DIR}" "${CADDY_DATA}" "${CADDY_DATA}/log" "${RUNTIME_DIR}"
@@ -394,6 +403,33 @@ read_config_slug() {
 }
 read_config_slug || true
 
+###############################################################################
+# Custom Caddyfile snippets for experts (since 2.3.0): customconf.py writes
+# README.txt into ${CUSTOM_SRC}, decides which of global.caddy, site.caddy,
+# lan.caddy and sites.caddy count (regular files only - nothing else is
+# opened -, at most 256 KiB, not blank; no imports of other files), copies
+# them to ${CUSTOM_DIR} and records the state in ${CUSTOM_STATE}. Whether
+# they are used is decided after rendering (caddy validate + the integrity
+# check); a rejection drops all four and the add-on starts without them.
+###############################################################################
+CUSTOM_JSON=""
+if ! CUSTOM_JSON="$("${PANEL_PYTHON}" "${CUSTOMCONF_PY}" collect --config-dir "${CUSTOM_SRC}" \
+        --copy-dir "${CUSTOM_DIR}" --state "${CUSTOM_STATE}" --slug "${CONFIG_SLUG}")" \
+        || ! jq -e '.state' >/dev/null 2>&1 <<<"${CUSTOM_JSON}"; then
+    bashio::log.warning "Could not read the custom Caddyfile snippets (customconf.py): starting without them."
+    rm -rf "${CUSTOM_DIR}"
+    CUSTOM_JSON='{"state": "none", "files": [], "ignored": []}'
+fi
+CUSTOM_FILES=()
+if [[ "$(jq -r '.state' <<<"${CUSTOM_JSON}")" == loaded ]]; then
+    mapfile -t CUSTOM_FILES < <(jq -r '.files[].name' <<<"${CUSTOM_JSON}")
+fi
+while IFS=$'\t' read -r name reason; do
+    [[ -n "${name}" ]] && bashio::log.warning "Custom Caddyfile snippets: caddy/${name} is ignored: ${reason}."
+done < <(jq -r '.ignored[]? | [.name, .reason] | @tsv' <<<"${CUSTOM_JSON}")
+# custom_counts <file>: the file is one of the counting custom files.
+custom_counts() { [[ " ${CUSTOM_FILES[*]} " == *" $1 "* ]]; }
+
 # The local-network site answers private source addresses only (lan.py) and
 # refuses the container's default gateways although they are private:
 # Docker's userland proxy forwards IPv6 connections to a container without
@@ -685,17 +721,21 @@ ${SITE_LOG}
 # port must never be forwarded by the router; the private-address rule is a
 # second line (a published port is reachable over IPv6 wherever the router's
 # IPv6 firewall lets connections in).
-LAN_SITE=""
+LAN_GATEWAY_MATCHER=""
+LAN_GATEWAY_RULE=""
 if [[ "${LAN_STATE}" == on ]]; then
-    LAN_GATEWAY_MATCHER=""
-    LAN_GATEWAY_RULE=""
     if (( ${#LAN_REFUSED[@]} > 0 )); then
         LAN_GATEWAY_MATCHER="
     @docker_gateway remote_ip ${LAN_REFUSED[*]}"
         LAN_GATEWAY_RULE="
         respond @docker_gateway \"403 Forbidden: this connection came from {remote_host}, the address of Docker on the Home Assistant host, which hides where the connection really comes from (an IPv6 connection, or one from the host itself). Connect over IPv4 from a device in your local network: let ${DOMAIN} resolve to the IPv4 address of the Home Assistant host.\" 403"
     fi
-    LAN_SITE="
+fi
+# lan_site: the local-network site's block (nothing while the port is off);
+# LAN_IMPORT is set by render_caddyfile.
+lan_site() {
+    [[ "${LAN_STATE}" == on ]] || return 0
+    printf '%s\n' "
 # Local network (container port 4443): no client certificate, private
 # source addresses only. Never forward its host port on the router.
 https://${DOMAIN}:4443 {
@@ -704,23 +744,72 @@ ${LAN_GATEWAY_MATCHER}
     @not_private not remote_ip ${LAN_PRIVATE_RANGES}
 
     route {${LAN_GATEWAY_RULE}
-        respond @not_private \"403 Forbidden: this HTTPS port of the Caddy mTLS Proxy answers only devices in your local network (private addresses), and this connection came from {remote_host}. From the internet, use https://${DOMAIN}/ with a client certificate.\" 403${HEADER_REMOVE}
+        respond @not_private \"403 Forbidden: this HTTPS port of the Caddy mTLS Proxy answers only devices in your local network (private addresses), and this connection came from {remote_host}. From the internet, use https://${DOMAIN}/ with a client certificate.\" 403${HEADER_REMOVE}${LAN_IMPORT}
         reverse_proxy ${UPSTREAM_HOST}:${UPSTREAM_PORT} {${HEADER_UP_REMOVE}
             # Forwarding headers (forwarded_headers; rewritten at run time)
             import ${FORWARD_SNIPPET}
         }
     }
 ${SITE_LOG}
+}"
+}
+
+# render_caddyfile <file> yes|no: write the Caddyfile, with or without the
+# imports of the custom snippets (no: also the reference of the integrity
+# check). The copies are imported at four fixed places: global.caddy first
+# in the global options (the add-on's own options win: Caddy keeps the later
+# of two), site.caddy / lan.caddy inside the site's route after the gate and
+# the header removal and before the proxy, sites.caddy last.
+render_caddyfile() {
+    local file="$1"
+    GLOBAL_IMPORT="" SITE_IMPORT="" LAN_IMPORT="" SITES_IMPORT="" MTLS_SNIPPET=""
+    if [[ "$2" == yes ]]; then
+        if custom_counts global.caddy; then
+            GLOBAL_IMPORT="
+    # Custom global options (caddy/global.caddy) - first, so the add-on's
+    # own options below win.
+    import ${CUSTOM_DIR}/global.caddy
+"
+        fi
+        if custom_counts site.caddy; then
+            SITE_IMPORT="
+        # Custom directives (caddy/site.caddy): after the gate, before the proxy.
+        import ${CUSTOM_DIR}/site.caddy"
+        fi
+        if custom_counts lan.caddy; then
+            LAN_IMPORT="
+        # Custom directives (caddy/lan.caddy): after the address checks, before the proxy.
+        import ${CUSTOM_DIR}/lan.caddy"
+        fi
+        if custom_counts sites.caddy; then
+            SITES_IMPORT="
+# Custom sites and snippets (caddy/sites.caddy) - last.
+import ${CUSTOM_DIR}/sites.caddy"
+        fi
+        if bashio::var.true "${MTLS_ENABLED}"; then
+            MTLS_SNIPPET="
+# For custom sites (caddy/sites.caddy): \"import mtls\" = the add-on's strict
+# client certificate check (always required, also with a header key).
+(mtls) {
+    tls {
+${TLS_ISSUER_DIRECTIVES}        client_auth {
+            mode require_and_verify
+            trust_pool file {
+                pem_file ${CERT_DIR}/mTLS-CA.crt
+            }
+            verifier leaf {
+                folder ${CERT_DIR}/active
+            }
+        }
+    }
 }
 "
-fi
-
-# render_caddyfile <file>: write the Caddyfile.
-render_caddyfile() {
-    cat > "$1" <<CADDYFILE
+        fi
+    fi
+    cat > "${file}" <<CADDYFILE
 # Caddy mTLS Proxy - generated by init-caddy on every start. Do not edit.
 
-{
+{${GLOBAL_IMPORT}
     email ${EMAIL}${ACME_CA_OPTION}
 
     storage file_system {
@@ -765,15 +854,15 @@ render_caddyfile() {
         include ${ACME_LOGGERS}
     }
 }
-
+${MTLS_SNIPPET}
 # Public reverse proxy: one route in every mode - the gate (with a header
-# key), the header's removal, the proxy - in this order (Caddy keeps the
-# order written inside a route).
+# key), the header's removal, custom directives (caddy/site.caddy), the
+# proxy - in this order (Caddy keeps the order written inside a route).
 ${DOMAIN} {
     ${TLS_BLOCK}
 ${PUBLIC_MATCHERS}
 
-    route {${PUBLIC_GATE}${HEADER_REMOVE}
+    route {${PUBLIC_GATE}${HEADER_REMOVE}${SITE_IMPORT}
         reverse_proxy ${UPSTREAM_HOST}:${UPSTREAM_PORT} {${HEADER_UP_REMOVE}
             # Forwarding headers (forwarded_headers; rewritten at run time)
             import ${FORWARD_SNIPPET}
@@ -781,12 +870,13 @@ ${PUBLIC_MATCHERS}
     }
 ${SITE_LOG}
 }
-${HTTP_SITE}${LAN_SITE}
+${HTTP_SITE}$(lan_site)${SITES_IMPORT}
 CADDYFILE
     # Caddy's own formatting (tabs), so that `caddy validate` / `caddy run`
-    # do not warn "Caddyfile input is not formatted" at every start.
-    if ! /usr/bin/caddy fmt --overwrite "$1" >/dev/null 2>&1; then
-        bashio::log.warning "caddy fmt could not format $1; validating it as it is."
+    # do not warn "Caddyfile input is not formatted" at every start (only
+    # this file: the imported copies stay as the user wrote them).
+    if ! /usr/bin/caddy fmt --overwrite "${file}" >/dev/null 2>&1; then
+        bashio::log.warning "caddy fmt could not format ${file}; validating it as it is."
     fi
 }
 
@@ -800,13 +890,56 @@ caddy_validate() {
         | "${PANEL_PYTHON}" "${HEADERAUTH_PY}" scrub --key-file "${HEADER_KEY_FILE}"
 }
 
-render_caddyfile "${CADDYFILE}"
+# custom_reject <customconf.py reject arguments...>: the custom files are not
+# used (state rejected, copies removed); prints the reason.
+custom_reject() {
+    CUSTOM_FILES=()
+    "${PANEL_PYTHON}" "${CUSTOMCONF_PY}" reject --copy-dir "${CUSTOM_DIR}" --state "${CUSTOM_STATE}" "$@" \
+        || printf '%s\n' "the custom files could not be checked"
+}
 
-bashio::log.info "Validating generated Caddyfile..."
-VALIDATE_RC=0
-caddy_validate "${CADDYFILE}" || VALIDATE_RC=$?
-if (( VALIDATE_RC != 0 )); then
-    bashio::exit.nok "Generated Caddyfile failed validation"
+# With custom files: render with them, validate, then the integrity check -
+# the configuration Caddy builds from it (caddy adapt) against the same
+# rendering without them (customconf.py check). Either failing drops all of
+# them: render again without, validate as always.
+if (( ${#CUSTOM_FILES[@]} > 0 )); then
+    render_caddyfile "${CADDYFILE}" yes
+    bashio::log.info "Validating generated Caddyfile with the custom snippets (${CUSTOM_FILES[*]/#/caddy/})..."
+    VALIDATE_OUT="$(mktemp)"
+    VALIDATE_RC=0
+    caddy_validate "${CADDYFILE}" >"${VALIDATE_OUT}" || VALIDATE_RC=$?
+    sed "s#${CUSTOM_DIR}/#caddy/#g" "${VALIDATE_OUT}"
+    if (( VALIDATE_RC != 0 )); then
+        custom_reject --validate-output "${VALIDATE_OUT}" >/dev/null
+    else
+        render_caddyfile "${CADDYFILE}.reference" no
+        ADAPTED="${RUNTIME_DIR}/custom-adapted.json"
+        REFERENCE="${RUNTIME_DIR}/custom-reference.json"
+        if /usr/bin/caddy adapt --config "${CADDYFILE}" --adapter caddyfile >"${ADAPTED}" 2>/dev/null \
+            && /usr/bin/caddy adapt --config "${CADDYFILE}.reference" --adapter caddyfile >"${REFERENCE}" 2>/dev/null; then
+            CHECK_JSON=""
+            if ! CHECK_JSON="$("${PANEL_PYTHON}" "${CUSTOMCONF_PY}" check --adapted "${ADAPTED}" --reference "${REFERENCE}" \
+                    --domain "${DOMAIN}" --upstream "${UPSTREAM_HOST}:${UPSTREAM_PORT}" --header-auth "${HEADER_AUTH}" \
+                    --state "${CUSTOM_STATE}")"; then
+                custom_reject --message "The add-on's integrity check refused them: $(jq -r '.message // "unknown"' <<<"${CHECK_JSON}" 2>/dev/null)" \
+                    --file "$(jq -r '.file // ""' <<<"${CHECK_JSON}" 2>/dev/null)" >/dev/null
+            fi
+        else
+            custom_reject --message "Caddy could not adapt the configuration for the integrity check." >/dev/null
+        fi
+        chmod 600 "${ADAPTED}" "${REFERENCE}" 2>/dev/null || true
+        rm -f "${CADDYFILE}.reference"
+    fi
+    rm -f "${VALIDATE_OUT}"
+fi
+if (( ${#CUSTOM_FILES[@]} == 0 )); then
+    render_caddyfile "${CADDYFILE}" no
+    bashio::log.info "Validating generated Caddyfile..."
+    VALIDATE_RC=0
+    caddy_validate "${CADDYFILE}" || VALIDATE_RC=$?
+    if (( VALIDATE_RC != 0 )); then
+        bashio::exit.nok "Generated Caddyfile failed validation"
+    fi
 fi
 
 ###############################################################################
@@ -884,6 +1017,43 @@ if [[ "${HEADER_AUTH}" == true ]]; then
 else
     bashio::log.info "  Header auth: off (option header_auth_key)"
 fi
+
+###############################################################################
+# Custom Caddyfile snippets (since 2.3.0): one line per file in use, or a
+# prominent block when they were rejected (the panel's card "Custom Caddy
+# configuration" and a notification say the same).
+###############################################################################
+custom_notice() {
+    local state folder
+    state="$(jq -r '.state' "${CUSTOM_STATE}" 2>/dev/null)" || state=none
+    folder="$(jq -r '.folder // ""' "${CUSTOM_STATE}" 2>/dev/null)" || folder=""
+    [[ -n "${folder}" ]] || folder="caddy/ in the add-on's configuration folder"
+    case "${state}" in
+        loaded)
+            bashio::log.info "  Custom:      in use (checked by Caddy and by the add-on's integrity check), from ${folder}:"
+            while IFS=$'\t' read -r name bytes; do
+                bashio::log.info "               caddy/${name} (${bytes} bytes)"
+            done < <(jq -r '.files[] | [.name, .bytes] | @tsv' "${CUSTOM_STATE}")
+            bashio::log.info "               Changes to these files take effect when the add-on restarts."
+            ;;
+        rejected)
+            bashio::log.warning "------------------------------------------------------------"
+            bashio::log.warning "Your custom Caddyfile snippets are NOT in use: the add-on"
+            bashio::log.warning "runs with its own configuration only (one rejected file"
+            bashio::log.warning "drops all of them)."
+            bashio::log.warning ""
+            bashio::log.warning "$(jq -r '.error' "${CUSTOM_STATE}")"
+            bashio::log.warning ""
+            bashio::log.warning "Fix the file in ${folder}/ and restart the add-on."
+            bashio::log.warning "Details: the add-on's web interface (card \"Custom Caddy configuration\")."
+            bashio::log.warning "------------------------------------------------------------"
+            ;;
+        *)
+            bashio::log.info "  Custom:      none (Caddyfile snippets: see README.txt in ${folder})"
+            ;;
+    esac
+}
+custom_notice || true
 
 ###############################################################################
 # Published host ports (read above). Informational - never fails the start.

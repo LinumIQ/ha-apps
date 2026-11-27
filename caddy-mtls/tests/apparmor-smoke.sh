@@ -25,7 +25,10 @@
 # with a new client name and a new client_cert_password (issuance and .p12
 # re-encryption at start-up). Header authentication (2.3.0) is on: the key
 # file (headerauth.py), the list of active client certificates (caddyctl.py,
-# at the start and before each reload) and the gate run under the profile.
+# at the start and before each reload) and the gate run under the profile;
+# custom Caddyfile snippets (2.3.0) are in use: customconf.py reads
+# /config/caddy (README.txt written), copies the files, Caddy adapts the
+# configuration twice for the integrity check.
 # Fails on any AppArmor denial for the profile.
 #
 # No external network traffic: the container runs with --network none and
@@ -129,6 +132,10 @@ printf 'fakekey.NOT-A-SECRET.%s' "$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
 jq --rawfile key "${WORK}/key" '. + {header_auth_key: $key}' "${WORK}/data/options.json" >"${WORK}/options.json"
 mv "${WORK}/options.json" "${WORK}/data/options.json"
 cp "${WORK}/data/options.json" "${WORK}/tmp/.bashio/addons.self.options.config.cache"
+# Custom snippets (the addon_config mapping is /config).
+mkdir -p "${WORK}/config/caddy"
+printf '%s\n' 'respond /aa-custom "aa custom" 200' >"${WORK}/config/caddy/site.caddy"
+printf '%s\n' 'servers {' '	protocols h1 h2' '}' >"${WORK}/config/caddy/global.caddy"
 # The add-on's network settings with the local-network port (4443/tcp) on.
 printf '%s\n' '{"name":"Caddy mTLS Proxy","network":{"80/tcp":8080,"443/tcp":8443,"4443/tcp":9443}}' \
     >"${WORK}/tmp/.bashio/addons.self.info.cache"
@@ -149,6 +156,7 @@ SUPERVISOR_LOG=/tmp/supervisor-requests.jsonl
     "${IMAGE}" >/dev/null
 copy_into "${WORK}/data" /data
 copy_into "${WORK}/tmp" /tmp
+tar -C "${WORK}" --owner=0 --group=0 --numeric-owner -cf - config | "${DOCKER}" cp - "${CTR}:/"
 tar -C "${SCRIPT_DIR}" --owner=0 --group=0 --numeric-owner -cf - fake-supervisor.py fake-upstream.py | "${DOCKER}" cp - "${CTR}:/tmp"
 "${DOCKER}" start "${CTR}" >/dev/null
 "${DOCKER}" exec -d "${CTR}" /usr/lib/cert-mgr/.venv/bin/python3 /tmp/fake-supervisor.py 8765 "${SUPERVISOR_LOG}"
@@ -176,6 +184,10 @@ lan_listening() {
         cexec sh -c 'grep -qi ":115B " /proc/net/tcp6 /proc/net/tcp' # 0x115B = 4443, listening
 }
 check "Caddy listens on 4443 under ${PROFILE}" wait_for 30 lan_listening
+check "custom snippets in use under ${PROFILE}: README.txt written, copies 0600, integrity check passed" eval '
+    test "$(cexec jq -r .state /run/caddy-mtls/custom.json)" == loaded &&
+    cexec test -s /config/caddy/README.txt && test "$(cexec stat -c %a /etc/caddy/custom/site.caddy)" == 600 &&
+    cexec curl -fsS http://127.0.0.1:2019/config/ | jq -e "[.apps.http.servers[] | select(.listen == [\":443\"]) | .protocols] == [[\"h1\", \"h2\"]]" >/dev/null'
 check "header authentication on: key file 0600 (headerauth.py), the list of active certificates written (caddyctl.py)" eval '
     test "$(cexec stat -c %a /etc/caddy/header-auth.key)" == 600 &&
     cexec grep -E "^not vars \{http.request.tls.client.fingerprint\} [0-9a-f]{64} [0-9a-f]{64}$" /etc/caddy/client-fingerprints.caddy >/dev/null'
@@ -292,6 +304,7 @@ CTR="${CTR2}"
 "${DOCKER}" cp - "${CTR}:/" <"${WORK}/data.tar"
 copy_into "${WORK}/data" /data
 copy_into "${WORK}/tmp" /tmp
+tar -C "${WORK}" --owner=0 --group=0 --numeric-owner -cf - config | "${DOCKER}" cp - "${CTR}:/"
 "${DOCKER}" start "${CTR}" >/dev/null
 check "restart: panel healthy under ${PROFILE}" wait_for 90 health
 pid1="$("${DOCKER}" inspect -f '{{.State.Pid}}' "${CTR}")"
@@ -314,6 +327,9 @@ check "restart: the gate: the key passes (502: no upstream), alice and carol pas
     test "$(gate --cert /data/certs/mTLS-client-alice.crt --key /data/certs/mTLS-client-alice.key)" == 502 &&
     test "$(gate --cert /data/certs/mTLS-client-carol.crt --key /data/certs/mTLS-client-carol.key)" == 502 &&
     test "$(gate --cert /data/certs/mTLS-client-bob.crt --key /data/certs/mTLS-client-bob.key)" == 000'
+check "restart: site.caddy in use: only after the gate (403 without credentials, the custom answer with the key)" eval '
+    test "$(cexec curl -sk --max-time 10 -o /dev/null -w "%{http_code}" --resolve caddy-mtls-aa.localhost:443:127.0.0.1 https://caddy-mtls-aa.localhost/aa-custom)" == 403 &&
+    test "$(cexec curl -sk --max-time 10 --resolve caddy-mtls-aa.localhost:443:127.0.0.1 -H @/tmp/h-key https://caddy-mtls-aa.localhost/aa-custom)" == "aa custom"'
 check "restart: the key is not in the log" eval '! "${DOCKER}" logs "${CTR}" 2>&1 | grep -F -f "${WORK}/key" >/dev/null'
 check "restart: no 'permission denied' in the log" logs_lack "ermission denied"
 check "restart: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_container

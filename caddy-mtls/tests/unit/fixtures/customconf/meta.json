@@ -1,0 +1,106 @@
+{
+ "domain": "caddy-mtls-smoke.localhost",
+ "_about": "caddy adapt output of the add-on's own rendering with (<case>.json) and without (<case>.reference.json) custom files, from Caddy 2.11.9 in the add-on image: SMOKE_FIXTURES_DIR=<dir> SMOKE_ONLY=custom tests/smoke.sh <image> (cases in smoke.sh custom_files)",
+ "ok": {
+  "expect": "ok",
+  "files": [
+   "global.caddy",
+   "site.caddy",
+   "lan.caddy",
+   "sites.caddy"
+  ],
+  "upstream": "homeassistant:8124",
+  "header_auth": true
+ },
+ "ok-strict": {
+  "expect": "ok",
+  "files": [
+   "global.caddy",
+   "site.caddy",
+   "lan.caddy",
+   "sites.caddy"
+  ],
+  "upstream": "127.0.0.1:8123",
+  "header_auth": false
+ },
+ "admin-off": {
+  "expect": "ok",
+  "files": [
+   "global.caddy"
+  ],
+  "upstream": "127.0.0.1:8123",
+  "header_auth": true
+ },
+ "admin-other": {
+  "expect": "ok",
+  "files": [
+   "global.caddy"
+  ],
+  "upstream": "127.0.0.1:8123",
+  "header_auth": true
+ },
+ "storage": {
+  "expect": "ok",
+  "files": [
+   "global.caddy"
+  ],
+  "upstream": "127.0.0.1:8123",
+  "header_auth": true
+ },
+ "breakout-site": {
+  "expect": 1,
+  "files": [
+   "site.caddy"
+  ],
+  "upstream": "127.0.0.1:8123",
+  "header_auth": true
+ },
+ "breakout-lan": {
+  "expect": 1,
+  "files": [
+   "lan.caddy"
+  ],
+  "upstream": "127.0.0.1:8123",
+  "header_auth": true
+ },
+ "pathsite": {
+  "expect": 2,
+  "files": [
+   "sites.caddy"
+  ],
+  "upstream": "127.0.0.1:8123",
+  "header_auth": true
+ },
+ "merged-scheme": {
+  "expect": 1,
+  "files": [
+   "sites.caddy"
+  ],
+  "upstream": "127.0.0.1:8123",
+  "header_auth": true
+ },
+ "merged-port": {
+  "expect": 1,
+  "files": [
+   "sites.caddy"
+  ],
+  "upstream": "127.0.0.1:8123",
+  "header_auth": true
+ },
+ "strict-sni": {
+  "expect": 3,
+  "files": [
+   "global.caddy"
+  ],
+  "upstream": "127.0.0.1:8123",
+  "header_auth": true
+ },
+ "double-close": {
+  "expect": 1,
+  "files": [
+   "site.caddy"
+  ],
+  "upstream": "127.0.0.1:8123",
+  "header_auth": true
+ }
+}
