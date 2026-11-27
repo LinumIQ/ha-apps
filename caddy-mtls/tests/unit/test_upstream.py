@@ -863,10 +863,13 @@ class ApplyTest(TempFiles):
                   "Error: adapting config using caddyfile: /etc/caddy/Caddyfile:42 - unexpected EOF\n")
         done = mock.Mock(returncode=1, stderr=stderr, stdout="")
         with mock.patch.object(upstream.subprocess, "run", return_value=done), \
+                mock.patch.object(upstream.caddyctl, "write_fingerprints") as regenerate, \
                 mock.patch.object(upstream, "CADDYFILE", upstream.STATE_FILE):
             upstream.STATE_FILE.write_text("{}")
             ok, message = upstream.caddy_reload()
         self.assertFalse(ok)
+        # 2.3.0: the fingerprint list was regenerated before the reload.
+        regenerate.assert_called_once_with()
         self.assertEqual(message, "Error: adapting config using caddyfile: /etc/caddy/Caddyfile:42 - unexpected EOF")
         # Caddy 2.11.9 prints the error as a JSON log line with a timestamp.
         caddy_2_11 = ('{"level":"info","ts":1795789792.1,"msg":"using config from file"}\n'

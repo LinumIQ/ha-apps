@@ -49,6 +49,16 @@ profile caddy_mtls flags=(attach_disconnected,mediate_deleted) {
   /usr/lib/cert-mgr/** r,
   /usr/lib/python3*/** mr,
   /etc/caddy/** r,
+  # Written at run time: the forwarding snippet (upstream.py), the header
+  # key (0600) and the list of active client certificates (headerauth.py,
+  # caddyctl.py; since 2.3.0), each through a temporary file + rename.
+  /etc/caddy/forwarded-headers.caddy rw,
+  /etc/caddy/.forwarded-headers.caddy.* rw,
+  /etc/caddy/header-auth.key rw,
+  /etc/caddy/.header-auth.key.* rw,
+  /etc/caddy/client-fingerprints.caddy rw,
+  /etc/caddy/.client-fingerprints.caddy.* rw,
+  /etc/caddy/Caddyfile rw,
 
   # Persistent add-on data and config
   /data/** rwk,

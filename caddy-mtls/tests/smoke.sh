@@ -134,6 +134,9 @@ check() { # check <name> <command...>
     shift
     if "$@"; then pass "${name}"; else fail "${name}"; fi
 }
+# SMOKE_ONLY (optional): the case groups to run, separated by blanks - main,
+# no-mtls, access-log, acme, fwd, lan, dns, bad, auth, custom. Default: all.
+smoke_case() { [[ -z "${SMOKE_ONLY:-}" || " ${SMOKE_ONLY} " == *" $1 "* ]]; }
 cleanup() {
     local rc=$? c
     for c in "${CONTAINERS[@]+"${CONTAINERS[@]}"}"; do
@@ -164,6 +167,10 @@ new_logs_contain() { "${DOCKER}" logs "${CTR}" 2>&1 | tail -n "+$(($1 + 1))" | g
 # The pattern (a secret) is read from a file, never put on a command line.
 logs_lack_secret() { ! "${DOCKER}" logs "${CTR}" 2>&1 | grep -F -f "$1" >/dev/null; }
 secret_file() { printf '%s\n' "$2" >"${WORK}/$1"; printf '%s' "${WORK}/$1"; }
+# raw_file <name> <value>: the value exactly (no line break) in a file of WORK
+# (a key for OPT_HEADER_KEY_FILE); prints the path. printf is a builtin: the
+# value is on no command line.
+raw_file() { printf '%s' "$2" >"${WORK}/$1"; printf '%s' "${WORK}/$1"; }
 running() { [[ "$("${DOCKER}" inspect -f '{{.State.Running}}' "${CTR}" 2>/dev/null)" == true ]]; }
 exited() { [[ "$("${DOCKER}" inspect -f '{{.State.Status}}' "${CTR}" 2>/dev/null)" == exited ]]; }
 health() { [[ "$(cexec curl -fsS --max-time 5 http://127.0.0.1:8099/_health 2>/dev/null)" == ok ]]; }
@@ -264,18 +271,23 @@ show_log_on_failure() {
 # (upstream default 127.0.0.1:8123; an empty port leaves upstream_port unset;
 # client_names, client_cert_password, log_level, access_log and
 # forwarded_headers from OPT_CLIENT_NAMES / OPT_PASSWORD / OPT_LOG_LEVEL /
-# OPT_ACCESS_LOG / OPT_FORWARDED)
+# OPT_ACCESS_LOG / OPT_FORWARDED; header_auth_name from OPT_HEADER_NAME and
+# header_auth_key from the FILE OPT_HEADER_KEY_FILE (exactly its bytes; the
+# key never goes on a command line), each left out when empty)
 OPT_CLIENT_NAMES='["alice", "bob"]'
 OPT_PASSWORD="${P12_PASSWORD}"
 OPT_LOG_LEVEL=info
 OPT_ACCESS_LOG=false
 OPT_FORWARDED=auto
+OPT_HEADER_NAME=""
+OPT_HEADER_KEY_FILE=""
 options() {
     jq -n --arg domain "$1" --argjson mtls "$2" --arg provider "$3" --arg token "$4" \
         --arg uhost "${5:-127.0.0.1}" --arg uport "${6-8123}" \
         --arg pass "${OPT_PASSWORD}" --argjson names "${OPT_CLIENT_NAMES}" \
         --arg level "${OPT_LOG_LEVEL}" --argjson access "${OPT_ACCESS_LOG}" \
-        --arg forwarded "${OPT_FORWARDED}" '{
+        --arg forwarded "${OPT_FORWARDED}" --arg hname "${OPT_HEADER_NAME}" \
+        --rawfile hkey "${OPT_HEADER_KEY_FILE:-/dev/null}" '{
         domain: $domain, email: "smoke@example.com",
         upstream_host: $uhost, mtls_enabled: $mtls,
         ca_country: "AT", ca_state: "Styria", ca_locality: "Graz",
@@ -284,7 +296,9 @@ options() {
         acme_dns_provider: $provider, dns_api_token: $token,
         log_level: $level, access_log: $access, forwarded_headers: $forwarded,
         cert_expiry_warn_days: [30, 14, 7, 1], cert_check_interval_hours: 6}
-        + (if $uport == "" then {} else {upstream_port: ($uport | tonumber)} end)'
+        + (if $uport == "" then {} else {upstream_port: ($uport | tonumber)} end)
+        + (if $hname == "" then {} else {header_auth_name: $hname} end)
+        + (if $hkey == "" then {} else {header_auth_key: $hkey} end)'
 }
 # The "Public certificate" card (GET /public-cert, as the dashboard reloads it).
 card() { cexec curl -fsS --max-time 15 http://127.0.0.1:8099/public-cert 2>/dev/null; }
@@ -318,6 +332,19 @@ P12_PASS_FILE="$(secret_file p12-pass "${P12_PASSWORD}")"
 # 1. main: mTLS on, internal issuer
 # ==============================================================================
 DOMAIN="caddy-mtls-smoke.localhost"
+# Helpers of several case groups.
+dashboard() { cexec curl -fsS --max-time 10 "http://127.0.0.1:8099$1" 2>/dev/null; }
+http80() { cexec curl -s --max-time 5 --resolve "${DOMAIN}:80:127.0.0.1" "$@" 2>/dev/null; }
+# 502 = the client certificate was accepted and the request reached the (absent)
+# upstream; 000 = the TLS handshake was refused.
+mtls() { # mtls <cert> <key>  (empty: no client certificate)
+    local args=()
+    [[ -n "$1" ]] && args=(--cert "$1" --key "$2")
+    cexec curl -sk --max-time 5 -o /dev/null -w '%{http_code}' --resolve "${DOMAIN}:443:127.0.0.1" \
+        "${args[@]+"${args[@]}"}" "https://${DOMAIN}/" 2>/dev/null || true
+}
+mtls_is() { [[ "$(mtls "$2" "$3")" == "$1" ]]; }
+if smoke_case main; then
 log "main: booting ${IMAGE} (mTLS, ${DOMAIN})"
 before=${FAIL_COUNT}
 boot main "$(options "${DOMAIN}" true none "")"
@@ -377,6 +404,20 @@ check "main: admin API config has the leaf verifier on /data/certs/active" \
     adapted '[.. | objects | select(.verifier? == "leaf")] | length == 1 and (.[0] | tostring | contains("/data/certs/active"))'
 check "main: admin API config requires and verifies client certificates" \
     adapted '[.. | objects | select(.mode? == "require_and_verify")] | length == 1'
+# Header authentication (2.3.0) is off by default: the TLS and log rendering
+# of 2.2.0, no gate, no key file.
+check "default: header authentication off - no gate, no header removal, no diagnosis, logs unfiltered, no key file" eval '
+    ! cexec grep -E "caddy_mtls_|header-auth.key|request_header|request>headers|log_append|verify_if_given" /etc/caddy/Caddyfile >/dev/null &&
+    test "$(cexec grep -c "format console" /etc/caddy/Caddyfile)" == 2 &&
+    file_absent /etc/caddy/header-auth.key &&
+    logs_contain "Header auth: off (option header_auth_key)" &&
+    test "$(cexec jq -c .header_auth /run/caddy-mtls/runtime.json)" == "{\"enabled\":false,\"name\":\"X-Custom-PSK\",\"key_length\":0}"'
+check "default: the list of active client certificates is written (alice, bob) but not imported" eval '
+    test "$(cexec grep -cE "^not vars \{http.request.tls.client.fingerprint\} [0-9a-f]{64} [0-9a-f]{64}$" /etc/caddy/client-fingerprints.caddy)" == 1 &&
+    ! cexec grep -F client-fingerprints /etc/caddy/Caddyfile >/dev/null'
+check "default: dashboard card Header authentication off, with the browser-side key helper" eval '
+    html="$(dashboard /)" && [[ "${html}" == *"id=\"header-auth\""*"data-state=\"off\""* &&
+    "${html}" == *">Suggest a key<"* && "${html}" == *"crypto.getRandomValues"* ]]'
 check "main: init-caddy logged the published host ports" \
     logs_contain "Host ports:  80/tcp -> 8080, 443/tcp -> 8443"
 check "main: init-caddy logged the router forwarding hint" \
@@ -416,7 +457,6 @@ check "fwd: card 'Home Assistant connection' unreachable (502 explained)" eval '
     upstream_card_contains "502 Bad Gateway"'
 
 # --- panel --------------------------------------------------------------------
-dashboard() { cexec curl -fsS --max-time 10 "http://127.0.0.1:8099$1" 2>/dev/null; }
 check "main: dashboard HTML lists the seeded clients" \
     eval 'html="$(dashboard /)" && [[ "${html}" == *"Caddy mTLS"* && "${html}" == *alice* && "${html}" == *bob* ]]'
 # The Revoke button's confirm() reads the client name from a data attribute
@@ -475,7 +515,6 @@ check "main: /api/state lists alice + bob active, CA present" \
     test "$(cexec sh -c 'curl -fsS http://127.0.0.1:8099/api/state | jq -r "([.clients[] | select(.status == \"active\") | .name] | sort | join(\",\")), (.ca != null)"' 2>/dev/null | tr '\n' ' ')" == "alice,bob true "
 
 # --- plain HTTP site (container port 80) ------------------------------------------
-http80() { cexec curl -s --max-time 5 --resolve "${DOMAIN}:80:127.0.0.1" "$@" 2>/dev/null; }
 check "main: port 80 serves /mTLS-CA.crl (= the CRL file)" eval '
     http80 -o /tmp/crl-http.pem "http://${DOMAIN}/mTLS-CA.crl" &&
     cexec cmp -s /tmp/crl-http.pem /data/certs/mTLS-CA.crl'
@@ -485,15 +524,6 @@ check "main: port 80 redirects other paths with 301 to https" \
     == "301 https://${DOMAIN}/some/path?x=1"
 
 # --- mTLS handshakes (port 443, internal server certificate) ------------------------
-# 502 = the client certificate was accepted and the request reached the (absent)
-# upstream; 000 = the TLS handshake was refused.
-mtls() { # mtls <cert> <key>  (empty: no client certificate)
-    local args=()
-    [[ -n "$1" ]] && args=(--cert "$1" --key "$2")
-    cexec curl -sk --max-time 5 -o /dev/null -w '%{http_code}' --resolve "${DOMAIN}:443:127.0.0.1" \
-        "${args[@]+"${args[@]}"}" "https://${DOMAIN}/" 2>/dev/null || true
-}
-mtls_is() { [[ "$(mtls "$2" "$3")" == "$1" ]]; }
 check "main: HTTPS up with Caddy's internal certificate, alice's client certificate accepted" \
     wait_for 60 mtls_is 502 /data/certs/mTLS-client-alice.crt /data/certs/mTLS-client-alice.key
 check "main: handshake without a client certificate refused" mtls_is 000 "" ""
@@ -843,10 +873,12 @@ fi
 show_log_on_failure "${before}"
 OPT_PASSWORD="${P12_PASSWORD}"
 OPT_CLIENT_NAMES='["alice", "bob"]'
+fi
 
 # ==============================================================================
 # 2. no-mtls: mtls_enabled false (public domain, ACME sinkhole)
 # ==============================================================================
+if smoke_case no-mtls; then
 log "no-mtls: booting (mtls_enabled: false, log_level debug)"
 before=${FAIL_COUNT}
 CORE_INFO='{"port": 80, "ssl": false}'
@@ -882,10 +914,12 @@ else
     fail "no-mtls: add-on booted"
 fi
 show_log_on_failure "${before}"
+fi
 
 # ==============================================================================
 # 2b. access-log: access_log true; Caddy restarted by s6 / crash stops the add-on
 # ==============================================================================
+if smoke_case access-log; then
 log "access-log: booting (access_log: true)"
 before=${FAIL_COUNT}
 OPT_ACCESS_LOG=true
@@ -927,6 +961,7 @@ else
     fail "access-log: add-on booted"
 fi
 show_log_on_failure "${before}"
+fi
 
 # ==============================================================================
 # 2c. acme: no certificate (ACME sinkhole) -> red card + notification; a
@@ -939,6 +974,17 @@ FAKE_SUPERVISOR_PORT=8765
 SUPERVISOR_LOG=/tmp/supervisor-requests.jsonl
 SMOKE_SUPERVISOR_TOKEN="smoke-supervisor-token-$$"
 ACME_DOMAIN="home.example.com"
+# supervisor_got <jq filter>: a request the fake Supervisor received matches.
+supervisor_got() {
+    cexec sh -c 'test -f "$1" && jq -s -e "$0" "$1"' "[.[] | select($1)] | length > 0" "${SUPERVISOR_LOG}" >/dev/null 2>&1
+}
+# supervisor_count <jq filter>: how many requests matched.
+supervisor_count() {
+    cexec sh -c 'jq -s "$0" "$1"' "[.[] | select($1)] | length" "${SUPERVISOR_LOG}" 2>/dev/null
+}
+NOTE_CREATE='.method == "POST" and .path == "/core/api/services/persistent_notification/create"
+    and .body.notification_id == "caddy_mtls_public_certificate"'
+if smoke_case acme; then
 log "acme: booting (${ACME_DOMAIN}, ACME sinkhole, fake Supervisor)"
 before=${FAIL_COUNT}
 EXTRA_CREATE_ARGS=(
@@ -952,16 +998,6 @@ EXTRA_CREATE_ARGS=()
 tar -C "${SCRIPT_DIR}" --owner=0 --group=0 --numeric-owner -cf - fake-supervisor.py | "${DOCKER}" cp - "${CTR}:/tmp"
 "${DOCKER}" exec -d "${CTR}" /usr/lib/cert-mgr/.venv/bin/python3 /tmp/fake-supervisor.py \
     "${FAKE_SUPERVISOR_PORT}" "${SUPERVISOR_LOG}"
-# supervisor_got <jq filter>: a request the fake Supervisor received matches.
-supervisor_got() {
-    cexec sh -c 'test -f "$1" && jq -s -e "$0" "$1"' "[.[] | select($1)] | length > 0" "${SUPERVISOR_LOG}" >/dev/null 2>&1
-}
-# supervisor_count <jq filter>: how many requests matched.
-supervisor_count() {
-    cexec sh -c 'jq -s "$0" "$1"' "[.[] | select($1)] | length" "${SUPERVISOR_LOG}" 2>/dev/null
-}
-NOTE_CREATE='.method == "POST" and .path == "/core/api/services/persistent_notification/create"
-    and .body.notification_id == "caddy_mtls_public_certificate"'
 if wait_for "${BOOT_TIMEOUT}" booted; then
     pass "acme: add-on booted"
     acme_error_logged() { cexec sh -c 'grep -F "\"logger\":\"tls.obtain\"" /data/caddy/log/acme.log | grep -F "\"level\":\"error\""' >/dev/null 2>&1; }
@@ -1022,6 +1058,7 @@ else
     fail "acme: add-on booted"
 fi
 show_log_on_failure "${before}"
+fi
 
 # ==============================================================================
 # 2d. forwarded_headers: a fake Home Assistant (tests/fake-upstream.py) that
@@ -1122,6 +1159,7 @@ upstream_mode_is() { # upstream_mode_is pass|strip: snippet, state and Caddy agr
 }
 
 # --- auto with mTLS: refused at the start -> strip; trust -> pass; back --------
+if smoke_case fwd; then
 log "fwd-auto: booting beside a fake Home Assistant that refuses X-Forwarded-For"
 before=${FAIL_COUNT}
 boot_fwd fwd-auto "$(options "${DOMAIN}" true none "" homeassistant 8124)"
@@ -1378,6 +1416,7 @@ else
     fail "fwd-other-always: add-on booted"
 fi
 show_log_on_failure "${before}"
+fi
 
 # ==============================================================================
 # 2e. lan: the local-network HTTPS port (container port 4443, host port 9443)
@@ -1403,6 +1442,7 @@ s_client() {
         openssl s_client -connect "127.0.0.1:$0" -servername "$4" -"$1" -ign_eof "$2" "$3" 2>&1 |
         grep -E "^(New|Reused),|alert|HTTP/1.1 [0-9]+" || true' "$1" "$2" "$3" "$4" "${LAN_DOMAIN}"
 }
+if smoke_case lan; then
 log "lan: booting (mTLS, local-network port on, a fake Home Assistant that trusts the proxy)"
 before=${FAIL_COUNT}
 FAKE_NET_SETUP='ip addr add 10.99.0.2/24 dev lo; ip addr add 10.99.0.1/32 dev lo;
@@ -1520,6 +1560,7 @@ else
     fail "lan-nomtls: add-on booted"
 fi
 show_log_on_failure "${before}"
+fi
 
 # ==============================================================================
 # 3. DNS providers (dummy tokens, public domain, ACME sinkhole)
@@ -1575,10 +1616,12 @@ dns_case() { # dns_case <provider> <token> <env-var=value...>
     check "dns-${provider}: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
     show_log_on_failure "${before}"
 }
+if smoke_case dns; then
 dns_case cloudflare "${CF_TOKEN}" "DNS_API_TOKEN=${CF_TOKEN}"
 dns_case route53 "${R53_KEY_ID}:${R53_SECRET}" \
     "DNS_AWS_ACCESS_KEY_ID=${R53_KEY_ID}" "DNS_AWS_SECRET_ACCESS_KEY=${R53_SECRET}"
 dns_case hetzner "${HZ_TOKEN}" "DNS_API_TOKEN=${HZ_TOKEN}"
+fi
 
 # ==============================================================================
 # 4. refused starts
@@ -1596,6 +1639,7 @@ bad_case() {
     fi
     show_log_on_failure "${before}"
 }
+if smoke_case bad; then
 bad_case route53-token "$(options home.example.com true route53 "${R53_SECRET//\//}")" \
     "For route53, dns_api_token must be ACCESS_KEY_ID:SECRET_ACCESS_KEY." \
     "$(secret_file secret-bad-route53 "${R53_SECRET//\//}")"
@@ -1620,6 +1664,424 @@ check "bad-never-nomtls: the message names the alternatives (mTLS on, or auto wi
 bad_case never-nomtls-other "$(options home.example.com false none "" 192.0.2.10 8080)" \
     "forwarded_headers: never needs mtls_enabled: true."
 OPT_FORWARDED=auto
+fi
+
+# ==============================================================================
+# 5. auth: header authentication (2.3.0)
+# ==============================================================================
+# A key, a wrong value and their variants are made per run and are obviously
+# fake. None of them is ever on a command line: the options take the key
+# from a file (OPT_HEADER_KEY_FILE), curl reads its headers from files in the
+# container (-H @file), the log checks read their patterns from files.
+rand_hex() { od -An -N16 -tx1 /dev/urandom | tr -d ' \n'; }
+AUTH_KEY="fakekey.NOT-A-SECRET.$(rand_hex)"
+AUTH_WRONG="fakewrong.NOT-A-SECRET.$(rand_hex)"
+AUTH_KEY_RAW="$(raw_file key-auth "${AUTH_KEY}")"
+AUTH_PATTERNS="$(secret_file pattern-auth "${AUTH_KEY}")"
+printf '%s\n' "${AUTH_WRONG}" >>"${AUTH_PATTERNS}"
+AUTH_NAME="X-Custom-PSK"
+CERT_ALICE=(--cert /data/certs/mTLS-client-alice.crt --key /data/certs/mTLS-client-alice.key)
+# shellcheck disable=SC2034 # used in eval'd checks
+CERT_BOB=(--cert /data/certs/mTLS-client-bob.crt --key /data/certs/mTLS-client-bob.key)
+# shellcheck disable=SC2034 # used in eval'd checks
+CERT_CAROL=(--cert /data/certs/mTLS-client-carol.crt --key /data/certs/mTLS-client-carol.key)
+# hdr_file <name> <header line...>: /tmp/h-<name> in the container (curl -H @file).
+hdr_file() {
+    local name="$1"
+    shift
+    printf '%s\n' "$@" | "${DOCKER}" exec -i "${CTR}" sh -c 'cat > "/tmp/h-$0"' "${name}"
+}
+# auth_headers: the header files of the auth cases (the key, the wrong value
+# and their variants, a misspelt name, a websocket upgrade).
+auth_headers() {
+    local last="${AUTH_KEY: -1}" other=x
+    [[ "${last}" == x ]] && other=y
+    hdr_file ok "${AUTH_NAME}: ${AUTH_KEY}"
+    hdr_file wrong "${AUTH_NAME}: ${AUTH_WRONG}"
+    hdr_file lower "$(printf '%s' "${AUTH_NAME}" | tr '[:upper:]' '[:lower:]'): ${AUTH_KEY}"
+    hdr_file onechar "${AUTH_NAME}: ${AUTH_KEY%?}${other}"
+    hdr_file prefix "${AUTH_NAME}: ${AUTH_KEY%?}"
+    hdr_file extra "${AUTH_NAME}: ${AUTH_KEY}x"
+    # "Name;" makes curl send the header with an empty value.
+    hdr_file empty "${AUTH_NAME};"
+    hdr_file star "${AUTH_NAME}: *"
+    hdr_file host "${AUTH_NAME}: {host}"
+    hdr_file twice-wr "${AUTH_NAME}: ${AUTH_WRONG}" "${AUTH_NAME}: ${AUTH_KEY}"
+    hdr_file twice-rw "${AUTH_NAME}: ${AUTH_KEY}" "${AUTH_NAME}: ${AUTH_WRONG}"
+    hdr_file trailing "${AUTH_NAME}: ${AUTH_KEY} "
+    hdr_file misspelt "X-Custom-PKS: ${AUTH_KEY}"
+    hdr_file ws "Connection: Upgrade" "Upgrade: websocket" "Sec-WebSocket-Version: 13" \
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=="
+    hdr_file app "Authorization: Bearer smoke-ha-token" "Cookie: smoke=cookie-value"
+}
+# areq <path> [curl args...]: "<code>" of GET https://<domain><path> (port 443);
+# 000: the TLS handshake failed. abody: the body.
+areq() {
+    local path="$1"
+    shift
+    cexec curl -sk --max-time 10 -o /dev/null -w '%{http_code}' --resolve "${DOMAIN}:443:127.0.0.1" \
+        "$@" "https://${DOMAIN}${path}" 2>/dev/null || true
+}
+abody() {
+    local path="$1"
+    shift
+    cexec curl -sk --max-time 10 --resolve "${DOMAIN}:443:127.0.0.1" "$@" "https://${DOMAIN}${path}" 2>/dev/null || true
+}
+# ws_code [curl args...]: the status of a websocket upgrade (HTTP/1.1).
+ws_code() {
+    cexec curl -sk --http1.1 --max-time 4 -o /dev/null -w '%{http_code}' --resolve "${DOMAIN}:443:127.0.0.1" \
+        -H @/tmp/h-ws "$@" "https://${DOMAIN}/api/websocket" 2>/dev/null || true
+}
+# The SHA-256 of a certificate as Caddy reports it.
+fp_of() { cexec sh -c 'openssl x509 -in "$0" -outform DER | sha256sum | cut -d" " -f1' "$1" 2>/dev/null; }
+fp_listed() { cexec grep -F -- "$1" /etc/caddy/client-fingerprints.caddy >/dev/null 2>&1; }
+# upstream_lacks_header <path>: the fake upstream received <path> (the last
+# such request; the monitor's control requests come in between) without the
+# header.
+upstream_lacks_header() {
+    fexec cat /tmp/up/requests.jsonl | jq -s -e --arg p "$1" \
+        '[.[] | select(.path == $p)] | length > 0 and ((last.header_names | index("x-custom-psk")) == null)' >/dev/null
+}
+# The add-on's own reload path (caddyctl.reload: regenerate the list, then
+# caddy reload --force), as the panel and the monitor call it.
+addon_reload() {
+    cexec /usr/lib/cert-mgr/.venv/bin/python3 -c 'import sys; sys.path.insert(0, "/usr/lib/cert-mgr")
+import caddyctl
+ok, message = caddyctl.reload()
+print("ok" if ok else "failed: " + message.strip().splitlines()[-1])' 2>&1
+}
+# secrecy_checks <case>: the key and the wrong value are in no log line, no
+# file but the key file (and the options/bashio cache this test wrote), no
+# process command line or environment, no panel page or API answer.
+secrecy_checks() {
+    local c="$1" hits
+    check "${c}: secrecy: neither the key nor the wrong value in the container log" logs_lack_secret "${AUTH_PATTERNS}"
+    "${DOCKER}" exec -i "${CTR}" sh -c 'cat > /tmp/auth-patterns' <"${AUTH_PATTERNS}"
+    # Regular files only (s6 keeps FIFOs in /run: grep would block on them).
+    hits="$(cexec sh -c 'find /etc /run /root /data /config /tmp /var -xdev -type f -exec grep -lF -f /tmp/auth-patterns {} + 2>/dev/null' || true)"
+    hits="$(printf '%s\n' "${hits}" | grep -vxE '/etc/caddy/header-auth.key|/data/options.json|/tmp/\.bashio/addons\.self\.options\.config\.cache|/tmp/auth-patterns|/tmp/h-[a-z-]+' || true)"
+    check "${c}: secrecy: no file holds them but the key file (Caddyfile, snippets, /run/caddy-mtls, autosave.json, state)" \
+        eval '[[ -z "${hits}" ]] || { log "files with the key: ${hits//$'"'"'\n'"'"'/ }"; false; }'
+    check "${c}: secrecy: autosave.json exists and holds the {file.*} placeholder, not the key" eval '
+        cexec grep -F "{file./etc/caddy/header-auth.key}" /root/.config/caddy/autosave.json >/dev/null &&
+        ! cexec cat /root/.config/caddy/autosave.json | grep -F -f "${AUTH_PATTERNS}" >/dev/null'
+    check "${c}: secrecy: no process command line or environment holds them" eval '
+        ! cexec sh -c '"'"'for p in /proc/[0-9]*; do tr "\0" " " < "$p/cmdline"; echo; tr "\0" "\n" < "$p/environ"; done 2>/dev/null'"'"' |
+            grep -F -f "${AUTH_PATTERNS}" >/dev/null'
+    check "${c}: secrecy: no panel page or API answer holds them" eval '
+        ! { for path in / /upstream /public-cert /api/state /api/upstream /api/public-cert; do dashboard "${path}"; done; } |
+            grep -F -f "${AUTH_PATTERNS}" >/dev/null'
+    check "${c}: secrecy: the key file is 0600 root" test "$(cexec stat -c '%a %U' /etc/caddy/header-auth.key)" == "600 root"
+}
+# auth_traffic <case>: the requests the secrecy checks follow - accepted,
+# wrong value, the key under a misspelt name, a websocket upgrade, a 502
+# (upstream down), a reload.
+auth_traffic() {
+    local c="$1"
+    check "${c}: traffic: the key 200, a wrong value 403, the key under a misspelt name 403, websocket 101" eval '
+        test "$(areq /t1 -H @/tmp/h-ok)" == 200 && test "$(areq /t2 -H @/tmp/h-wrong)" == 403 &&
+        test "$(areq /t3 -H @/tmp/h-misspelt)" == 403 && test "$(ws_code -H @/tmp/h-ok)" == 101'
+    fexec touch /tmp/up/down
+    fake_restart || true
+    check "${c}: traffic: upstream down -> 502 with the key (the error line of a 5xx carries the request)" \
+        wait_for 15 eval 'test "$(areq /t4 -H @/tmp/h-ok)" == 502'
+    areq /t5 --http1.1 -H @/tmp/h-ok >/dev/null
+    areq /t6 -H @/tmp/h-misspelt -H @/tmp/h-wrong >/dev/null
+    fexec rm -f /tmp/up/down
+    wait_for 15 fake_up_ok || true
+    check "${c}: traffic: a reload through the add-on's path (client added in the panel)" \
+        test "$(panel_post /api/clients name=reload-check)" == "303 http://127.0.0.1:8099${INGRESS_PREFIX}/?ok=Client+%27reload-check%27+created."
+}
+
+if smoke_case auth; then
+# --- mTLS + key: the gate, revocation, the forwarding switch, secrecy -------
+log "auth: booting (mTLS, header key, access log, local-network port, a fake Home Assistant that trusts the proxy)"
+before=${FAIL_COUNT}
+OPT_HEADER_KEY_FILE="${AUTH_KEY_RAW}"
+OPT_ACCESS_LOG=true
+SEED_NETWORK='{"80/tcp":8080,"443/tcp":8443,"4443/tcp":9443}'
+boot_fwd auth "$(options "${DOMAIN}" true none "" homeassistant 8124)" trust
+SEED_NETWORK='{"80/tcp":8080,"443/tcp":8443}'
+OPT_ACCESS_LOG=false
+OPT_HEADER_KEY_FILE=""
+if wait_for "${BOOT_TIMEOUT}" booted; then
+    pass "auth: add-on booted"
+    auth_headers
+    check "auth: Caddyfile: certificate optional in the handshake (verify_if_given) with the trust pool and the leaf verifier" eval '
+        cexec grep -F "mode verify_if_given" /etc/caddy/Caddyfile >/dev/null && ! cexec grep -F require_and_verify /etc/caddy/Caddyfile >/dev/null &&
+        adapted "[.. | objects | select(.mode? == \"verify_if_given\")] | length == 1" &&
+        adapted "[.. | objects | select(.verifier? == \"leaf\")] | length == 1"'
+    check "auth: Caddyfile: the gate imports the list and reads the key from its file (the key is not in the Caddyfile)" eval '
+        cexec grep -F "@caddy_mtls_gate_denied {" /etc/caddy/Caddyfile >/dev/null &&
+        cexec grep -F "import /etc/caddy/client-fingerprints.caddy" /etc/caddy/Caddyfile >/dev/null &&
+        cexec grep -F "header X-Custom-PSK {file./etc/caddy/header-auth.key}" /etc/caddy/Caddyfile >/dev/null &&
+        cexec grep -F "not vars {file./etc/caddy/header-auth.key} \"\"" /etc/caddy/Caddyfile >/dev/null &&
+        ! cexec cat /etc/caddy/Caddyfile | grep -F -f "${AUTH_PATTERNS}" >/dev/null'
+    check "auth: Caddyfile: every log that can carry a request drops all request headers (default + 3 sites)" \
+        test "$(cexec grep -c "request>headers delete" /etc/caddy/Caddyfile)" == 4
+    check "auth: Caddyfile: the header removed after the gate on the public and the local-network site (request_header and header_up)" eval '
+        test "$(cexec grep -c "request_header -X-Custom-PSK" /etc/caddy/Caddyfile)" == 2 &&
+        test "$(cexec grep -c "header_up -X-Custom-PSK" /etc/caddy/Caddyfile)" == 2'
+    # The order inside the public site's route: diagnosis (log_append), the
+    # gate (static_response with the gate matcher), the header's removal,
+    # the proxy last.
+    # shellcheck disable=SC2016
+    check "auth: admin API: the public route = log_append..., 403 gate, header removal, reverse_proxy (last)" adapted '
+        [.apps.http.servers[] | select(.listen == [":443"]) | .. | objects | select(has("routes")) | .routes
+         | select(any(.[]; .handle[0].handler? == "static_response" and ((.handle[0].status_code? // "") | tostring) == "403"))]
+        | length == 1 and (.[0] | [.[] | .handle[] | .handler] | . as $h | (map(. == "static_response") | index(true)) as $g
+            | $h[-1] == "reverse_proxy" and $h[$g + 1] == "headers" and ($h[:$g] | length > 0 and all(. == "log_append")))'
+    check "auth: strict SNI-Host enforcement still on for :443" \
+        logs_contain "enabling strict SNI-Host enforcement because TLS client auth is configured"
+    check "auth: start log: on, the header name, the key length, the notice" eval '
+        logs_contain "Header auth: on - header X-Custom-PSK, a key of ${#AUTH_KEY} characters; or one of 2 active client certificates" &&
+        logs_contain "Header authentication is on: a request that carries the header X-Custom-PSK with the key is accepted without a client certificate. Whoever knows the key gets as far as Home Assistant"'
+    check "auth: runtime.json: on, name, key length (no key)" \
+        test "$(cexec jq -c .header_auth /run/caddy-mtls/runtime.json)" == "{\"enabled\":true,\"name\":\"X-Custom-PSK\",\"key_length\":${#AUTH_KEY}}"
+    for v in http1.1 http2; do
+        h="${v/http1.1/h1}"
+        h="${h/http2/h2}"
+        check "auth: ${h}: no certificate, no header -> the handshake completes, 403 with a text that does not name the header" eval '
+            [[ "$(abody /m --"${v}" -w " %{http_code} %{http_version}")" == "403 Forbidden: this site needs a client certificate. 403 "* ]]'
+        check "auth: ${h}: a wrong value -> 403" test "$(areq /m --"${v}" -H @/tmp/h-wrong)" == 403
+        # shellcheck disable=SC2034 # used in eval'd checks
+        echo_ok="$(abody /right-key --"${v}" -H @/tmp/h-ok -H @/tmp/h-app)"
+        check "auth: ${h}: the right key -> 200 at the upstream, which did not get the header" eval '
+            test "$(jq -r .path <<<"${echo_ok}" 2>/dev/null)" == /right-key && test -z "$(echo_header "${echo_ok}" X-Custom-PSK)" &&
+            upstream_lacks_header /right-key'
+        check "auth: ${h}: ... Authorization and Cookie arrive unchanged" eval '
+            test "$(echo_header "${echo_ok}" Authorization)" == "Bearer smoke-ha-token" &&
+            test "$(echo_header "${echo_ok}" Cookie)" == "smoke=cookie-value"'
+        check "auth: ${h}: a client certificate without the header -> 200" test "$(areq /m --"${v}" "${CERT_ALICE[@]}")" == 200
+        check "auth: ${h}: a client certificate with a wrong value -> 200" test "$(areq /m --"${v}" "${CERT_ALICE[@]}" -H @/tmp/h-wrong)" == 200
+        check "auth: ${h}: the header name in lower case -> 200" test "$(areq /m --"${v}" -H @/tmp/h-lower)" == 200
+        for variant in onechar prefix extra empty star host; do
+            check "auth: ${h}: header value '${variant}' (one character changed / a prefix / one more character / empty / * / {host}) -> 403" \
+                test "$(areq /m --"${v}" -H "@/tmp/h-${variant}")" == 403
+        done
+        # REPORT-I I-4: the header matcher accepts ANY of several values.
+        check "auth: ${h}: the header twice, wrong then right -> 200 (any value matches; documented)" \
+            test "$(areq /m --"${v}" -H @/tmp/h-twice-wr)" == 200
+        check "auth: ${h}: the header twice, right then wrong -> 200 (documented)" \
+            test "$(areq /m --"${v}" -H @/tmp/h-twice-rw)" == 200
+    done
+    # REPORT-I I-4: HTTP/1.1 drops trailing blanks of a header value (Go's
+    # parser), HTTP/2 keeps them - curl sends the blank in both.
+    check "auth: h1: the key with a trailing blank -> 200 (Go trims it on HTTP/1.1; documented)" \
+        test "$(areq /m --http1.1 -H @/tmp/h-trailing)" == 200
+    check "auth: h2: the key with a trailing blank -> 403 (HTTP/2 keeps it; documented)" \
+        test "$(areq /m --http2 -H @/tmp/h-trailing)" == 403
+    check "auth: websocket upgrade with the key -> 101, the upstream got it without the header" eval '
+        test "$(ws_code -H @/tmp/h-ok)" == 101 && upstream_lacks_header /api/websocket &&
+        fexec cat /tmp/up/requests.jsonl | jq -s -e "[.[] | select(.path == \"/api/websocket\")] | last.header_names | index(\"upgrade\") != null" >/dev/null'
+    check "auth: websocket upgrade with a wrong value -> 403, without a header -> 403" eval '
+        test "$(ws_code -H @/tmp/h-wrong)" == 403 && test "$(ws_code)" == 403'
+    sleep 1
+    check "auth: access log: no request headers, the field auth says how each request was let in or why not" eval '
+        logs_contain "\"auth\": \"header key\"" && logs_contain "\"auth\": \"certificate\"" &&
+        logs_contain "\"auth\": \"refused: no certificate, header absent\"" &&
+        logs_contain "\"auth\": \"refused: no certificate, header present with a wrong value\"" &&
+        ! "${DOCKER}" logs "${CTR}" 2>&1 | grep -F "handled request" | grep -F "\"headers\": {" >/dev/null &&
+        ! "${DOCKER}" logs "${CTR}" 2>&1 | grep -F "handled request" | grep -iF "x-custom-psk" >/dev/null'
+    # Fail closed: the key file emptied or removed in the running container.
+    cexec sh -c ': > /etc/caddy/header-auth.key'
+    check "auth: key file emptied -> an EMPTY header 403, the key 403, a certificate still 200" eval '
+        test "$(areq /e -H @/tmp/h-empty)" == 403 && test "$(areq /e -H @/tmp/h-ok)" == 403 &&
+        test "$(areq /e "${CERT_ALICE[@]}")" == 200'
+    cexec rm -f /etc/caddy/header-auth.key
+    check "auth: key file removed -> an EMPTY header 403, no header 403, a certificate still 200" eval '
+        test "$(areq /e -H @/tmp/h-empty)" == 403 && test "$(areq /e)" == 403 &&
+        test "$(areq /e "${CERT_ALICE[@]}")" == 200'
+    "${DOCKER}" exec -i "${CTR}" sh -c 'umask 077; cat > /etc/caddy/header-auth.key' <"${AUTH_KEY_RAW}"
+    check "auth: key file back -> the key 200 again (read per request, no reload)" test "$(areq /e -H @/tmp/h-ok)" == 200
+    # The local-network site: no gate, but the header goes no further.
+    # shellcheck disable=SC2034 # used in eval'd checks
+    lan_echo="$(cexec curl -sk --max-time 10 --resolve "${DOMAIN}:4443:127.0.0.1" -H @/tmp/h-ok "https://${DOMAIN}:4443/lan-auth" 2>/dev/null)"
+    check "auth: local-network site: a request with the header reaches the upstream without it" eval '
+        test "$(jq -r .path <<<"${lan_echo}" 2>/dev/null)" == /lan-auth && test -z "$(echo_header "${lan_echo}" X-Custom-PSK)" &&
+        upstream_lacks_header /lan-auth'
+    check "auth: dashboard card on: the name and the key length, never the key" eval '
+        html="$(dashboard /)" && [[ "${html}" == *"id=\"header-auth\""*"data-state=\"on\""* &&
+        "${html}" == *"Header <code>X-Custom-PSK</code>; a key of ${#AUTH_KEY}"* && "${html}" == *"long-lived access token"* ]] &&
+        ! dashboard / | grep -F -f "${AUTH_PATTERNS}" >/dev/null'
+
+    # --- revocation: the leaf verifier in the handshake, the list in the gate --
+    # shellcheck disable=SC2034 # used in eval'd checks
+    alice_fp="$(fp_of /data/certs/mTLS-client-alice.crt)"
+    # shellcheck disable=SC2034 # used in eval'd checks
+    bob_fp="$(fp_of /data/certs/mTLS-client-bob.crt)"
+    check "auth: the list = the SHA-256 of the active certificates (alice, bob), lower-case hex" eval '
+        [[ "${alice_fp}" =~ ^[0-9a-f]{64}$ && "${bob_fp}" =~ ^[0-9a-f]{64}$ ]] && fp_listed "${alice_fp}" && fp_listed "${bob_fp}" &&
+        ! cexec grep -F e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 /etc/caddy/client-fingerprints.caddy >/dev/null'
+    check "auth: alice and bob accepted (200)" eval '
+        test "$(areq /r "${CERT_ALICE[@]}")" == 200 && test "$(areq /r "${CERT_BOB[@]}")" == 200'
+    check "auth: POST revoke alice -> 303" \
+        test "$(panel_post /api/clients/alice/revoke reason=keyCompromise)" == "303 http://127.0.0.1:8099${INGRESS_PREFIX}/?ok=Client+%27alice%27+revoked."
+    check "auth: revoked alice -> the handshake fails (000)" test "$(areq /r "${CERT_ALICE[@]}")" == 000
+    check "auth: revoked alice WITH the right key -> the handshake fails too (no fallback for a refused certificate)" \
+        test "$(areq /r "${CERT_ALICE[@]}" -H @/tmp/h-ok)" == 000
+    # shellcheck disable=SC2034 # used in an eval'd check
+    alert="$(cexec sh -c 'printf "GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" "$0" |
+        openssl s_client -connect 127.0.0.1:443 -servername "$0" -cert /data/certs/mTLS-client-alice.crt \
+            -key /data/certs/mTLS-client-alice.key -ign_eof 2>&1 | grep -E "alert|HTTP/1.1 [0-9]+" || true' "${DOMAIN}")"
+    check "auth: revoked alice: a TLS alert (bad certificate), no HTTP answer" eval '[[ "${alert}" == *"alert bad certificate"* && "${alert}" != *"HTTP/1.1"* ]]'
+    check "auth: no certificate + the right key -> 200 after the revocation; bob still 200" eval '
+        test "$(areq /r -H @/tmp/h-ok)" == 200 && test "$(areq /r "${CERT_BOB[@]}")" == 200'
+    cexec sh -c 'openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj /CN=alice -days 2 \
+        -keyout /tmp/foreign.key -out /tmp/foreign.crt' >/dev/null 2>&1
+    check "auth: a certificate of a foreign CA -> the handshake fails, with and without the key" eval '
+        test "$(areq /r --cert /tmp/foreign.crt --key /tmp/foreign.key)" == 000 &&
+        test "$(areq /r --cert /tmp/foreign.crt --key /tmp/foreign.key -H @/tmp/h-ok)" == 000'
+    check "auth: alice's fingerprint left the list, bob's stayed" eval '! fp_listed "${alice_fp}" && fp_listed "${bob_fp}"'
+    # shellcheck disable=SC2034 # used in an eval'd check
+    list_before="$(cexec cat /etc/caddy/client-fingerprints.caddy)"
+    check "auth: POST add carol -> 303" \
+        test "$(panel_post /api/clients name=carol)" == "303 http://127.0.0.1:8099${INGRESS_PREFIX}/?ok=Client+%27carol%27+created."
+    carol_fp="$(fp_of /data/certs/mTLS-client-carol.crt)"
+    check "auth: carol accepted at once (the list was regenerated before the reload: its content changed, carol in it)" eval '
+        [[ "$(cexec cat /etc/caddy/client-fingerprints.caddy)" != "${list_before}" ]] && fp_listed "${carol_fp}" &&
+        test "$(areq /c "${CERT_CAROL[@]}")" == 200'
+    # Drift: a list that lacks an active client refuses it at the gate,
+    # although the handshake accepts it (both checks must agree).
+    cexec sh -c 'printf "not vars {http.request.tls.client.fingerprint} %s\n" "$0" > /etc/caddy/client-fingerprints.caddy &&
+        caddy reload --force --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1' "${carol_fp}"
+    check "auth: drift: a list without bob -> bob's handshake succeeds, the gate answers 403; carol 200" eval '
+        test "$(areq /d "${CERT_BOB[@]}")" == 403 && test "$(areq /d "${CERT_CAROL[@]}")" == 200'
+    check "auth: drift: the add-on's reload regenerates the list from the folder -> bob 200 again" eval '
+        test "$(addon_reload)" == ok && fp_listed "${bob_fp}" && test "$(areq /d "${CERT_BOB[@]}")" == 200'
+    # The generator: only real certificate fingerprints (a copy of the folder).
+    # shellcheck disable=SC2034 # used in an eval'd check
+    gen_out="$(cexec sh -c 'rm -rf /tmp/fp-test && cp -r /data/certs/active /tmp/fp-test && : > /tmp/fp-test/empty.pem &&
+        head -c 300 /data/certs/mTLS-client-bob.crt > /tmp/fp-test/truncated.pem &&
+        cp /data/certs/mTLS-client-bob.key /tmp/fp-test/key.pem &&
+        /usr/lib/cert-mgr/.venv/bin/python3 /usr/lib/cert-mgr/caddyctl.py fingerprints --folder /tmp/fp-test --output /tmp/fp-test.caddy 2>&1' || true)"
+    check "auth: generator: an empty, a truncated and a non-certificate .pem give no entry (a warning each), never the empty-input hash" eval '
+        [[ "${gen_out}" == *"empty.pem: left out"* && "${gen_out}" == *"truncated.pem: left out"* && "${gen_out}" == *"key.pem: left out"* ]] &&
+        test "$(cexec sh -c "tail -n 1 /tmp/fp-test.caddy | wc -w")" == 5 &&
+        ! cexec grep -F e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 /tmp/fp-test.caddy >/dev/null'
+    # Caddy's own leaf loader refuses a folder with such a file: the reload
+    # fails and the running configuration stays (bob still in).
+    cexec sh -c ': > /data/certs/active/broken.pem'
+    # shellcheck disable=SC2034 # used in an eval'd check
+    reload_out="$(addon_reload)"
+    check "auth: an empty .pem in the live folder: Caddy refuses the reload (reported), the running configuration stays" eval '
+        [[ "${reload_out}" == "failed: "*"broken.pem"* ]] && test "$(areq /b "${CERT_BOB[@]}")" == 200 && test "$(areq /b)" == 403'
+    cexec rm -f /data/certs/active/broken.pem
+    # Forwarding switch (2.2.0) in the key mode: rewrite + reload, the list
+    # regenerated before that reload, the gate unchanged.
+    # shellcheck disable=SC2034 # used in an eval'd check
+    inode_before="$(cexec stat -c %i /etc/caddy/client-fingerprints.caddy)"
+    fake_trust off
+    fake_restart
+    check "auth: forwarding switch pass -> strip (snippet rewritten, Caddy reloaded) in the key mode" \
+        wait_for 20 eval 'snippet_is strip && [[ "$(cexec jq -r "\"\(.mode) \(.applied)\"" /data/upstream.json)" == "strip true" ]]'
+    check "auth: ... the list was rewritten before that reload (a new file)" \
+        eval '[[ "$(cexec stat -c %i /etc/caddy/client-fingerprints.caddy)" != "${inode_before}" ]]'
+    echo_strip="$(abody /after-switch -H @/tmp/h-ok)"
+    check "auth: after the switch: no certificate/no key 403; the key 200 without forwarding headers or the header" eval '
+        test "$(areq /s)" == 403 && test "$(jq -r .path <<<"${echo_strip}" 2>/dev/null)" == /after-switch &&
+        no_forwarding_headers "${echo_strip}" && test -z "$(echo_header "${echo_strip}" X-Custom-PSK)"'
+    fake_trust on
+    fake_restart
+    wait_for 20 eval 'snippet_is pass' || true
+    # No active client: the sentinel; the key still works.
+    panel_post /api/clients/bob/revoke reason=superseded >/dev/null
+    panel_post /api/clients/carol/revoke reason=superseded >/dev/null
+    check "auth: no active client -> the sentinel; no certificate/no key 403, the key 200, bob refused in the handshake" eval '
+        cexec grep -Fx "not vars {http.request.tls.client.fingerprint} no-active-client" /etc/caddy/client-fingerprints.caddy >/dev/null &&
+        test "$(areq /n)" == 403 && test "$(areq /n -H @/tmp/h-ok)" == 200 && test "$(areq /n "${CERT_BOB[@]}")" == 000'
+    auth_traffic auth
+    secrecy_checks auth
+    check "auth: no Traceback, no failed validation" eval 'logs_lack "Traceback" && logs_lack "failed validation"'
+    check "auth: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
+else
+    fail "auth: add-on booted"
+fi
+show_log_on_failure "${before}"
+
+# --- secrecy at log_level debug and trace (Caddy's config dump, bashio) -----
+for level in debug trace; do
+    log "auth-${level}: booting (mTLS, header key, log_level ${level})"
+    before=${FAIL_COUNT}
+    OPT_HEADER_KEY_FILE="${AUTH_KEY_RAW}"
+    OPT_LOG_LEVEL="${level}"
+    boot_fwd "auth-${level}" "$(options "${DOMAIN}" true none "" homeassistant 8124)" trust
+    OPT_LOG_LEVEL=info
+    OPT_HEADER_KEY_FILE=""
+    if wait_for "${BOOT_TIMEOUT}" booted; then
+        pass "auth-${level}: add-on booted"
+        auth_headers
+        auth_traffic "auth-${level}"
+        check "auth-${level}: positive control: Caddy's debug config dump is in the log, with the {file.*} placeholder" eval '
+            logs_contain "adjusted config" && logs_contain "{file./etc/caddy/header-auth.key}"'
+        if [[ "${level}" == trace ]]; then
+            check "auth-trace: bashio's trace output is off (it would print the options with every secret)" eval '
+                logs_lack "bashio::jq" && logs_lack "bashio::config" && logs_lack "client_cert_password"'
+        fi
+        secrecy_checks "auth-${level}"
+        check "auth-${level}: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
+    else
+        fail "auth-${level}: add-on booted"
+    fi
+    show_log_on_failure "${before}"
+done
+
+# --- mTLS off + key: the key is the only gate; no certificate is requested --
+log "auth-nomtls: booting (mtls_enabled false, header key)"
+before=${FAIL_COUNT}
+OPT_HEADER_KEY_FILE="${AUTH_KEY_RAW}"
+boot_fwd auth-nomtls "$(options "${DOMAIN}" false none "" homeassistant 8124)" trust
+OPT_HEADER_KEY_FILE=""
+if wait_for "${BOOT_TIMEOUT}" booted; then
+    pass "auth-nomtls: add-on booted"
+    auth_headers
+    check "auth-nomtls: no client_auth, the gate without a certificate branch" eval '
+        ! cexec grep -E "client_auth|client-fingerprints|caddy_mtls_diag" /etc/caddy/Caddyfile >/dev/null &&
+        cexec grep -F "@caddy_mtls_gate_denied {" /etc/caddy/Caddyfile >/dev/null &&
+        adapted "[.. | objects | select(has(\"client_authentication\"))] | length == 0"'
+    check "auth-nomtls: no header -> 403 \"403 Forbidden\"; a wrong value 403" eval '
+        [[ "$(abody /x -w " %{http_code}")" == "403 Forbidden 403" ]] && test "$(areq /x -H @/tmp/h-wrong)" == 403'
+    # shellcheck disable=SC2034 # used in eval'd checks
+    echo_nomtls="$(abody /nomtls-key -H @/tmp/h-ok)"
+    check "auth-nomtls: the key -> 200 at the upstream, without the header" eval '
+        test "$(jq -r .path <<<"${echo_nomtls}" 2>/dev/null)" == /nomtls-key && test -z "$(echo_header "${echo_nomtls}" X-Custom-PSK)"'
+    # shellcheck disable=SC2034 # used in an eval'd check
+    hello="$(cexec sh -c 'openssl s_client -connect 127.0.0.1:443 -servername "$0" </dev/null 2>&1' "${DOMAIN}" || true)"
+    check "auth-nomtls: the server requests no client certificate" eval '[[ "${hello}" == *"No client certificate CA names sent"* ]]'
+    check "auth-nomtls: the notice says the key is the only protection; the card warns" eval '
+        logs_contain "Header auth: on - header X-Custom-PSK, a key of ${#AUTH_KEY} characters (mTLS off)" &&
+        logs_contain "Header authentication is on without mTLS" &&
+        [[ "$(dashboard /)" == *"<strong>mTLS is off:</strong> the key is the only protection"* ]]'
+    check "auth-nomtls: forwarding headers passed on (mTLS off: never hidden, as in 2.2.0)" eval '
+        test -n "$(echo_header "${echo_nomtls}" X-Forwarded-For)"'
+    check "auth-nomtls: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
+else
+    fail "auth-nomtls: add-on booted"
+fi
+show_log_on_failure "${before}"
+
+# --- refused starts: no message contains the key or a part of it ------------
+# bad_auth <name> <key value> <expected text> [<header name>]
+bad_auth() {
+    local pattern value="${2%$'\n'}"
+    # The value without a trailing line break, and a part of it (an empty
+    # pattern line would match every line).
+    pattern="$(secret_file "pattern-bad-auth-$1" "${value}")"
+    printf '%s\n' "${value:4:16}" >>"${pattern}"
+    OPT_HEADER_KEY_FILE="$(raw_file "key-bad-auth-$1" "$2")"
+    OPT_HEADER_NAME="${4:-}"
+    bad_case "auth-$1" "$(options "${DOMAIN}" true none "")" "$3" "${pattern}"
+    OPT_HEADER_KEY_FILE=""
+    OPT_HEADER_NAME=""
+}
+bad_auth short "${AUTH_KEY:0:31}" "header_auth_key has 31 characters; it needs 32 to 256"
+check "bad-auth-short: the refusal says how to make a key" logs_contain "openssl rand -base64 32"
+bad_auth blank "${AUTH_KEY:0:20} ${AUTH_KEY:20}" "header_auth_key contains a character that is not allowed"
+bad_auth star "${AUTH_KEY}*" "header_auth_key contains a character that is not allowed"
+bad_auth linebreak "${AUTH_KEY}"$'\n' "header_auth_key contains a character that is not allowed"
+bad_auth name "${AUTH_KEY}" 'header_auth_name "X_Custom" is not a header name for this add-on' X_Custom
+bad_auth reserved "${AUTH_KEY}" 'header_auth_name "x-forwarded-for" is a header that browsers, Home Assistant or the proxy itself use' x-forwarded-for
+fi
 
 printf '\n%d passed, %d failed\n' "${PASS_COUNT}" "${FAIL_COUNT}"
 (( FAIL_COUNT == 0 ))

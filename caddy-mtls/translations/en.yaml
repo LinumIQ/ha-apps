@@ -143,6 +143,27 @@ configuration:
       The add-on's web interface shows the state and how to let Home
       Assistant trust the add-on.
 
+  header_auth_name:
+    name: Header Authentication - Header Name
+    description: >-
+      The name of the header that carries the key (header authentication).
+      Default X-Custom-PSK. 1-64 characters: a letter first, then letters,
+      digits or '-'. Names that browsers, Home Assistant or the proxy use
+      (Authorization, Cookie, X-Forwarded-..., Sec-..., ...) are refused.
+      Used only while a key is set.
+
+  header_auth_key:
+    name: Header Authentication - Key
+    description: >-
+      Empty (default): header authentication is off. With a key, a request
+      that carries the header above with exactly this key is accepted on the
+      public port without a client certificate - for clients that cannot
+      present one, such as a watch app. 32 to 256 characters: letters A-Z
+      and a-z, digits and . _ ~ + / = - (no blanks). The add-on's web
+      interface suggests one; or run: openssl rand -base64 32. Whoever knows
+      the key gets as far as Home Assistant's login page; a visitor with
+      neither a certificate nor the key gets 403 Forbidden.
+
 network:
   80/tcp: >-
     HTTP (Let's Encrypt HTTP-01, CRL, redirect to HTTPS).

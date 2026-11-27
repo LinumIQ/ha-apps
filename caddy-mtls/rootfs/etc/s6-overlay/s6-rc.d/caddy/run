@@ -10,6 +10,14 @@
 # by cert-mgr. The init-caddy oneshot's own exports do not reach this service.
 # ==============================================================================
 
+# bashio's trace output prints the arguments of its functions - among them
+# the add-on's whole options with every secret (header_auth_key,
+# dns_api_token, client_cert_password): never more than debug here (2.3.0).
+# shellcheck disable=SC2154,SC2034
+if (( __BASHIO_LOG_LEVEL > __BASHIO_LOG_LEVEL_DEBUG )); then
+    __BASHIO_LOG_LEVEL="${__BASHIO_LOG_LEVEL_DEBUG}"
+fi
+
 # shellcheck source=rootfs/etc/s6-overlay/scripts/lib/dns-provider.sh
 source /etc/s6-overlay/scripts/lib/dns-provider.sh
 

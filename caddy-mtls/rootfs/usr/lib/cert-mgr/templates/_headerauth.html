@@ -1,0 +1,103 @@
+{#- "Header authentication" card (since 2.3.0). ha: headerauth.card_context
+    (state on/off, the header's name, the key's LENGTH - the panel never
+    sees the key). The key helper creates a suggestion in the browser only
+    (crypto.getRandomValues; script in index.html): nothing is sent to the
+    add-on or stored. -#}
+{%- set labels = {"on": "On", "off": "Off"} -%}
+{%- set badges = {"on": "success", "off": "info"} -%}
+<section
+  class="card ha ha--{{ ha.state }}"
+  id="header-auth"
+  aria-labelledby="ha-heading"
+  data-state="{{ ha.state }}"
+>
+  <div class="card__header">
+    <h2 class="card__title" id="ha-heading">Header authentication</h2>
+    <span class="status status--{{ badges[ha.state] }}">{{ labels[ha.state] }}</span>
+  </div>
+
+  {% if ha.state == "on" %}
+  <p class="ha__lead">
+    Header <code>{{ ha.name }}</code>; a key of {{ ha.key_length }}
+    characters is set.
+  </p>
+  {% if not ha.mtls %}
+  <p class="ha__warn" role="alert">
+    <strong>mTLS is off:</strong> the key is the only protection in front of
+    Home Assistant's login page. Every request without it gets "403
+    Forbidden".
+  </p>
+  {% endif %}
+  <ul class="ha__list">
+    <li>Every request that carries this header with exactly the key is
+      accepted{% if ha.mtls %} without a client certificate{% endif %}.</li>
+    <li>The header is removed before Home Assistant sees the request.</li>
+    {% if ha.mtls %}
+    <li>A visitor without a client certificate and without the key gets "403
+      Forbidden" instead of a failed TLS handshake. A certificate that is
+      presented is still checked as before: a revoked or unknown one ends the
+      connection, also with the key.</li>
+    <li>Forwarding headers follow the same rules as for visitors with a
+      client certificate.</li>
+    {% endif %}
+    <li>While a key is set, the add-on's log lines carry no request headers{% if ha.access_log %};
+      each line of the access log has a field <code>auth</code> that says how
+      the request was let in or why it was refused{% else %} (with the option
+      <code>access_log</code> on, each line of the access log has a field
+      <code>auth</code> that says how the request was let in or why it was
+      refused){% endif %}.</li>
+    <li>To switch it off, empty <code>header_auth_key</code> in the app's
+      configuration and restart the app.</li>
+  </ul>
+  <p class="ha__note">
+    <strong>Clients like a watch app:</strong> the app must send the header
+    with every request - requests it makes without it (renewing a token,
+    logging in through the phone's browser) are refused. Give such an app a
+    Home Assistant <strong>long-lived access token</strong> (your profile,
+    Security tab) instead of a login.
+  </p>
+  <p class="ha__note"><strong>To change the key</strong>, enter a new one in
+    the app's configuration and restart the app:</p>
+  {% else %}
+  <p class="ha__lead">
+    {% if ha.known %}Off.{% else %}Not known yet: the app is still starting.{% endif %}
+    For clients that cannot present a client certificate but can send one
+    fixed header with every request (for example a watch app): with a key
+    set, such a request is accepted on the same address without a
+    certificate. Everyone else needs a client certificate as before (a
+    visitor without either gets "403 Forbidden").
+  </p>
+  <p class="ha__note"><strong>To turn it on:</strong></p>
+  <ol class="ha__list">
+    <li>Open <strong>Settings &gt; Apps &gt; Caddy mTLS Proxy &gt; Configuration</strong>.</li>
+    <li>Enter a key in <code>header_auth_key</code>: {{ ha.key_min }} to
+      {{ ha.key_max }} characters ({{ ha.charset }}) - a suggestion is
+      below. Optionally change the header's name,
+      <code>header_auth_name</code> (default <code>{{ ha.default_name }}</code>).</li>
+    <li>Select <strong>Save</strong> and restart the app.</li>
+  </ol>
+  {% endif %}
+
+  <div class="ha__suggest">
+    <button class="btn" type="button" id="ha-suggest">Suggest a key</button>
+    <div class="ha__suggest-out" id="ha-suggest-out" hidden>
+      <label class="visually-hidden" for="ha-key">Suggested key</label>
+      <input
+        id="ha-key"
+        class="ha__key"
+        type="text"
+        readonly
+        autocomplete="off"
+        spellcheck="false"
+      />
+      <button class="btn-secondary" type="button" id="ha-copy" hidden>Copy</button>
+    </div>
+    <p class="ha__hint" id="ha-hint" hidden>
+      Created in your browser from 32 random bytes; nothing is sent to the
+      app or stored. Copy it into <code>header_auth_key</code> (and into the
+      client's settings), save and restart the app.
+      <span id="ha-select-hint">Select the key and copy it (Ctrl+C or
+      Cmd+C).</span>
+    </p>
+  </div>
+</section>

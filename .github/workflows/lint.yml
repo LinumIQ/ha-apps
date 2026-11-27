@@ -259,6 +259,8 @@ jobs:
           caddy-mtls/rootfs/usr/lib/cert-mgr/public_cert.py
           caddy-mtls/rootfs/usr/lib/cert-mgr/upstream.py
           caddy-mtls/rootfs/usr/lib/cert-mgr/lan.py
+          caddy-mtls/rootfs/usr/lib/cert-mgr/headerauth.py
+          caddy-mtls/rootfs/usr/lib/cert-mgr/caddyctl.py
           caddy-mtls/tests/fake-upstream.py
           caddy-mtls/tests/real-core-ws.py
 

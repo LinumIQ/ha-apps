@@ -12,15 +12,22 @@ usage: fake-upstream.py <port> <state-dir>
   * Every other request is answered 200 with a JSON echo of the request:
     method, path, peer address and all headers.
   * Every request is appended to <state-dir>/requests.jsonl (method, path,
-    peer, the forwarding headers, refused or not).
+    peer, the forwarding headers, the names of all headers in lower case,
+    refused or not).
+  * A websocket upgrade (Upgrade: websocket, Sec-WebSocket-Key) that is not
+    refused is answered "101 Switching Protocols" (with the RFC 6455 accept
+    value); the connection is closed after a second.
 
 HTTP/1.1 with keep-alive, like Home Assistant's server, so that the add-on's
 monitor can keep its control connection open. Listens on 127.0.0.1 only.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -28,6 +35,7 @@ PORT = int(sys.argv[1])
 STATE = Path(sys.argv[2])
 STATE.mkdir(parents=True, exist_ok=True)
 FORWARDING = ("X-Forwarded-For", "X-Forwarded-Proto", "X-Forwarded-Host", "X-Real-IP", "Forwarded", "Via")
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -54,6 +62,7 @@ class Handler(BaseHTTPRequestHandler):
             "path": self.path,
             "peer": self.client_address[0],
             "forwarded": forwarded,
+            "header_names": sorted({name.lower() for name in self.headers.keys()}),
             "refused": refused,
         }
         with open(STATE / "requests.jsonl", "a", encoding="utf-8") as fh:
@@ -65,6 +74,18 @@ class Handler(BaseHTTPRequestHandler):
                     "but your HTTP integration is not set-up for reverse proxies\n"
                 )
             self._send(400, b"400: Bad Request", "text/plain; charset=utf-8")
+            return
+        ws_key = self.headers.get("Sec-WebSocket-Key")
+        if (self.headers.get("Upgrade") or "").lower() == "websocket" and ws_key:
+            accept = base64.b64encode(hashlib.sha1((ws_key + WS_GUID).encode()).digest()).decode()
+            self.send_response(101)
+            self.send_header("Upgrade", "websocket")
+            self.send_header("Connection", "Upgrade")
+            self.send_header("Sec-WebSocket-Accept", accept)
+            self.end_headers()
+            self.wfile.flush()
+            time.sleep(1)
+            self.close_connection = True
             return
         echo = {
             "method": self.command,

@@ -23,7 +23,10 @@
 # (< 10 s, exit 0, no s6 warnings) and a
 # restart as Supervisor does it (a new container with the previous /data)
 # with a new client name and a new client_cert_password (issuance and .p12
-# re-encryption at start-up). Fails on any AppArmor denial for the profile.
+# re-encryption at start-up). Header authentication (2.3.0) is on: the key
+# file (headerauth.py), the list of active client certificates (caddyctl.py,
+# at the start and before each reload) and the gate run under the profile.
+# Fails on any AppArmor denial for the profile.
 #
 # No external network traffic: the container runs with --network none and
 # ACME_CA_URL points at a closed local port. A profile that was not loaded
@@ -120,6 +123,11 @@ cat >"${WORK}/data/options.json" <<'JSON'
  "acme_dns_provider": "none", "dns_api_token": "", "log_level": "info",
  "cert_expiry_warn_days": [30, 14, 7, 1], "cert_check_interval_hours": 6}
 JSON
+# Header authentication with a per-run fake key (from a file: never on a
+# command line).
+printf 'fakekey.NOT-A-SECRET.%s' "$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')" >"${WORK}/key"
+jq --rawfile key "${WORK}/key" '. + {header_auth_key: $key}' "${WORK}/data/options.json" >"${WORK}/options.json"
+mv "${WORK}/options.json" "${WORK}/data/options.json"
 cp "${WORK}/data/options.json" "${WORK}/tmp/.bashio/addons.self.options.config.cache"
 # The add-on's network settings with the local-network port (4443/tcp) on.
 printf '%s\n' '{"name":"Caddy mTLS Proxy","network":{"80/tcp":8080,"443/tcp":8443,"4443/tcp":9443}}' \
@@ -168,6 +176,14 @@ lan_listening() {
         cexec sh -c 'grep -qi ":115B " /proc/net/tcp6 /proc/net/tcp' # 0x115B = 4443, listening
 }
 check "Caddy listens on 4443 under ${PROFILE}" wait_for 30 lan_listening
+check "header authentication on: key file 0600 (headerauth.py), the list of active certificates written (caddyctl.py)" eval '
+    test "$(cexec stat -c %a /etc/caddy/header-auth.key)" == 600 &&
+    cexec grep -E "^not vars \{http.request.tls.client.fingerprint\} [0-9a-f]{64} [0-9a-f]{64}$" /etc/caddy/client-fingerprints.caddy >/dev/null'
+printf 'X-Custom-PSK: %s\n' "$(cat "${WORK}/key")" | "${DOCKER}" exec -i "${CTR}" sh -c 'cat > /tmp/h-key'
+gate() { # gate [curl args]: the status of a request to the public site
+    cexec curl -sk --max-time 10 -o /dev/null -w '%{http_code}' --resolve home.example.com:443:127.0.0.1 \
+        "$@" https://home.example.com/gate-check 2>/dev/null || true
+}
 # Read from the host: the profile itself does not allow reading AppArmor labels.
 pid1="$("${DOCKER}" inspect -f '{{.State.Pid}}' "${CTR}")"
 check "PID 1 confined by ${PROFILE} (enforce)" \
@@ -208,6 +224,9 @@ code="$(http_code POST /api/upstream/check -H "X-Ingress-Path: ${INGRESS_PREFIX}
 check "Check again answered (got ${code})" test "${code}" == 303
 check "the fake upstream got the test requests (start of the watch + Check again)" \
     test "$(cexec sh -c 'wc -l < /tmp/up/refused.log' 2>/dev/null)" -ge 2
+check "the gate under ${PROFILE}: no certificate/no key 403, the key 200, alice's certificate 200" eval '
+    test "$(gate)" == 403 && test "$(gate -H @/tmp/h-key)" == 200 &&
+    test "$(gate --cert /data/certs/mTLS-client-alice.crt --key /data/certs/mTLS-client-alice.key)" == 200'
 code="$(http_code GET /)"
 check "dashboard renders (got ${code})" test "${code}" == 200
 # The shared LinumIQ UI (stylesheets, a font, the footer logo, the app mark)
@@ -238,6 +257,13 @@ check "bob revoked, CRL regenerated" \
     test "$(state '.clients[] | select(.name == "bob") | .status')" == revoked
 reloaded() { (( $(log_count 'stopped previous server') >= reloads_before + 2 )); }
 check "Caddy reloaded twice (forced reload)" wait_for 15 reloaded
+# shellcheck disable=SC2034 # used in eval'd checks
+carol_fp="$(cexec sh -c 'openssl x509 -in /data/certs/mTLS-client-carol.crt -outform DER | sha256sum | cut -d" " -f1')"
+check "the list regenerated before those reloads (carol in it, bob out), carol's certificate passes the gate" eval '
+    cexec grep -F "${carol_fp}" /etc/caddy/client-fingerprints.caddy >/dev/null &&
+    test "$(gate --cert /data/certs/mTLS-client-carol.crt --key /data/certs/mTLS-client-carol.key)" == 200 &&
+    test "$(gate --cert /data/certs/mTLS-client-bob.crt --key /data/certs/mTLS-client-bob.key)" == 000'
+check "the key is not in the log" eval '! "${DOCKER}" logs "${CTR}" 2>&1 | grep -F -f "${WORK}/key" >/dev/null' 
 check "no 'config is unchanged' (reload was forced)" logs_lack "config is unchanged"
 check "no 'permission denied' in the log" logs_lack "ermission denied"
 

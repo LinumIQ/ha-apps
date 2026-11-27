@@ -58,6 +58,8 @@ from ipaddress import ip_address, ip_network
 from pathlib import Path
 from typing import Any
 
+import caddyctl
+
 STATE_FILE = Path(os.environ.get("CADDY_MTLS_UPSTREAM_STATE", "/data/upstream.json"))
 SNIPPET_FILE = Path(os.environ.get("CADDY_MTLS_FORWARD_SNIPPET", "/etc/caddy/forwarded-headers.caddy"))
 LOCK_FILE = Path(os.environ.get("CADDY_MTLS_UPSTREAM_LOCK", "/run/caddy-mtls/upstream.lock"))
@@ -130,6 +132,15 @@ class Settings:
     port: int
     mtls: bool
     option: str = "auto"
+    #: Header authentication is on (2.3.0): a holder of the key gets in like
+    #: a holder of a client certificate. Only the texts follow it; the
+    #: forwarding rules depend on ``mtls`` alone.
+    header_auth: bool = False
+
+    @property
+    def visitors(self) -> str:
+        """Who gets through the public port, for texts ("every device ...")."""
+        return "with a client certificate or the header key" if self.header_auth else "with a client certificate"
 
     @property
     def target(self) -> str:
@@ -149,12 +160,14 @@ class Settings:
         if not isinstance(host, str) or not host or not isinstance(port, int) or not 0 < port < 65536:
             return None
         option = data.get("forwarded_headers")
+        header_auth = data.get("header_auth")
         return cls(
             domain=str(data.get("domain") or ""),
             host=host,
             port=port,
             mtls=bool(data.get("mtls_enabled")),
             option=option if option in OPTIONS else "auto",
+            header_auth=isinstance(header_auth, dict) and header_auth.get("enabled") is True,
         )
 
     @classmethod
@@ -292,10 +305,11 @@ def decide(option: str, mtls: bool, decisive: str | None) -> str:
 
     With mTLS: always -> pass; never -> strip; auto -> pass unless the
     upstream refused the last test request. Visitors on the public port have
-    a client certificate and visitors on the local-network port come from
-    private addresses, so showing them to Home Assistant under the add-on's
-    address is acceptable. While the upstream is unreachable the last
-    decisive result counts (none yet: pass).
+    a client certificate (or, with header authentication, the header key:
+    treated like a certificate) and visitors on the local-network port come
+    from private addresses, so showing them to Home Assistant under the
+    add-on's address is acceptable. While the upstream is unreachable the
+    last decisive result counts (none yet: pass).
     """
     if not mtls:
         return PASS
@@ -455,12 +469,12 @@ def strip_consequences(settings: Settings, source: str) -> list[str]:
         f"Home Assistant counts {source} as a device in the local network: users marked "
         '"Can only log in from the local network" can log in, and webhooks marked '
         '"Only accessible from the local network" accept requests, from every device '
-        "with a client certificate.",
+        f"{settings.visitors}.",
         f"If you set a limit of login attempts (HTTP server > IP banning), too many failed "
         f"logins ban {source} - that is everyone who uses this add-on - until you delete "
         "it from ip_bans.yaml and restart Home Assistant.",
         f"If you use the trusted networks login provider and its networks include {source}, "
-        "every device with a client certificate logs in without a password.",
+        f"every device {settings.visitors} logs in without a password.",
     ]
 
 
@@ -855,20 +869,12 @@ def snippet_mode() -> str | None:
 
 def caddy_reload() -> tuple[bool, str]:
     """``caddy reload --force`` of the Caddyfile (the snippet is imported at
-    adapt time; --force: Caddy skips an unchanged config otherwise)."""
-    if not CADDYFILE.exists():
-        return False, f"Caddyfile not found at {CADDYFILE}"
-    try:
-        proc = subprocess.run(
-            [CADDY_BIN, "reload", "--force", "--config", str(CADDYFILE),
-             "--adapter", "caddyfile", "--address", CADDY_ADMIN],
-            capture_output=True, text=True, check=False, timeout=60,
-        )
-    except (OSError, subprocess.SubprocessError) as err:
-        return False, str(err)
-    if proc.returncode != 0:
-        return False, _cli_error(proc.stderr or proc.stdout or "")
-    return True, "reloaded"
+    adapt time; --force: Caddy skips an unchanged config otherwise), through
+    caddyctl.reload: it regenerates the list of active client certificates
+    first (header authentication, 2.3.0) - see the comment there on what a
+    reload re-reads."""
+    ok, message = caddyctl.reload(caddy_bin=CADDY_BIN, caddyfile=CADDYFILE, admin=CADDY_ADMIN)
+    return ok, ("reloaded" if ok else _cli_error(message))
 
 
 def _cli_error(output: str) -> str:

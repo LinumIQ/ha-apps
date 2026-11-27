@@ -22,6 +22,8 @@
 
       {% include "_lan.html" %}
 
+      {% include "_headerauth.html" %}
+
       <section class="card" aria-labelledby="ca-heading">
         <div class="card__header">
           <h2 class="card__title" id="ca-heading">Certificate Authority</h2>
@@ -241,6 +243,58 @@
             .then(replace("upstream"))
             .catch(function () {});
         }, 30000);
+      })();
+
+      // "Suggest a key" (card "Header authentication"): 32 random bytes from
+      // the browser's own generator, base64url without padding (43
+      // characters). Nothing is sent to the add-on or stored. The copy
+      // button only where the clipboard API works (a secure context - the
+      // panel is often served over plain http in the LAN); otherwise the
+      // field is selected for Ctrl+C.
+      (function () {
+        var button = document.getElementById("ha-suggest");
+        var out = document.getElementById("ha-suggest-out");
+        var field = document.getElementById("ha-key");
+        var copy = document.getElementById("ha-copy");
+        var hint = document.getElementById("ha-hint");
+        var selectHint = document.getElementById("ha-select-hint");
+        if (!button || !out || !field || !copy || !hint || !selectHint) return;
+        if (!window.crypto || !window.crypto.getRandomValues || !window.btoa) {
+          button.hidden = true;
+          return;
+        }
+        var canCopy = !!(window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText);
+        button.addEventListener("click", function () {
+          var bytes = new Uint8Array(32);
+          window.crypto.getRandomValues(bytes);
+          var bin = "";
+          for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+          field.value = window.btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+          out.hidden = false;
+          hint.hidden = false;
+          copy.hidden = !canCopy;
+          copy.textContent = "Copy";
+          selectHint.hidden = canCopy;
+          button.textContent = "Suggest another key";
+          field.focus();
+          field.select();
+        });
+        field.addEventListener("focus", function () {
+          field.select();
+        });
+        copy.addEventListener("click", function () {
+          navigator.clipboard.writeText(field.value).then(
+            function () {
+              copy.textContent = "Copied";
+            },
+            function () {
+              copy.hidden = true;
+              selectHint.hidden = false;
+              field.focus();
+              field.select();
+            }
+          );
+        });
       })();
     </script>
 {% endblock %}

@@ -46,6 +46,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import BaseHTTPMiddleware
 
+import caddyctl
+import headerauth
 import public_cert
 import upstream
 
@@ -124,10 +126,14 @@ def _read_state() -> dict[str, Any]:
 
 
 def _caddy_reload() -> tuple[bool, str]:
-    """Reload Caddy via the admin API.
+    """Reload Caddy via the admin API (caddyctl.reload).
 
-    Uses the `caddy` CLI which knows how to convert the Caddyfile to JSON
-    and POST it to /load on the admin endpoint.
+    The `caddy` CLI converts the Caddyfile to JSON and POSTs it to /load on
+    the admin endpoint. Before that, caddyctl regenerates the list of active
+    client certificates from the ``active/`` folder (the header
+    authentication gate, 2.3.0); if that fails, Caddy is not reloaded and
+    the reload counts as failed. See caddyctl.py for what a reload re-reads
+    (the custom snippets only as the copies checked at the start).
 
     ``--force`` is required: client changes never change the Caddyfile (the
     leaf verifier only names the ``active/`` folder, whose files Caddy reads
@@ -135,27 +141,7 @@ def _caddy_reload() -> tuple[bool, str]:
     is unchanged") - without it, added clients were refused and revoked ones
     still accepted until the add-on restarted.
     """
-    if not CADDYFILE.exists():
-        return False, f"Caddyfile not found at {CADDYFILE}"
-    proc = subprocess.run(
-        [
-            CADDY_BIN,
-            "reload",
-            "--force",
-            "--config",
-            str(CADDYFILE),
-            "--adapter",
-            "caddyfile",
-            "--address",
-            CADDY_ADMIN,
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        return False, proc.stderr or proc.stdout or "caddy reload failed"
-    return True, "reloaded"
+    return caddyctl.reload(caddy_bin=CADDY_BIN, caddyfile=CADDYFILE, admin=CADDY_ADMIN)
 
 
 def _validate_client_name(name: str) -> str:
@@ -301,6 +287,15 @@ def _upstream_context() -> dict[str, Any]:
     return {"hc": upstream.card_context(settings, upstream.load_state(settings) if settings else None)}
 
 
+def _runtime_json() -> dict[str, Any] | None:
+    """runtime.json as it is (the facts of this start; never a secret)."""
+    try:
+        data = json.loads(public_cert.RUNTIME_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 # Sync (def) routes run in the thread pool: they read files and call openssl.
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request) -> Any:
@@ -325,6 +320,9 @@ def index(request: Request) -> Any:
             # add-on's configuration folder (the certificate copies).
             "lan_rt": runtime,
             "rt": runtime,
+            # The "Header authentication" card (name, key length - never
+            # the key).
+            "ha": headerauth.card_context(_runtime_json()),
         },
     )
 

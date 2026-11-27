@@ -8,6 +8,14 @@
 # library functions and produce identical artefacts.
 # ==============================================================================
 
+# bashio's trace output prints the arguments of its functions - among them
+# the add-on's whole options with every secret (header_auth_key,
+# dns_api_token, client_cert_password): never more than debug here (2.3.0).
+# shellcheck disable=SC2154,SC2034
+if (( __BASHIO_LOG_LEVEL > __BASHIO_LOG_LEVEL_DEBUG )); then
+    __BASHIO_LOG_LEVEL="${__BASHIO_LOG_LEVEL_DEBUG}"
+fi
+
 bashio::log.info "Starting cert-mgr (FastAPI) service..."
 
 # Reuse the same options the init oneshot read.

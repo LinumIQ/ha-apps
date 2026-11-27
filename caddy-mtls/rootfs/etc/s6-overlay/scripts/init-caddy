@@ -9,6 +9,15 @@
 # ==============================================================================
 set -e
 
+# bashio's trace output prints the arguments of its functions - among them
+# the add-on's whole options with every secret (header_auth_key,
+# dns_api_token, client_cert_password): never more than debug here (since
+# 2.3.0; log_level trace still turns everything else on).
+# shellcheck disable=SC2154,SC2034
+if (( __BASHIO_LOG_LEVEL > __BASHIO_LOG_LEVEL_DEBUG )); then
+    __BASHIO_LOG_LEVEL="${__BASHIO_LOG_LEVEL_DEBUG}"
+fi
+
 # shellcheck source=rootfs/etc/s6-overlay/scripts/lib/cert-helpers.sh
 source /etc/s6-overlay/scripts/lib/cert-helpers.sh
 # shellcheck source=rootfs/etc/s6-overlay/scripts/lib/state.sh
@@ -35,7 +44,15 @@ readonly RUNTIME_FILE="${RUNTIME_DIR}/runtime.json"
 readonly FORWARD_SNIPPET="/etc/caddy/forwarded-headers.caddy"
 readonly UPSTREAM_PY="/usr/lib/cert-mgr/upstream.py"
 readonly LAN_PY="/usr/lib/cert-mgr/lan.py"
+readonly HEADERAUTH_PY="/usr/lib/cert-mgr/headerauth.py"
+readonly CADDYCTL_PY="/usr/lib/cert-mgr/caddyctl.py"
 readonly PANEL_PYTHON="/usr/lib/cert-mgr/.venv/bin/python3"
+# Header authentication (since 2.3.0): the key (0600, written by
+# headerauth.py; Caddy reads it per request through {file.*}) and the list
+# of active client certificates (caddyctl.py; regenerated before every
+# reload).
+readonly HEADER_KEY_FILE="/etc/caddy/header-auth.key"
+readonly FINGERPRINT_FILE="/etc/caddy/client-fingerprints.caddy"
 STARTED_AT="$(date +%s)"
 
 mkdir -p "${CERT_DIR}" "${CADDY_DATA}" "${CADDY_DATA}/log" "${RUNTIME_DIR}"
@@ -173,6 +190,29 @@ if bashio::var.true "${MTLS_ENABLED}" && bashio::var.is_empty "${CLIENT_CERT_PAS
 fi
 
 ###############################################################################
+# Header authentication (since 2.3.0; on exactly when header_auth_key is not
+# empty). headerauth.py reads header_auth_name and header_auth_key from the
+# options file itself - the key never passes through this script, the
+# environment or a command line -, refuses a bad name or key (its messages
+# name the key's length at most), writes the key to ${HEADER_KEY_FILE}
+# (0600) or removes that file, and prints on/off, the name and the key's
+# length.
+###############################################################################
+HEADER_AUTH_JSON=""
+if ! HEADER_AUTH_JSON="$("${PANEL_PYTHON}" "${HEADERAUTH_PY}" setup \
+        --options /data/options.json --key-file "${HEADER_KEY_FILE}" 2>&1)"; then
+    bashio::exit.nok "${HEADER_AUTH_JSON:-header authentication: the options could not be checked}"
+fi
+HEADER_AUTH=false
+[[ "$(jq -r '.enabled' <<<"${HEADER_AUTH_JSON}")" == true ]] && HEADER_AUTH=true
+HEADER_AUTH_NAME="$(jq -r '.name' <<<"${HEADER_AUTH_JSON}")"
+HEADER_AUTH_KEY_LENGTH="$(jq -r '.key_length' <<<"${HEADER_AUTH_JSON}")"
+# Rendered into the Caddyfile unquoted: checked again here.
+if [[ "${HEADER_AUTH}" == true && ! "${HEADER_AUTH_NAME}" =~ ^[A-Za-z][A-Za-z0-9-]{0,63}$ ]]; then
+    bashio::exit.nok "header_auth_name is not a valid header name."
+fi
+
+###############################################################################
 # Initialise state file (atomic, idempotent)
 ###############################################################################
 state_init
@@ -279,6 +319,25 @@ if bashio::var.true "${MTLS_ENABLED}"; then
     generate_crl
     state_refresh_crl
 fi
+
+###############################################################################
+# The SHA-256 fingerprints of the active client certificates, derived from
+# exactly the files in ${CERT_DIR}/active that Caddy's leaf verifier loads
+# (caddyctl.py; also before every run-time reload). The header
+# authentication gate imports the list (since 2.3.0): with a key set, a
+# request without the key gets through only with one of these certificates.
+# Written always - it costs nothing and keeps it current for every reload.
+###############################################################################
+FP_WARNINGS="$(mktemp)"
+if ! FP_COUNT="$("${PANEL_PYTHON}" "${CADDYCTL_PY}" fingerprints 2>"${FP_WARNINGS}")"; then
+    while IFS= read -r line; do bashio::log.error "${line}"; done <"${FP_WARNINGS}"
+    rm -f "${FP_WARNINGS}"
+    bashio::exit.nok "Could not write the list of active client certificates (${FINGERPRINT_FILE})."
+fi
+while IFS= read -r line; do
+    bashio::log.warning "Active client certificates: ${line#WARNING }"
+done <"${FP_WARNINGS}"
+rm -f "${FP_WARNINGS}"
 
 ###############################################################################
 # Published host ports, read before rendering: the local-network site exists
@@ -409,6 +468,21 @@ case "${LOG_LEVEL}" in
     *)                      CADDY_LOG_LEVEL="INFO" ;;
 esac
 
+# The format of every log that can carry a request (the default log and the
+# sites' access logs). While a header key is set (header authentication,
+# since 2.3.0) ALL request headers are removed from them: the access log and
+# - even with the access log off - the error line of a failed (5xx) request
+# in the default log carry the request's headers, and a header name misspelt
+# in a client's settings must not put the key into the log either. Without a
+# key: console, as up to 2.2.0.
+LOG_FORMAT="format console"
+if [[ "${HEADER_AUTH}" == true ]]; then
+    LOG_FORMAT="format filter {
+            wrap console
+            request>headers delete
+        }"
+fi
+
 # Caddy's access log ("handled request", one line of ~1.5 KB per request):
 # only with access_log: true, or with log_level debug / trace. Its entries
 # have level INFO (ERROR for 5xx), so it logs at INFO even with a higher
@@ -420,7 +494,7 @@ if bashio::var.true "${ACCESS_LOG}" || [[ "${CADDY_LOG_LEVEL}" == "DEBUG" ]]; th
     SITE_LOG="
     log {
         output stdout
-        format console
+        ${LOG_FORMAT}
         level ${ACCESS_LOG_LEVEL}
     }"
 fi
@@ -448,11 +522,20 @@ if [[ "${ACME_DNS_PROVIDER}" != "none" ]]; then
     fi
 fi
 
-# ... and the client certificates (the public site only).
+# ... and the client certificates (the public site only). Without a header
+# key: required in the handshake (as up to 2.2.0). With a key (2.3.0):
+# optional in the handshake, so that a client without one meets the HTTP
+# gate - a certificate that IS presented is still checked in the handshake
+# exactly as before (CA, validity, the active folder): Caddy 2.11.8+ runs
+# the leaf verifier only on a presented certificate (connpolicy.go
+# verifyConnection), and refuses one that fails it. No fallback to the key
+# for a refused certificate.
+CLIENT_AUTH_MODE="require_and_verify"
+[[ "${HEADER_AUTH}" == true ]] && CLIENT_AUTH_MODE="verify_if_given"
 TLS_DIRECTIVES="${TLS_ISSUER_DIRECTIVES}"
 if bashio::var.true "${MTLS_ENABLED}"; then
     TLS_DIRECTIVES="${TLS_DIRECTIVES}        client_auth {
-            mode require_and_verify
+            mode ${CLIENT_AUTH_MODE}
             trust_pool file {
                 pem_file ${CERT_DIR}/mTLS-CA.crt
             }
@@ -479,6 +562,96 @@ LAN_TLS_BLOCK=""
 if [[ -n "${TLS_ISSUER_DIRECTIVES}" ]]; then
     LAN_TLS_BLOCK="tls {
 ${TLS_ISSUER_DIRECTIVES}    }"
+fi
+
+# Header authentication (2.3.0): the gate of the public site. One named
+# matcher (a name nobody picks by chance; customconf.py's integrity check
+# compares it with the reference) = NOT an active client certificate (the
+# fingerprint list, only with mTLS) AND NOT the header with exactly the key.
+# The key is read per request from its file: a placeholder is the only form
+# that keeps it out of the configuration, Caddy's autosave.json and the
+# debug log's config dump; the guard (`not vars {file...} ""`) makes a
+# missing or emptied file match nobody - otherwise the header matcher would
+# compare an EMPTY header with an empty value. The key's character set
+# (headerauth.py) rules out the matcher's wildcard and placeholder forms.
+PUBLIC_MATCHERS=""
+PUBLIC_GATE=""
+HEADER_REMOVE=""
+HEADER_UP_REMOVE=""
+if [[ "${HEADER_AUTH}" == true ]]; then
+    KEY_MATCHERS="header ${HEADER_AUTH_NAME} {file.${HEADER_KEY_FILE}}
+            not vars {file.${HEADER_KEY_FILE}} \"\""
+    CERT_MATCHER=""
+    DENY_TEXT="403 Forbidden"
+    if bashio::var.true "${MTLS_ENABLED}"; then
+        CERT_MATCHER="
+        import ${FINGERPRINT_FILE}"
+        DENY_TEXT="403 Forbidden: this site needs a client certificate."
+    fi
+    PUBLIC_MATCHERS="
+    # Neither an active client certificate nor the header ${HEADER_AUTH_NAME}
+    # with exactly the key: answered 403 before any other handler.
+    @caddy_mtls_gate_denied {${CERT_MATCHER}
+        not {
+            ${KEY_MATCHERS}
+        }
+    }"
+    PUBLIC_GATE="
+        respond @caddy_mtls_gate_denied \"${DENY_TEXT}\" 403"
+    # The header goes no further than the gate: neither Home Assistant nor
+    # an upstream of a custom snippet receives it (header_up in the add-on's
+    # own proxy blocks as a second line).
+    HEADER_REMOVE="
+        request_header -${HEADER_AUTH_NAME}"
+    HEADER_UP_REMOVE="
+            header_up -${HEADER_AUTH_NAME}"
+
+    # Diagnosis for the access log (only when it is on): one field "auth"
+    # per request saying how it was let in or why not - never a value.
+    # log_append always passes the request on (the field is added on the
+    # way back) and has its own matchers: it shares nothing with the gate.
+    if [[ -n "${SITE_LOG}" ]]; then
+        NO_CERT=""
+        NO_CERT_TEXT=""
+        if bashio::var.true "${MTLS_ENABLED}"; then
+            NO_CERT="
+        vars {http.request.tls.client.certificate_der_base64} \"\""
+            NO_CERT_TEXT="no certificate, "
+            PUBLIC_MATCHERS="${PUBLIC_MATCHERS}
+
+    # Diagnosis only (log_append): who the gate let in, or why not.
+    @caddy_mtls_diag_certificate {
+        not vars {http.request.tls.client.certificate_der_base64} \"\"
+        not {
+            import ${FINGERPRINT_FILE}
+        }
+    }
+    @caddy_mtls_diag_inactive {
+        not vars {http.request.tls.client.certificate_der_base64} \"\"
+        import ${FINGERPRINT_FILE}
+    }"
+            PUBLIC_GATE="
+        log_append @caddy_mtls_diag_certificate auth \"certificate\"
+        log_append @caddy_mtls_diag_inactive auth \"refused: certificate not in the active list\"${PUBLIC_GATE}"
+        fi
+        PUBLIC_MATCHERS="${PUBLIC_MATCHERS}
+    @caddy_mtls_diag_key {${NO_CERT}
+        ${KEY_MATCHERS}
+    }
+    @caddy_mtls_diag_wrong {${NO_CERT}
+        header ${HEADER_AUTH_NAME} *
+        not {
+            ${KEY_MATCHERS}
+        }
+    }
+    @caddy_mtls_diag_absent {${NO_CERT}
+        header !${HEADER_AUTH_NAME}
+    }"
+        PUBLIC_GATE="
+        log_append @caddy_mtls_diag_key auth \"header key\"
+        log_append @caddy_mtls_diag_wrong auth \"refused: ${NO_CERT_TEXT}header present with a wrong value\"
+        log_append @caddy_mtls_diag_absent auth \"refused: ${NO_CERT_TEXT}header absent\"${PUBLIC_GATE}"
+    fi
 fi
 
 # Plain-HTTP site (container port 80), rendered always since 2.2.0: the CRL
@@ -531,8 +704,8 @@ ${LAN_GATEWAY_MATCHER}
     @not_private not remote_ip ${LAN_PRIVATE_RANGES}
 
     route {${LAN_GATEWAY_RULE}
-        respond @not_private \"403 Forbidden: this HTTPS port of the Caddy mTLS Proxy answers only devices in your local network (private addresses), and this connection came from {remote_host}. From the internet, use https://${DOMAIN}/ with a client certificate.\" 403
-        reverse_proxy ${UPSTREAM_HOST}:${UPSTREAM_PORT} {
+        respond @not_private \"403 Forbidden: this HTTPS port of the Caddy mTLS Proxy answers only devices in your local network (private addresses), and this connection came from {remote_host}. From the internet, use https://${DOMAIN}/ with a client certificate.\" 403${HEADER_REMOVE}
+        reverse_proxy ${UPSTREAM_HOST}:${UPSTREAM_PORT} {${HEADER_UP_REMOVE}
             # Forwarding headers (forwarded_headers; rewritten at run time)
             import ${FORWARD_SNIPPET}
         }
@@ -542,7 +715,9 @@ ${SITE_LOG}
 "
 fi
 
-cat > "${CADDYFILE}" <<CADDYFILE
+# render_caddyfile <file>: write the Caddyfile.
+render_caddyfile() {
+    cat > "$1" <<CADDYFILE
 # Caddy mTLS Proxy - generated by init-caddy on every start. Do not edit.
 
 {
@@ -563,7 +738,7 @@ cat > "${CADDYFILE}" <<CADDYFILE
     # lines (one per health probe and per panel action).
     log default {
         output stdout
-        format console
+        ${LOG_FORMAT}
         level ${CADDY_LOG_LEVEL}
         exclude admin.api
     }
@@ -591,31 +766,45 @@ cat > "${CADDYFILE}" <<CADDYFILE
     }
 }
 
-# Public mTLS-protected reverse proxy
+# Public reverse proxy: one route in every mode - the gate (with a header
+# key), the header's removal, the proxy - in this order (Caddy keeps the
+# order written inside a route).
 ${DOMAIN} {
     ${TLS_BLOCK}
+${PUBLIC_MATCHERS}
 
-    reverse_proxy ${UPSTREAM_HOST}:${UPSTREAM_PORT} {
-        # Forwarding headers (forwarded_headers; rewritten at run time)
-        import ${FORWARD_SNIPPET}
+    route {${PUBLIC_GATE}${HEADER_REMOVE}
+        reverse_proxy ${UPSTREAM_HOST}:${UPSTREAM_PORT} {${HEADER_UP_REMOVE}
+            # Forwarding headers (forwarded_headers; rewritten at run time)
+            import ${FORWARD_SNIPPET}
+        }
     }
 ${SITE_LOG}
 }
 ${HTTP_SITE}${LAN_SITE}
 CADDYFILE
+    # Caddy's own formatting (tabs), so that `caddy validate` / `caddy run`
+    # do not warn "Caddyfile input is not formatted" at every start.
+    if ! /usr/bin/caddy fmt --overwrite "$1" >/dev/null 2>&1; then
+        bashio::log.warning "caddy fmt could not format $1; validating it as it is."
+    fi
+}
 
-# Caddy's own formatting (tabs), so that `caddy validate` / `caddy run` do
-# not warn "Caddyfile input is not formatted" at every start.
-if ! /usr/bin/caddy fmt --overwrite "${CADDYFILE}" >/dev/null 2>&1; then
-    bashio::log.warning "caddy fmt could not format ${CADDYFILE}; validating it as it is."
-fi
+# caddy_validate <file>: `caddy validate` with its output in the add-on log,
+# scrubbed of the DNS credentials (e.g. the Cloudflare module quotes a token
+# it considers malformed in its error message) and - as a second line: the
+# configuration never contains it - of the header key.
+caddy_validate() {
+    /usr/bin/caddy validate --config "$1" --adapter caddyfile 2>&1 \
+        | dns_provider_redact "${DNS_API_TOKEN}" \
+        | "${PANEL_PYTHON}" "${HEADERAUTH_PY}" scrub --key-file "${HEADER_KEY_FILE}"
+}
+
+render_caddyfile "${CADDYFILE}"
 
 bashio::log.info "Validating generated Caddyfile..."
-# The output is scrubbed of the DNS credentials: e.g. the Cloudflare module
-# quotes a token it considers malformed in its error message.
 VALIDATE_RC=0
-/usr/bin/caddy validate --config "${CADDYFILE}" --adapter caddyfile 2>&1 \
-    | dns_provider_redact "${DNS_API_TOKEN}" || VALIDATE_RC=$?
+caddy_validate "${CADDYFILE}" || VALIDATE_RC=$?
 if (( VALIDATE_RC != 0 )); then
     bashio::exit.nok "Generated Caddyfile failed validation"
 fi
@@ -684,6 +873,17 @@ if [[ -n "${SITE_LOG}" ]]; then
 else
     bashio::log.info "  Access log:  off (option access_log)"
 fi
+if [[ "${HEADER_AUTH}" == true ]]; then
+    if bashio::var.true "${MTLS_ENABLED}"; then
+        bashio::log.info "  Header auth: on - header ${HEADER_AUTH_NAME}, a key of ${HEADER_AUTH_KEY_LENGTH} characters; or one of ${FP_COUNT} active client certificates"
+        bashio::log.notice "Header authentication is on: a request that carries the header ${HEADER_AUTH_NAME} with the key is accepted without a client certificate. Whoever knows the key gets as far as Home Assistant's login page. A visitor with neither gets 403 Forbidden (the TLS handshake completes). The add-on's log lines carry no request headers while a key is set."
+    else
+        bashio::log.info "  Header auth: on - header ${HEADER_AUTH_NAME}, a key of ${HEADER_AUTH_KEY_LENGTH} characters (mTLS off)"
+        bashio::log.notice "Header authentication is on without mTLS: only requests that carry the header ${HEADER_AUTH_NAME} with the key are passed on - the key is the only protection in front of Home Assistant's login page. Every other request gets 403 Forbidden. The add-on's log lines carry no request headers while a key is set."
+    fi
+else
+    bashio::log.info "  Header auth: off (option header_auth_key)"
+fi
 
 ###############################################################################
 # Published host ports (read above). Informational - never fails the start.
@@ -751,6 +951,10 @@ jq -n \
     --arg lan_state "${LAN_STATE}" \
     --arg lan_refused "${LAN_REFUSED[*]}" \
     --arg config_slug "${CONFIG_SLUG}" \
+    --argjson header_auth "${HEADER_AUTH}" \
+    --arg header_auth_name "${HEADER_AUTH_NAME}" \
+    --argjson header_auth_key_length "${HEADER_AUTH_KEY_LENGTH}" \
+    --argjson access_log "$([[ -n "${SITE_LOG}" ]] && echo true || echo false)" \
     '{domain: $domain, started_at: $started_at, host_ports_known: $ports_known,
       http_host_port: ($http_port | tonumber? // null),
       https_host_port: ($https_port | tonumber? // null),
@@ -760,7 +964,10 @@ jq -n \
       mtls_enabled: $mtls, forwarded_headers: $forwarded,
       lan_host_port: ($lan_port | tonumber? // null), lan_state: $lan_state,
       lan_refused: ($lan_refused | split(" ") | map(select(. != ""))),
-      config_slug: (if $config_slug == "" then null else $config_slug end)}' \
+      config_slug: (if $config_slug == "" then null else $config_slug end),
+      header_auth: {enabled: $header_auth, name: $header_auth_name,
+                    key_length: $header_auth_key_length},
+      access_log: $access_log}' \
     > "${RUNTIME_FILE}.tmp"
 chmod 644 "${RUNTIME_FILE}.tmp"
 mv -f "${RUNTIME_FILE}.tmp" "${RUNTIME_FILE}"
