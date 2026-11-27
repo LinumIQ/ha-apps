@@ -73,7 +73,7 @@ access_log: false
 
 # Visitor addresses for Home Assistant (X-Forwarded-For): auto passes them on
 # when Home Assistant trusts the add-on, otherwise (with mTLS) removes them
-forwarded_headers: auto # or: always, never
+forwarded_headers: auto # or: always, never (never needs mtls_enabled: true)
 ```
 
 ## Network Requirements

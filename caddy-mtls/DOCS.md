@@ -105,7 +105,13 @@ IPv4. Check what your devices get with `nslookup home.example.com`.
 **Tip:** where host port 443 is free on your Home Assistant host (not on new
 Home Assistant OS installations, which serve Home Assistant itself on 443),
 give `4443/tcp` the host port 443: at home `https://home.example.com/` then
-opens without a certificate, and away the same URL asks for one.
+opens without a certificate, and away the same URL asks for one. **Before
+you do, look at your router's port forwarding:** external TCP 443 must go to
+the host port of `443/tcp` (the client-certificate port, 8443 by default),
+never to host port 443 itself, which would then be the port without client
+certificates. Installations from before 2.0.0 used host port 443 for
+`443/tcp`, so an old forwarding rule may still point there. The card **Local
+network** repeats this warning while the port uses host port 443.
 
 **Only local addresses.** The port answers only connections from private
 addresses (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8,
@@ -162,7 +168,14 @@ integration is not set-up for reverse proxies` into its log.
 | ------------------- | ----------------- | ---------------------------------------- |
 | `auto` (default)    | passed on if Home Assistant trusts the add-on; otherwise (with mTLS) removed | no |
 | `always`            | always passed on  | yes - otherwise every request is answered `400: Bad Request` |
-| `never`             | never passed on   | no |
+| `never`             | never passed on - **only with mTLS on** | no |
+
+**`never` needs mTLS** (`mtls_enabled: true`), for every upstream. Without
+client certificates the visitors are anyone on the internet; if the add-on
+hid their addresses, each of them would look like a device in your local
+network to Home Assistant. With `mtls_enabled: false` and
+`forwarded_headers: never` the add-on refuses to start and says so in its
+log; use `auto` and let Home Assistant trust the add-on, or turn mTLS on.
 
 With `auto`, the add-on asks Home Assistant at every start whether it
 accepts forwarded requests from the add-on (a request with and one without
@@ -174,9 +187,10 @@ the header):
 - **Home Assistant does not trust the add-on, mTLS on** (the default): the
   add-on removes the forwarding headers. It works, and **Home Assistant sees
   every visitor under the add-on's own address** (for example
-  `172.30.33.3`). Every visitor has a client certificate, so this is an
-  acceptable default, but it has consequences, which the web interface
-  lists:
+  `172.30.33.3`). Visitors on the public port have a client certificate,
+  and visitors on the [local-network port](#https-in-your-local-network-without-a-client-certificate-since-220)
+  come from private addresses, so this is an acceptable default, but it
+  has consequences, which the web interface lists:
   - Logins, the "Login attempt failed" notifications and Home Assistant's
     logs show the add-on's address instead of the visitor's.
   - Home Assistant counts that address as a device in your local network:
@@ -196,17 +210,35 @@ the header):
   Home Assistant notification say what to do.
 - **Home Assistant does not answer** (for example while it starts - at boot
   the add-on starts before Home Assistant): the add-on keeps the last known
-  mode and decides as soon as Home Assistant answers.
+  mode and decides as soon as Home Assistant answers. While Home Assistant
+  does not answer or restarts, the add-on asks every 2.5 seconds, so few
+  requests are answered 400 before it decides. A Home Assistant that is
+  only slow (no answer within 5 seconds) counts as "does not answer" after
+  two unanswered questions in a row, or at once when the connection is
+  refused; a pause of up to about 15 seconds changes nothing.
 
-The add-on keeps watching: when Home Assistant restarts (which is how a
-changed HTTP setting takes effect), the add-on asks again and switches
-without a restart of its own (Caddy reloads its configuration; open
-websocket connections, for example of the Home Assistant app, reconnect).
-While Home Assistant trusts the add-on it asks once a minute, which Home
-Assistant does not log. While Home Assistant does not trust it, the add-on
-asks only at its start, after a Home Assistant restart and when you select
-**Check again** - **each of these questions writes one line into Home
-Assistant's log** (the one quoted above).
+The add-on keeps watching: it asks Home Assistant every 12 seconds with a
+request that Home Assistant does not log, over a connection that Home
+Assistant keeps open. When Home Assistant restarts (which is how a changed
+HTTP setting takes effect - and how it drops unconfirmed settings after 5
+minutes), that connection breaks; the add-on then asks again whether Home
+Assistant trusts it and switches without a restart of its own (Caddy
+reloads its configuration; open websocket connections, for example of the
+Home Assistant app, reconnect). While Home Assistant trusts the add-on it
+also asks once a minute, which Home Assistant does not log. While Home
+Assistant does not trust it, the add-on asks only at its start, after a
+Home Assistant restart (or after Home Assistant did not answer twice in a
+row) and when you select **Check again** - **each of these questions writes
+one line into Home Assistant's log** (the one quoted above).
+
+When the add-on stops passing visitor addresses on while it runs (Home
+Assistant no longer trusts it), it raises a Home Assistant notification
+**"Caddy mTLS: Home Assistant no longer trusts the app - visitor addresses
+are hidden"** with what that means and how to restore the trust. The
+notification disappears when the addresses are passed on again (and at the
+add-on's next start). If Caddy cannot be reloaded for a change, the card
+turns red ("Change not applied", with the error), shows what Caddy still
+runs, and the add-on retries.
 
 ### Passing the real visitor addresses on (recommended)
 
@@ -266,7 +298,7 @@ network works as well.
 | `client_cert_password`      | `LinumIQ`        | Password for .p12 files - set your own; changing it re-encrypts the existing bundles at the next start (see [Changing the certificate password](#changing-the-certificate-password)) |
 | `log_level`                 | `info`           | Add-on / Caddy log verbosity (`trace`, `debug`, `info`, `notice`, `warning`, `error`, `fatal`); `debug` and `trace` also turn the access logs on |
 | `access_log`                | `false`          | Log every proxied request (Caddy's access log, ~1.5 KB per request); see [Logs](#logs)                                  |
-| `forwarded_headers`         | `auto`           | Whether Home Assistant gets each visitor's own address (`auto`, `always`, `never`); see [Home Assistant Core Configuration](#home-assistant-core-configuration) |
+| `forwarded_headers`         | `auto`           | Whether Home Assistant gets each visitor's own address (`auto`, `always`, `never`; `never` only with `mtls_enabled: true`); see [Home Assistant Core Configuration](#home-assistant-core-configuration) |
 | `cert_expiry_warn_days`     | `[30, 14, 7, 1]` | List of days-before-expiry thresholds at which to fire a notification (one notification per crossed threshold per cert) |
 | `cert_check_interval_hours` | `6`              | How often the `cert-monitor` service polls certificate metadata and publishes sensor states (`1`-`168`)                 |
 
@@ -600,9 +632,14 @@ interface: the card **Home Assistant connection** is red and says why -
 `forwarded_headers: always`, or mTLS is off (then the add-on never hides the
 visitor addresses). Let Home Assistant trust the add-on (see
 [Passing the real visitor addresses on](#passing-the-real-visitor-addresses-on-recommended)),
-or with mTLS on set `forwarded_headers` to `auto`. Up to 2.1.x this was the
-answer to every request until Home Assistant trusted the add-on; since 2.2.0
-`forwarded_headers: auto` avoids it.
+or with mTLS on set `forwarded_headers` to `auto`. With mTLS off,
+`forwarded_headers: never` is no way out - the add-on refuses to start with
+it ([why](#what-the-add-on-does-option-forwarded_headers-since-220)). If the
+card says **Change not applied**, Caddy could not be reloaded for a change of
+the forwarding mode: the card shows the error and what Caddy still runs; the
+add-on retries, and a restart of the add-on applies it as well. Up to 2.1.x
+this was the answer to every request until Home Assistant trusted the
+add-on; since 2.2.0 `forwarded_headers: auto` avoids it.
 
 ### No public certificate / "not reachable over HTTPS"
 
@@ -664,6 +701,10 @@ local network - or came over IPv6 with a public address: let the domain
 resolve to the host's IPv4 address in your local DNS. "The address of
 Docker" means Docker hid the real address (an IPv6 connection, or one from
 the Home Assistant host itself): connect over IPv4 from another device.
+Devices that come through a VPN (for example Tailscale, whose addresses
+100.64.0.0/10 are not private, or a VPN app on the same host, whose
+connections arrive under Docker's address) are refused as well: they use
+the client-certificate address `https://<domain>/`.
 
 ### "Connection refused" errors
 
@@ -721,12 +762,14 @@ The image can be started without Supervisor (this is what the smoke tests in
   `CERT_MONITOR_PUBLIC_CERT_GRACE_SECONDS` (default 120) and
   `CERT_MONITOR_FAST_INTERVAL_SECONDS` (default 60) shorten the public
   certificate notification's delay and check interval for the tests.
-- `CADDY_MTLS_UPSTREAM_CONTROL_SECONDS` (default 12) and
-  `CADDY_MTLS_UPSTREAM_TEST_SECONDS` (default 60) (environment variables,
+- `CADDY_MTLS_UPSTREAM_CONTROL_SECONDS` (default 12),
+  `CADDY_MTLS_UPSTREAM_TEST_SECONDS` (default 60) and
+  `CADDY_MTLS_UPSTREAM_FAST_SECONDS` (default 2.5) (environment variables,
   test-only): how often the monitor watches Home Assistant (a request without
-  forwarding headers, which Home Assistant does not log) and, while Home
-  Assistant trusts the add-on under `forwarded_headers: auto`, how often it
-  repeats the test request.
+  forwarding headers, which Home Assistant does not log), how often it
+  repeats the test request while Home Assistant trusts the add-on under
+  `forwarded_headers: auto`, and how often it watches while nothing has been
+  decided and Home Assistant does not answer.
 - Without the Supervisor API the add-on reaches `homeassistant:8123`
   (`upstream_port` unset) only where a host of that name exists; the tests
   set `upstream_host`/`upstream_port` or provide the name.
@@ -764,9 +807,11 @@ caddy-mtls/tests/real-core.sh caddy-mtls-test [ghcr.io/linumiq/amd64-addon-caddy
   each mode (spoofed client headers included), the switch at run time in
   both directions (after a "restart" of the fake and by the periodic test),
   the number of refused requests (= Home Assistant log lines) per phase,
-  "Check again", the card in every state, the notification, the last known
-  mode while the upstream is down, `always`, `never` and `auto` without
-  mTLS.
+  "Check again", the card in every state, both notifications, a failed
+  reload (red card, what Caddy really runs, one ERROR line, the repair), the
+  last known mode while the upstream is down, `always`, `never` and `auto`
+  without mTLS, `never` without mTLS refused at the start, the texts for an
+  upstream that is not Home Assistant.
   Prints PASS/FAIL per check; exit 0 = all passed, 1 = a check failed,
   2 = usage error.
 - `tests/apparmor-smoke.sh <image> <apparmor.txt>` (needs root or sudo and an
@@ -794,7 +839,12 @@ caddy-mtls/tests/real-core.sh caddy-mtls-test [ghcr.io/linumiq/amd64-addon-caddy
   through Core's own API (what **Settings > System > Network > HTTP server**
   does) make the running add-on switch to passing addresses on, with the
   client's real address in Core's log; removing them switches back; the
-  websocket (`/api/websocket`) works through the proxy in both modes. It
+  websocket (`/api/websocket`) works through the proxy in both modes. With
+  the monitor's default intervals: the first start with Core down (the
+  switch within 5 s of Core's first answer), a Core restart right after the
+  add-on's start, trust removed while passing addresses on (noticed within
+  one control interval, the "addresses hidden" notification), Core paused
+  for 15 s (nothing happens) and for 40 s (unreachable, no 502 claim). It
   counts the lines that each phase writes into Core's log.
   `REALCORE_PREFIX`, `REALCORE_SUBNET` and `REALCORE_EVIDENCE` set the name
   prefix, the test network and a directory for the logs.

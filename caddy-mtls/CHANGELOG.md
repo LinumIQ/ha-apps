@@ -31,27 +31,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     client certificates no internet visitor may look like a local device),
     so the 400 stays - now explained in the web interface and in a Home
     Assistant notification.
-  - `always` passes the addresses on as up to 2.1.3; `never` never does.
+  - `always` passes the addresses on as up to 2.1.3; `never` never does -
+    and needs mTLS: with `mtls_enabled: false` and `forwarded_headers:
+    never` the add-on refuses to start (every internet visitor would look
+    like a local device), naming the alternatives.
 - The add-on keeps watching Home Assistant (a request every 12 seconds that
-  Home Assistant does not log) and switches at run time, without a restart
-  of its own, when Home Assistant restarts with changed settings: the
-  header lines of the proxy live in an imported file that is rewritten,
-  then Caddy reloads (open websocket connections reconnect). While Home
-  Assistant trusts the add-on, the check repeats once a minute; while it
-  does not, only at the start, after a Home Assistant restart and on
-  **Check again** - each refused check writes one line into Home
-  Assistant's log.
+  Home Assistant does not log, over a connection Home Assistant keeps open)
+  and switches at run time, without a restart of its own, when Home
+  Assistant restarts with changed settings - also when it restarts right
+  after the add-on started, and also when it stops trusting the add-on (for
+  example when it drops unconfirmed HTTP settings after 5 minutes): that is
+  noticed at the next 12-second check, not after a minute. The header lines
+  of the proxy live in an imported file that is rewritten, then Caddy
+  reloads (open websocket connections reconnect). While Home Assistant
+  trusts the add-on, the check repeats once a minute; while it does not,
+  only at the start, after a Home Assistant restart and on **Check again** -
+  each refused check writes one line into Home Assistant's log. While Home
+  Assistant does not answer or restarts (also at the first start with Home
+  Assistant still down) the add-on asks every 2.5 seconds. A slow answer is
+  not "down": Home Assistant counts as unreachable only after a refused
+  connection or two checks in a row without an answer within 5 seconds.
 
 ### Added
 
 - Web interface: a card **Home Assistant connection** - green while visitor
   addresses are passed on, blue while Home Assistant sees every visitor as
   the add-on (with the consequences), red while every request is answered
-  400 or Home Assistant does not answer - with the steps to let Home
-  Assistant trust the add-on and a **Check again** button.
+  400, Home Assistant does not answer, or Caddy could not be reloaded for a
+  change ("Change not applied", with the error; the card then shows what
+  Caddy still runs) - with the steps to let Home Assistant trust the add-on
+  and a **Check again** button.
 - A Home Assistant notification "Caddy mTLS: Home Assistant refuses the
   proxied requests" while every request is answered 400; it is dismissed
   when that is over.
+- A Home Assistant notification "Caddy mTLS: Home Assistant no longer
+  trusts the app - visitor addresses are hidden" when the add-on stops
+  passing the addresses on while it runs, with what that means and how to
+  restore the trust; dismissed when the addresses are passed on again and
+  at the next start (none when the add-on simply starts that way).
 - `tests/real-core.sh`: checks the behaviour against a real Home Assistant
   Core 2026.11.3 (not part of CI).
 - **HTTPS in the local network without a client certificate** (optional):
@@ -64,9 +81,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hides their real source. Off by default: it is on exactly while the port
   has a host port (Network settings, **Show disabled ports**). Never forward
   it on the router. The web interface has a card **Local network** (off:
-  how to turn it on; on: the address, the local DNS record, the warnings).
-  A TLS session of this port cannot be resumed on the client-certificate
-  port.
+  how to turn it on; on: the address, the local DNS record, the warnings -
+  with host port 443 also: the router must forward external 443 to the
+  client-certificate port, never to host port 443). A TLS session of this
+  port cannot be resumed on the client-certificate port. Devices that come
+  through a VPN are refused there; they use the client-certificate address.
 
 ### Changed
 

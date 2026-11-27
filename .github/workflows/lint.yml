@@ -260,6 +260,7 @@ jobs:
           caddy-mtls/rootfs/usr/lib/cert-mgr/upstream.py
           caddy-mtls/rootfs/usr/lib/cert-mgr/lan.py
           caddy-mtls/tests/fake-upstream.py
+          caddy-mtls/tests/real-core-ws.py
 
       # The expiry monitor, public_cert.py and upstream.py (standard library
       # only): entity-id slugs against Home Assistant's entity id rule,
