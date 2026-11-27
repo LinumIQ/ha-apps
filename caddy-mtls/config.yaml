@@ -40,7 +40,7 @@ ports:
 ports_description:
   "80/tcp": "HTTP (Let's Encrypt HTTP-01, CRL, redirect to HTTPS). Router: forward external TCP 80 to this port."
   "443/tcp": "HTTPS with mTLS client certificates. Router: forward external TCP 443 to this port."
-  "4443/tcp": "HTTPS for your local network without a client certificate (private addresses only). Never forward this port on the router."
+  "4443/tcp": "Local-network HTTPS without client certificate (private addresses only). Never forward on the router."
 
 # Ingress configuration for the certificate management web UI (FastAPI app
 # served by the cert-mgr s6 service on port 8099 inside the container).
