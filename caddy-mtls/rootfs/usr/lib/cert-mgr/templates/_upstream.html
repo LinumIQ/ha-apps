@@ -10,6 +10,7 @@
   "never": "Addresses not passed on",
   "unreachable": "Unreachable",
   "reload_failed": "Change not applied",
+  "too_slow": "Too slow to decide",
   "unknown": "Not checked yet",
 } -%}
 {%- set badges = {
@@ -19,6 +20,7 @@
   "never": "info",
   "unreachable": "danger",
   "reload_failed": "danger",
+  "too_slow": "warn",
   "unknown": "info",
 } -%}
 {%- set s = hc.settings -%}
@@ -45,7 +47,8 @@
   {% if hc.card == "reload_failed" %}
   <div class="hc__error" role="alert">
     <strong>Applying the forwarding mode {{ st.mode }} failed</strong>: Caddy
-    could not be reloaded. The add-on retries every few seconds.
+    could not be reloaded. The add-on retries on its own at each regular check
+    of the connection.
     <code class="hc__error-text">{{ st.reload_error }}</code>
   </div>
   <p class="hc__lead">
@@ -131,12 +134,22 @@
 
   {% elif hc.card == "unreachable" %}
   <p class="hc__lead">
-    <strong>The upstream <code>{{ s.target }}</code> does not answer</strong>
-    ({{ st.error or "no answer" }}), so {{ hc.effect }}.
-    While Home Assistant starts or restarts this is normal: the add-on asks
-    every few seconds and decides about the forwarding headers as soon as it
-    answers (until then: mode <code>{{ st.running_mode }}</code>, the last
-    known).
+    <strong>The upstream <code>{{ s.target }}</code> {{ hc.down }}</strong>
+    ({{ hc.down_detail }}), so {{ hc.effect }}.
+    While {{ hc.name }} starts or restarts this is normal: the add-on keeps
+    asking and decides about the forwarding headers as soon as it answers
+    (until then: mode <code>{{ st.running_mode }}</code>, the last known).
+  </p>
+
+  {% elif hc.card == "too_slow" %}
+  <p class="hc__lead">
+    <strong>{{ hc.Name }} answers the test request too slowly to decide</strong>
+    whether it trusts this add-on as a reverse proxy: {{ hc.slow_tests_max }}
+    test requests in a row got no answer in time. The add-on has stopped
+    retrying on its own; it tests again when {{ hc.name }} restarts, when the
+    app starts and when you select <strong>Check again</strong>. Until then:
+    mode <code>{{ st.running_mode }}</code> (visitor addresses
+    {% if st.running_mode == "strip" %}removed{% else %}passed on{% endif %}).
   </p>
 
   {% else %}

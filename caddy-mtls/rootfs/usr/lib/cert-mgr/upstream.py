@@ -28,7 +28,10 @@ log - once a minute in mode ``pass`` under ``auto``. The control request (no
 forwarding header) is never logged by Home Assistant; the monitor sends it
 every few seconds to watch the upstream. A control request that times out
 means "slow", not "down": the upstream counts as unreachable after a failed
-connect or after two failures in a row.
+connect or after two failures in a row. A test request that times out is
+retried at the normal interval, and after SLOW_TESTS_MAX in a row only at
+the next event (a restart of the upstream, "Check again", the add-on's
+start).
 
 Shared by init-caddy (``upstream.py start``, before Caddy starts), the
 monitor (monitor.py) and the panel (app.py). Standard library only.
@@ -77,7 +80,16 @@ SLOW = "slow"
 UNKNOWN = "unknown"
 #: The card state while the last mode change could not be applied to Caddy.
 RELOAD_FAILED = "reload_failed"
+#: The card state after SLOW_TESTS_MAX test requests in a row without an
+#: answer in time while nothing is decided: the add-on stopped retrying.
+TOO_SLOW = "too_slow"
 FAILURES_UNREACHABLE = 2
+#: Test requests in a row without an answer in time after which the add-on
+#: stops sending them on its own (until the next event).
+SLOW_TESTS_MAX = 3
+#: The longest error text of a failed Caddy reload that is kept (state file,
+#: log, card).
+RELOAD_ERROR_MAX = 500
 
 #: The request of the probe; Home Assistant's frontend serves it without
 #: authentication and without logging.
@@ -194,10 +206,16 @@ class State:
     reachable: bool | None = None
     #: A test request is owed (the upstream came back, the test was slow).
     test_due: bool = False
-    #: Visitor addresses are hidden since a switch at run time (not at the
-    #: start): the monitor's "addresses hidden" notification (cleared at the
-    #: next start and when addresses are passed on again).
+    #: Visitor addresses are hidden because the upstream stopped trusting the
+    #: add-on at run time (it had accepted forwarded requests before; not at
+    #: the start, not at a first decision): the monitor's "addresses hidden"
+    #: notification while Caddy runs strip. Set when that is decided (also
+    #: if the reload fails and is retried); cleared at the next start and
+    #: when addresses are passed on again.
     hidden_at_runtime: bool = False
+    #: Test requests in a row without an answer in time (SLOW_TESTS_MAX: no
+    #: more until the next event).
+    slow_tests: int = 0
     checked_at: float | None = None  # the last test request
     seen_at: float | None = None  # the last answer of the upstream
     changed_at: float | None = None  # the last mode switch
@@ -224,6 +242,8 @@ class State:
             state.mode = PASS
         if state.running not in (PASS, STRIP):
             state.running = None
+        if not isinstance(state.slow_tests, int) or state.slow_tests < 0:
+            state.slow_tests = 0
         return state
 
 
@@ -241,6 +261,8 @@ class Outcome:
     switched: bool = field(default=False)
     #: A test request was sent.
     tested: bool = False
+    #: The monitor's control request was answered (None: none was sent).
+    answered: bool | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -285,8 +307,9 @@ def decide(option: str, mtls: bool, decisive: str | None) -> str:
 
 
 def card_state(settings: Settings, state: State | None) -> str:
-    """The state the panel card and the log show: unknown, reload_failed
-    (the last mode change could not be applied: red, whatever else),
+    """The state the panel card and the log show: unknown, too_slow (not
+    known, and the add-on stopped retrying slow tests), reload_failed (the
+    last mode change could not be applied: red, whatever else),
     unreachable, never, accepted, strip (refused, works without addresses)
     or broken (refused, every request answered 400). Always from the mode
     Caddy really runs."""
@@ -296,15 +319,22 @@ def card_state(settings: Settings, state: State | None) -> str:
         return RELOAD_FAILED
     if state.reachable is False:
         return UNREACHABLE
+    not_known = TOO_SLOW if gave_up(state) else UNKNOWN
     if state.reachable is None:
-        return UNKNOWN
+        return not_known
     if settings.option == "never":
         return "never"
     if state.decisive == REFUSED:
         return STRIP if state.running_mode == STRIP else "broken"
     if state.decisive == ACCEPTED and state.running_mode == PASS:
         return ACCEPTED
-    return UNKNOWN
+    return not_known
+
+
+def gave_up(state: State | None) -> bool:
+    """SLOW_TESTS_MAX test requests in a row got no answer in time: the
+    add-on sends none on its own until the next event."""
+    return state is not None and state.slow_tests >= SLOW_TESTS_MAX
 
 
 def is_broken(settings: Settings, state: State | None) -> bool:
@@ -336,6 +366,16 @@ def unreachable_effect(kind: str) -> str:
     if kind == "http":
         return "visitors get its error answers"
     return "visitors' requests wait for it or fail"
+
+
+def unreachable_reason(state: State | None) -> tuple[str, str]:
+    """Why the upstream counts as unreachable, for a sentence that starts
+    with its name: (verb, detail in brackets). A 5xx is an answer: "answers
+    with an error (HTTP 503)"; otherwise "does not answer (<error>)"."""
+    if state is not None and state.error_kind == "http":
+        return "answers with an error", (f"HTTP {state.control_status}" if state.control_status
+                                         else state.error or "HTTP 5xx")
+    return "does not answer", (state.error if state is not None and state.error else "no answer")
 
 
 def trusted_proxy_suggestion(source_address: str) -> str:
@@ -435,6 +475,7 @@ def card_context(settings: Settings | None, state: State | None) -> dict[str, An
         return {"card": UNKNOWN, "settings": None, "state": None}
     source = (state.source_address if state else "") or ""
     suggestion = trusted_proxy_suggestion(source)
+    down, down_detail = unreachable_reason(state)
     return {
         "card": card_state(settings, state),
         "settings": settings,
@@ -448,6 +489,9 @@ def card_context(settings: Settings | None, state: State | None) -> dict[str, An
         "yaml": yaml_block(suggestion),
         "consequences": strip_consequences(settings, source),
         "effect": unreachable_effect(state.error_kind if state else ""),
+        "down": down,
+        "down_detail": down_detail,
+        "slow_tests_max": SLOW_TESTS_MAX,
         "broken": is_broken(settings, state),
         "time": local_time,
     }
@@ -546,9 +590,12 @@ def _no_answer(err: BaseException) -> str:
     return "timeout" if isinstance(err, TimeoutError) else "closed"
 
 
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
 def _error_text(err: BaseException) -> str:
-    text = str(err) or type(err).__name__
-    return text if len(text) <= 200 else text[:197] + "..."
+    return _clip(str(err) or type(err).__name__, 200)
 
 
 def probe(settings: Settings, test: bool = True, timeout: float | None = None,
@@ -787,8 +834,11 @@ def save_state(state: State) -> None:
     _write_atomic(STATE_FILE, json.dumps(asdict(state), indent=1) + "\n", 0o600)
 
 
-def write_snippet(mode: str) -> None:
-    _write_atomic(SNIPPET_FILE, render_snippet(mode), 0o644)
+def write_snippet(mode: str, *, mtls: bool) -> None:
+    """Write the snippet for ``mode``. Without mTLS always the pass lines,
+    whatever the caller asks (B-1: the add-on never hides visitor addresses
+    while mTLS is off - this is the last line)."""
+    _write_atomic(SNIPPET_FILE, render_snippet(mode if mtls else PASS), 0o644)
 
 
 def snippet_mode() -> str | None:
@@ -848,8 +898,10 @@ def _apply(settings: Settings, state: State, result: ProbeResult | None, now: fl
     failed). After a failed reload the snippet goes back to the mode Caddy
     runs (so that another reload, e.g. for a client, cannot apply the new
     mode unnoticed) and ``running`` keeps it: the card, the log and the
-    notifications follow what Caddy runs. Caller holds the lock."""
+    notifications follow what Caddy runs. Without mTLS that is always pass.
+    Caller holds the lock."""
     previous_running = state.running_mode
+    previous_decisive = state.decisive
     previous_card = card_state(settings, state)
     state.upstream = settings.target
     info = result if result is not None and result.result != SLOW else None
@@ -873,32 +925,38 @@ def _apply(settings: Settings, state: State, result: ProbeResult | None, now: fl
                 state.checked_at = now
                 state.test_status = info.test_status
                 state.test_due = False
+                state.slow_tests = 0
             elif state.result in (UNREACHABLE, UNKNOWN):
                 state.result = state.decisive or UNKNOWN
     mode = decide(settings.option, settings.mtls, state.decisive)
     outcome = Outcome(state=state, previous_mode=previous_running, previous_card=previous_card,
                       card=previous_card, probe=result)
+    if (reload is not None and previous_decisive == ACCEPTED and state.decisive == REFUSED
+            and mode == STRIP and previous_running == PASS):
+        # The upstream trusted the add-on and stopped (B2-1: not a first
+        # decision at run time, which had nothing to lose).
+        state.hidden_at_runtime = True
     if (mode != state.mode or mode != previous_running or not state.applied
             or snippet_mode() != mode):
-        write_snippet(mode)
+        write_snippet(mode, mtls=settings.mtls)
         state.mode = mode
         ok, message = (True, "") if reload is None else reload()
         if ok:
             if mode != previous_running:
                 state.changed_at = now
                 outcome.switched = True
-                if reload is not None and mode == STRIP:
-                    state.hidden_at_runtime = True
             state.running = mode
             state.applied = True
             state.reload_error = ""
         else:
-            write_snippet(previous_running)
-            state.running = previous_running
+            # Back to what Caddy runs - never strip without mTLS (B2-2).
+            back = previous_running if settings.mtls else PASS
+            write_snippet(back, mtls=settings.mtls)
+            state.running = back
             state.applied = False
-            state.reload_error = message
-            outcome.reload_error = message
-    if state.running_mode == PASS:
+            state.reload_error = _clip(message, RELOAD_ERROR_MAX)
+            outcome.reload_error = state.reload_error
+    if state.mode == PASS and state.running_mode == PASS:
         state.hidden_at_runtime = False
     save_state(state)
     outcome.card = card_state(settings, state)
@@ -907,10 +965,12 @@ def _apply(settings: Settings, state: State, result: ProbeResult | None, now: fl
 
 def check(settings: Settings, *, test: bool = True, reload: Reload | None = caddy_reload,
           now: float | None = None, prober: Callable[..., ProbeResult] = probe) -> Outcome:
-    """Probe (with ``test``: also the test request), decide and apply."""
+    """Probe (with ``test``: also the test request), decide and apply.
+    "Check again": the slow tests count anew."""
     with locked():
         state = load_state(settings) or State(upstream=settings.target)
         result = prober(settings, test=test, timeout=WATCH_TIMEOUT, deadline=2 * WATCH_TIMEOUT + 1)
+        state.slow_tests = 1 if result.result == SLOW else 0
         outcome = _apply(settings, state, result, time.time() if now is None else now, reload)
         outcome.tested = result.test_sent
         return outcome
@@ -924,19 +984,27 @@ def watch_once(settings: Settings, channel: ControlChannel, *, reload: Reload | 
     or not checked, or it closed the kept connection: a restart), a test is
     still owed, nothing is decided yet, or ``force_test`` (the periodic test
     while passing addresses on): also the test request. A slow answer
-    changes nothing."""
+    changes nothing; a test request without an answer in time counts, and
+    after SLOW_TESTS_MAX in a row only a restart of the upstream (or its
+    return after it was unreachable) sends the next one (B2-3)."""
     with locked():
         state = load_state(settings) or State(upstream=settings.target)
         control, came_back = channel.check()
         result: ProbeResult | None = control
         tested = False
-        if control.result == REACHABLE and (came_back or force_test or state.test_due
-                                            or state.reachable is not True or state.decisive is None):
-            state.test_due = True
-            result = prober(settings, test=True, timeout=WATCH_TIMEOUT, deadline=2 * WATCH_TIMEOUT + 1)
-            tested = result.test_sent
+        if control.result == REACHABLE:
+            if came_back or state.reachable is False:
+                state.slow_tests = 0  # an event: back, or restarted
+            owed = came_back or state.test_due or state.reachable is not True or state.decisive is None
+            if force_test or (owed and not gave_up(state)):
+                state.test_due = True
+                result = prober(settings, test=True, timeout=WATCH_TIMEOUT, deadline=2 * WATCH_TIMEOUT + 1)
+                tested = result.test_sent
+                if result.result == SLOW:
+                    state.slow_tests += 1
         outcome = _apply(settings, state, result, time.time() if now is None else now, reload)
         outcome.tested = tested
+        outcome.answered = control.result == REACHABLE
         return outcome
 
 
@@ -966,6 +1034,7 @@ def start(settings: Settings, now: float | None = None) -> dict[str, Any]:
         state.result = UNKNOWN if state.decisive is None else state.decisive
         state.hidden_at_runtime = False
         state.test_due = False
+        state.slow_tests = 0
         result = probe(settings, test=True)
         if result.result == SLOW:
             state.error, state.error_kind = result.error, result.kind
@@ -997,12 +1066,7 @@ def _main(argv: list[str]) -> int:
     start_cmd.add_argument("--port", required=True, type=int)
     start_cmd.add_argument("--mtls", required=True, choices=("true", "false"))
     start_cmd.add_argument("--option", required=True, choices=OPTIONS)
-    snippet_cmd = sub.add_parser("snippet", help="write the snippet for a mode (fallback)")
-    snippet_cmd.add_argument("--mode", required=True, choices=(PASS, STRIP))
     args = parser.parse_args(argv)
-    if args.command == "snippet":
-        write_snippet(args.mode)
-        return 0
     settings = Settings(domain=args.domain, host=args.host, port=args.port,
                         mtls=args.mtls == "true", option=args.option)
     print(json.dumps(start(settings)))

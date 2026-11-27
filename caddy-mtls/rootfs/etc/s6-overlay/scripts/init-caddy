@@ -761,7 +761,11 @@ upstream_notice() {
             bashio::log.info "forwarded_headers: never - visitor addresses are not passed on; ${what_mid} sees every visitor as ${source:-this add-on}."
             ;;
         unreachable)
-            bashio::log.warning "The upstream ${UPSTREAM_HOST}:${UPSTREAM_PORT} does not answer yet (${error:-no answer}): $(upstream effect) until it does. Forwarding headers until then: mode $(upstream mode) (last known); the add-on checks again every few seconds."
+            if [[ "$(upstream error_kind)" == http ]]; then
+                bashio::log.warning "The upstream ${UPSTREAM_HOST}:${UPSTREAM_PORT} answers with an error (HTTP $(upstream control_status)): $(upstream effect). Forwarding headers meanwhile: mode $(upstream mode) (last known); the add-on checks again every few seconds."
+            else
+                bashio::log.warning "The upstream ${UPSTREAM_HOST}:${UPSTREAM_PORT} does not answer yet (${error:-no answer}): $(upstream effect) until it does. Forwarding headers until then: mode $(upstream mode) (last known); the add-on checks again every few seconds."
+            fi
             ;;
         broken)
             bashio::log.warning "------------------------------------------------------------"

@@ -53,6 +53,9 @@ class FakeHomeAssistant:
         self.keep_alive = keep_alive
         #: Seconds to wait before answering (a slow / paused Home Assistant).
         self.delay = 0.0
+        #: The same for requests with X-Forwarded-For only (a test request
+        #: that is always too slow, B2-3).
+        self.forwarded_delay = 0.0
         #: Close a kept connection this many seconds after an answer (an
         #: upstream that closes idle connections itself).
         self.idle_close: float | None = None
@@ -85,6 +88,8 @@ class FakeHomeAssistant:
                                       "peer": self.client_address[0],
                                       "host": self.headers.get("Host"),
                                       "xff": self.headers.get("X-Forwarded-For")})
+                if forwarded and fake.forwarded_delay:
+                    time.sleep(fake.forwarded_delay)
                 status, body = (400, b"400: Bad Request") if refused else (fake.status, b"{}")
                 self.send_response(status)
                 self.send_header("Content-Length", str(len(body)))
@@ -269,6 +274,13 @@ class CardStateTest(unittest.TestCase):
             (auto, self.state(result=R, decisive=R, mode="strip", running="pass", applied=False,
                               reachable=True, reload_error="x"), "reload_failed"),
             (auto, self.state(result=R, decisive=R, mode="strip", running="pass", reachable=True), "broken"),
+            # B2-3: nothing known and the add-on stopped retrying slow tests.
+            (auto, self.state(reachable=True, slow_tests=2), "unknown"),
+            (auto, self.state(reachable=True, slow_tests=3), "too_slow"),
+            (auto, self.state(slow_tests=3), "too_slow"),
+            (auto, self.state(result=U, reachable=False, slow_tests=3), "unreachable"),
+            (auto, self.state(result=R, decisive=R, mode="strip", reachable=True, slow_tests=3), "strip"),
+            (never, self.state(reachable=True, mode="strip", slow_tests=3), "never"),
         ]
         for settings, state, expected in cases:
             with self.subTest(option=settings.option, state=state):
@@ -296,6 +308,15 @@ class CardStateTest(unittest.TestCase):
         self.assertEqual(upstream.card_title(ha), "Home Assistant connection")
         self.assertEqual(upstream.unreachable_effect("connect"), "visitors get 502 Bad Gateway")
         self.assertNotIn("502", upstream.unreachable_effect("timeout"))
+
+    def test_an_error_answer_is_an_answer(self) -> None:
+        """A 5xx: "answers with an error (HTTP 503)", not "does not answer"."""
+        answered = self.state(reachable=False, error="answered HTTP 503", error_kind="http", control_status=503)
+        self.assertEqual(upstream.unreachable_reason(answered), ("answers with an error", "HTTP 503"))
+        refused = self.state(reachable=False, error="[Errno 111] Connection refused", error_kind="connect")
+        self.assertEqual(upstream.unreachable_reason(refused),
+                         ("does not answer", "[Errno 111] Connection refused"))
+        self.assertEqual(upstream.unreachable_reason(self.state()), ("does not answer", "no answer"))
 
 
 class SuggestionTest(unittest.TestCase):
@@ -356,12 +377,25 @@ class SnippetTest(TempFiles):
 
     def test_write_is_atomic_and_readable(self) -> None:
         self.assertIsNone(upstream.snippet_mode())
-        upstream.write_snippet("strip")
+        upstream.write_snippet("strip", mtls=True)
         self.assertEqual(upstream.snippet_mode(), "strip")
         self.assertEqual(os.stat(upstream.SNIPPET_FILE).st_mode & 0o777, 0o644)
-        upstream.write_snippet("pass")
+        upstream.write_snippet("pass", mtls=True)
         self.assertEqual(upstream.snippet_mode(), "pass")
         self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["forwarded-headers.caddy"])
+
+    def test_no_strip_lines_without_mtls(self) -> None:
+        """B2-2: whatever a caller asks, without mTLS the pass lines."""
+        upstream.write_snippet("strip", mtls=False)
+        self.assertEqual(upstream.snippet_mode(), "pass")
+
+    def test_no_snippet_command(self) -> None:
+        """B2-2: the command that wrote a mode without asking mTLS is gone
+        (init-caddy only runs ``start``)."""
+        with contextlib.redirect_stderr(open(os.devnull, "w")) as err, self.assertRaises(SystemExit):
+            upstream._main(["snippet", "--mode", "strip"])
+        err.close()
+        self.assertIsNone(upstream.snippet_mode())
 
 
 class StateTest(TempFiles):
@@ -709,13 +743,55 @@ class ApplyTest(TempFiles):
         self.assertEqual(upstream.snippet_mode(), "pass")  # what Caddy runs
         self.assertTrue(upstream.is_broken(s, st))
         self.assertFalse(out.switched)
-        self.assertFalse(st.hidden_at_runtime)
+        self.assertFalse(upstream.is_hidden(st))  # Caddy still passes them on
         self.reload_ok = True
         out = upstream.retry_apply(s, reload=self.reload)
         self.assertEqual((out.state.running, out.state.applied, out.card, out.switched),
                          ("strip", True, "strip", True))
         self.assertEqual(upstream.snippet_mode(), "strip")
-        self.assertTrue(out.state.hidden_at_runtime)  # a run-time switch (B-12)
+        # A run-time loss of trust (B-12), also across the failed reload.
+        self.assertTrue(upstream.is_hidden(out.state))
+
+    def test_no_strip_without_mtls_after_a_failed_reload(self) -> None:
+        """B2-2: option x stored state x failing reload, mTLS off: the
+        write-back and ``running`` are pass, never strip."""
+        self.reload_ok = False
+        combos = 0
+        for option in upstream.OPTIONS:
+            s = self.settings(self.ha.port, option, mtls=False)
+            for mode in ("pass", "strip"):
+                for running in ("pass", "strip", None):
+                    for applied in (True, False):
+                        for decisive in (A, R, None):
+                            for call in ("retry_apply", "check"):
+                                with self.subTest(option=option, mode=mode, running=running, applied=applied,
+                                                  decisive=decisive, call=call):
+                                    combos += 1
+                                    upstream.save_state(upstream.State(
+                                        upstream=s.target, decisive=decisive, mode=mode, running=running,
+                                        applied=applied, reachable=True))
+                                    upstream.SNIPPET_FILE.write_text(upstream.render_snippet("strip"))
+                                    if call == "check":
+                                        out = upstream.check(s, reload=self.reload)
+                                    else:
+                                        out = upstream.retry_apply(s, reload=self.reload)
+                                    self.assertEqual(upstream.snippet_mode(), "pass")
+                                    self.assertIn(out.state.running, ("pass", None))
+                                    self.assertEqual(out.state.running_mode, "pass")
+                                    self.assertEqual(upstream.load_state(s).running_mode, "pass")
+                                    self.assertFalse(upstream.is_hidden(out.state))
+        self.assertEqual(combos, 3 * 2 * 3 * 2 * 3 * 2)
+        self.assertNotIn("strip", self.reloads)  # Caddy was never asked to load strip
+
+    def test_reload_error_is_capped(self) -> None:
+        """A very long Caddy error: about 500 characters are kept (state,
+        log, card)."""
+        s = self.settings(self.ha.port)
+        out = upstream.check(s, reload=lambda: (False, "x" * 5000))
+        self.assertEqual(len(out.state.reload_error), upstream.RELOAD_ERROR_MAX)
+        self.assertTrue(out.state.reload_error.endswith("..."))
+        self.assertEqual(out.reload_error, out.state.reload_error)
+        self.assertEqual(upstream.load_state(s).reload_error, out.state.reload_error)
 
     def test_hidden_only_at_run_time(self) -> None:
         """B-12: starting in strip is no "hidden at run time"; a run-time
@@ -732,6 +808,35 @@ class ApplyTest(TempFiles):
         upstream.start(s)
         self.assertFalse(upstream.load_state(s).hidden_at_runtime)
 
+    def test_hidden_only_after_trust(self) -> None:
+        """B2-1: a first decision at run time (start with the upstream down
+        or slow) is no loss of trust; a refusal after an acceptance is."""
+        s = self.settings(self.ha.port)
+        for how in ("down", "slow"):
+            with self.subTest(start=how):
+                upstream.STATE_FILE.unlink(missing_ok=True)
+                self.ha.trust = False
+                if how == "down":
+                    self.ha.stop()
+                    upstream.start(s)
+                    self.ha.start()
+                else:
+                    self.ha.delay = 1.0
+                    with mock.patch.object(upstream, "REQUEST_TIMEOUT", 0.3):
+                        upstream.start(s)
+                    self.ha.delay = 0.0
+                self.assertIsNone(upstream.load_state(s).decisive)
+                out = upstream.check(s, reload=self.reload)  # decided at run time: refused
+                self.assertEqual((out.state.running_mode, out.switched), ("strip", True))
+                self.assertFalse(out.state.hidden_at_runtime)
+                self.assertFalse(upstream.is_hidden(out.state))
+                # Trusted, then not: that is a loss of trust.
+                self.ha.trust = True
+                upstream.check(s, reload=self.reload)
+                self.ha.trust = False
+                out = upstream.check(s, reload=self.reload)
+                self.assertTrue(upstream.is_hidden(out.state))
+
     def test_slow_check_changes_nothing(self) -> None:
         s = self.settings(self.ha.port)
         upstream.check(s, reload=self.reload)
@@ -740,6 +845,7 @@ class ApplyTest(TempFiles):
         with mock.patch.object(upstream, "WATCH_TIMEOUT", 0.3):
             out = upstream.check(s, reload=self.reload)
         self.assertEqual(out.probe.result, upstream.SLOW)
+        before.slow_tests = 1  # only counted (B2-3)
         self.assertEqual(upstream.load_state(s), before)
 
     def test_start_while_slow(self) -> None:
@@ -998,6 +1104,8 @@ class UpstreamWatchTest(TempFiles):
             self.ha.start()
             self.assertEqual(watch.tick(5.0), 12.0)
         self.assertEqual(self.mode(s), "strip")
+        # B2-1: the first decision is no loss of trust - no "addresses hidden".
+        self.assertEqual(self.creates("caddy_mtls_upstream_addresses_hidden"), [])
         self.assertEqual(watch.tick(17.0), 12.0)
         # Down (or restarting) later: fast again, until it is back.
         self.ha.stop()
@@ -1005,6 +1113,101 @@ class UpstreamWatchTest(TempFiles):
             self.assertEqual(watch.tick(29.0), 2.5)
             self.ha.start()
             self.assertEqual(watch.tick(31.5), 12.0)
+
+    def test_fast_polling_backs_off_after_ten_minutes(self) -> None:
+        """2.5 s for the first 10 minutes without an answer (from the start
+        too: B-5 keeps its short window), then 12 s until it answers; the
+        next period starts anew."""
+        self.resolve_homeassistant()
+        s = self.write_runtime()
+        self.ha.stop()
+        upstream.start(s)
+        watch = self.make_watch()
+
+        def intervals(start: float, until: float) -> list[tuple[float, float]]:
+            now, seen = start, []
+            while now < until:
+                step = watch.tick(now)
+                seen.append((now, step))
+                now += step
+            return seen
+
+        with captured_logs():
+            seen = intervals(0.0, 700.0)
+            self.assertTrue(all(step == 2.5 for now, step in seen if now < 600), seen[:3])
+            self.assertTrue(all(step == 12.0 for now, step in seen if now >= 600), seen[-3:])
+            self.assertEqual(len([1 for now, _ in seen if now < 600]), 240)
+            t = seen[-1][0] + seen[-1][1]
+            self.ha.start()
+            self.assertEqual(watch.tick(t), 12.0)  # answered: decided (strip)
+            self.assertEqual(self.mode(s), "strip")
+            self.ha.stop()
+            seen = intervals(t + 12, t + 12 + 700)
+        self.assertTrue(all(step == 2.5 for now, step in seen if now < t + 12 + 600))
+        self.assertTrue(all(step == 12.0 for now, step in seen if now >= t + 12 + 600))
+        self.assertEqual(self.ha.refusals, 1)
+
+    def test_a_test_that_is_always_slow_is_given_up(self) -> None:
+        """B2-3: the control request answers, the test request never in
+        time: the next test at the normal interval, none after three until
+        an event (restart, Check again, start); the card says so."""
+        self.resolve_homeassistant()
+        s = self.write_runtime()
+        for name, value in (("WATCH_TIMEOUT", 0.3), ("REQUEST_TIMEOUT", 0.3)):
+            patcher = mock.patch.object(upstream, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.ha.forwarded_delay = 1.0
+        upstream.start(s)  # its test is slow too: nothing decided
+        self.assertEqual(self.ha.tests, 1)
+        watch = self.make_watch()
+        with captured_logs() as logs:
+            steps = [watch.tick(t) for t in (0.0, 12.0, 24.0)]
+            self.assertEqual(steps, [12.0, 12.0, 12.0])  # not 2.5
+            self.assertEqual(self.ha.tests, 4)
+            st = upstream.load_state(s)
+            self.assertEqual((st.slow_tests, upstream.card_state(s, st)), (3, "too_slow"))
+            t = self.run_watch(watch, 36.0, 3600)
+            self.assertEqual(self.ha.tests, 4)  # given up: none in an hour
+            st = upstream.load_state(s)
+            self.assertEqual((st.reachable, st.decisive, upstream.card_state(s, st)), (True, None, "too_slow"))
+            warnings = [r.getMessage() for r in logs if r.levelno >= logging.WARNING]
+            self.assertEqual(len(warnings), 1, warnings)
+            self.assertIn("answers the test request too slowly to decide", warnings[0])
+            # An event: Home Assistant restarts - three more tries.
+            self.ha.restart()
+            t = self.run_watch(watch, t, 600)
+            self.assertEqual(self.ha.tests, 7)
+            # "Check again": one more, and the add-on retries again.
+            upstream.check(s, reload=self.reload)
+            self.assertEqual((self.ha.tests, upstream.load_state(s).slow_tests), (8, 1))
+            self.ha.forwarded_delay = 0.0
+            self.run_watch(watch, t, 13)
+        st = upstream.load_state(s)
+        self.assertEqual((st.decisive, st.running_mode, st.slow_tests, upstream.card_state(s, st)),
+                         (R, "strip", 0, "strip"))
+        self.assertEqual(self.ha.tests, 9)
+        # The add-on's start counts anew.
+        st.slow_tests = 3
+        upstream.save_state(st)
+        upstream.start(s)
+        self.assertEqual(upstream.load_state(s).slow_tests, 0)
+
+    def test_an_error_answer_is_logged_as_an_answer(self) -> None:
+        """A 5xx: "answers with an error (HTTP 503)", not "does not answer"."""
+        self.resolve_homeassistant()
+        s = self.write_runtime()
+        upstream.start(s)
+        watch = self.make_watch()
+        with captured_logs() as logs:
+            watch.tick(0.0)
+            self.ha.status = 503
+            watch.tick(12.0)
+            watch.tick(14.5)
+        self.assertEqual(upstream.card_state(s, upstream.load_state(s)), "unreachable")
+        text = "\n".join(r.getMessage() for r in logs if r.levelno >= logging.WARNING)
+        self.assertIn("Home Assistant answers with an error (HTTP 503): visitors get its error answers.", text)
+        self.assertNotIn("does not answer", text)
 
     def test_restart_pending_and_slow_intervals(self) -> None:
         """Fast while the upstream restarts (it closed the kept connection

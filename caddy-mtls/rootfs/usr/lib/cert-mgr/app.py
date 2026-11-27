@@ -603,7 +603,7 @@ _CHECK_RESULT = {
     "strip": "{Name} does not trust this add-on as a reverse proxy: visitor addresses are not passed on.",
     "broken": "{Name} does not trust this add-on as a reverse proxy: every request is answered 400.",
     "never": "Checked. Visitor addresses are not passed on (forwarded_headers: never).",
-    "unreachable": "{Name} does not answer ({error}): {effect}.",
+    "unreachable": "{Name} {down} ({down_detail}): {effect}.",
     "unknown": "Checked; the result is not known yet.",
 }
 
@@ -632,9 +632,11 @@ def check_upstream(request: Request):
             f"{name_start} did not answer in time ({outcome.probe.error}); nothing changed. "
             "Try again in a moment."
         )
+    down, down_detail = upstream.unreachable_reason(outcome.state)
     message = _CHECK_RESULT.get(outcome.card, _CHECK_RESULT["unknown"]).format(
         Name=name_start,
-        error=outcome.state.error or "no answer",
+        down=down,
+        down_detail=down_detail,
         effect=upstream.unreachable_effect(outcome.state.error_kind),
     )
     if outcome.switched:

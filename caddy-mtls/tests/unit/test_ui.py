@@ -277,6 +277,7 @@ class UpstreamCardTests(unittest.TestCase):
                                     error="[Errno 111] Connection refused", error_kind="connect"),
                 "reload_failed": dict(result="refused", decisive="refused", mode="strip", running="pass",
                                       applied=False, reachable=True, reload_error="Error: loading config: x"),
+                "too_slow": dict(reachable=True, slow_tests=3),
                 "unknown": dict(),
             }[card]
             defaults.update(source_address="172.30.33.3", checked_at=self.NOW - 30)
@@ -316,6 +317,9 @@ class UpstreamCardTests(unittest.TestCase):
             "reload_failed": ["status--danger", "Change not applied", 'role="alert"',
                               "Applying the forwarding mode strip failed", "Error: loading config: x",
                               'every request is answered "400: Bad Request"', 'data-mode="pass"'],
+            "too_slow": ["status--warn", "Too slow to decide", "hc--too_slow",
+                         "answers the test request too slowly to decide", "3\n    test requests in a row",
+                         "stopped\n    retrying on its own", "mode <code>pass</code>", "Check again"],
             "unknown": ["Not checked yet"],
         }
         for card, needles in expectations.items():
@@ -346,6 +350,27 @@ class UpstreamCardTests(unittest.TestCase):
         html = self.render("unreachable", error="timed out", error_kind="timeout")
         self.assertIn("visitors&#39; requests wait for it or fail", html)
         self.assertNotIn("502", html)
+
+    def test_retry_wording_is_true(self):
+        """The red card names no interval it does not keep."""
+        html = self.render("reload_failed")
+        self.assertIn("retries on its own at each regular check", html)
+        self.assertNotIn("every few seconds", html)
+
+    def test_error_answer_is_an_answer(self):
+        """A 5xx: "answers with an error (HTTP 503)", not "does not answer"."""
+        html = self.render("unreachable", error="answered HTTP 503", error_kind="http", control_status=503)
+        self.assertIn("<code>homeassistant:8123</code> answers with an error</strong>\n    (HTTP 503)", html)
+        self.assertIn("visitors get its error answers", html)
+        self.assertNotIn("does not answer", html)
+
+    def test_unreachable_other_upstream_names_it(self):
+        """"While Home Assistant starts or restarts" only for Home Assistant."""
+        html = self.render("unreachable", host="192.0.2.10")
+        self.assertIn("While the upstream 192.0.2.10:8123 starts or restarts this is normal", html)
+        self.assertNotIn("Home Assistant", html)
+        html = self.render("unreachable")
+        self.assertIn("While Home Assistant starts or restarts this is normal", html)
 
     def test_other_upstream_is_neutral(self):
         html = self.render("broken", option="always", host="192.0.2.10")

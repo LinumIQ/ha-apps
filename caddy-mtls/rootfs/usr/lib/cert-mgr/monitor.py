@@ -20,15 +20,17 @@ add-on log gets one line per change of that state.
 
 It watches the upstream (upstream.py) as well: a control request every
 UPSTREAM_CONTROL_INTERVAL seconds on a kept-alive connection (every
-UPSTREAM_FAST_INTERVAL seconds while nothing is decided and the upstream does
-not answer); when the upstream answers again after it was unreachable or
-restarted, the test request (does it accept forwarded requests?), which
+UPSTREAM_FAST_INTERVAL seconds while the upstream does not answer, restarts
+or a test is owed - for the first UPSTREAM_FAST_WINDOW seconds of a period
+without an answer); when the upstream answers again after it was unreachable
+or restarted, the test request (does it accept forwarded requests?), which
 switches the forwarding mode at run time. Under forwarded_headers: auto in
 mode pass the test also runs every UPSTREAM_TEST_INTERVAL seconds (Home
 Assistant logs nothing while it trusts the add-on). While every request is
 answered "400: Bad Request" (refused, mode pass) a persistent notification is
 raised; another one when the add-on starts hiding the visitor addresses at
-run time; each is dismissed when that is over.
+run time because the upstream stopped trusting it; each is dismissed when
+that is over.
 
 Failure to reach the Supervisor never crashes the loop - we log and try
 again on the next iteration.
@@ -83,13 +85,16 @@ FAST_LANE_SECONDS = int(os.environ.get("CERT_MONITOR_FAST_LANE_SECONDS", "1800")
 PUBLIC_CERT_NOTIFICATION_ID = "caddy_mtls_public_certificate"
 
 # Upstream watch (upstream.py): the control request's interval, the test
-# request's interval in mode pass under auto, the control interval while
-# nothing is decided and the upstream does not answer, the notifications
+# request's interval in mode pass under auto, the control interval while the
+# upstream does not answer (or restarts, or a test is owed), the notifications
 # "every request is answered 400" and "addresses hidden at run time".
-# (Overridable for tests only.)
+# (Overridable for tests only.) The fast interval holds for the first
+# UPSTREAM_FAST_WINDOW seconds of a period without an answer (also from the
+# add-on's start); after that the control interval, until it answers again.
 UPSTREAM_CONTROL_INTERVAL = float(os.environ.get("CADDY_MTLS_UPSTREAM_CONTROL_SECONDS", "12"))
 UPSTREAM_TEST_INTERVAL = float(os.environ.get("CADDY_MTLS_UPSTREAM_TEST_SECONDS", "60"))
 UPSTREAM_FAST_INTERVAL = float(os.environ.get("CADDY_MTLS_UPSTREAM_FAST_SECONDS", "2.5"))
+UPSTREAM_FAST_WINDOW = 600.0
 UPSTREAM_NOTIFICATION_ID = "caddy_mtls_upstream_refuses"
 UPSTREAM_HIDDEN_NOTIFICATION_ID = "caddy_mtls_upstream_addresses_hidden"
 
@@ -525,7 +530,11 @@ _CARD_LOG = {
     "broken": (logging.WARNING, "{Name} answers every request with 400 Bad Request: it does not trust "
                'this add-on ({source}) as a reverse proxy (see the card "{title}" in the web interface).'),
     "never": (logging.INFO, "forwarded_headers: never - visitor addresses are not passed on."),
-    "unreachable": (logging.WARNING, "{Name} does not answer ({error}): {effect}."),
+    "unreachable": (logging.WARNING, "{Name} {down} ({down_detail}): {effect}."),
+    "too_slow": (logging.WARNING, "{Name} answers the test request too slowly to decide whether it trusts "
+                 "this add-on ({slow_tests} tests in a row without an answer in time). The add-on stops "
+                 "retrying until {name} restarts, the add-on starts or Check again is selected; forwarding "
+                 "headers meanwhile: mode {running}."),
     "reload_failed": (logging.ERROR, "Applying the forwarding mode {mode} failed: Caddy could not be "
                       "reloaded ({reload_error}). Caddy keeps mode {running}{broken}; the add-on "
                       "retries every {interval:g} s."),
@@ -541,15 +550,19 @@ class UpstreamWatch:
       next one), every UPSTREAM_FAST_INTERVAL seconds while it is
       unreachable, nothing has been decided for it, it is restarting (it
       closed the kept connection and has not answered since) or a test is
-      owed - so the window of 400s after it is back stays short; under auto
-      in mode pass also the periodic test every UPSTREAM_TEST_INTERVAL
-      seconds.
+      owed - so the window of 400s after it is back stays short - but only
+      for the first UPSTREAM_FAST_WINDOW seconds without an answer (the
+      period starts anew when it answers; at the start it begins with the
+      first look). Not after a test request without an answer in time
+      (upstream.SLOW_TESTS_MAX: none until the next event). Under auto in
+      mode pass also the periodic test every UPSTREAM_TEST_INTERVAL seconds.
       After a failed reload: a retry instead.
     * Log: one line per change of the card state (and of the reload error).
     * Notifications: "refuses" while every request is answered 400 (from
       the mode Caddy really runs); "addresses hidden" after a switch to
-      strip at run time. Each is raised once, dismissed when it is over and
-      dismissed once after a start (a previous run's)."""
+      strip at run time because the upstream stopped trusting the add-on
+      (not at a first decision). Each is raised once, dismissed when it is
+      over and dismissed once after a start (a previous run's)."""
 
     def __init__(self, started: float, reload: upstream.Reload | None = upstream.caddy_reload) -> None:
         self.reload = reload
@@ -561,6 +574,9 @@ class UpstreamWatch:
         self._dismiss_pending = True
         self._hidden_raised = False
         self._hidden_dismiss_pending = True
+        #: Since when the control request has not been answered (None: it
+        #: was answered at the last look).
+        self.down_since: float | None = None
 
     def tick(self, now: float) -> float:
         """One look; returns the seconds until the next one."""
@@ -580,12 +596,22 @@ class UpstreamWatch:
             if outcome.tested or not self._periodic(settings, outcome.state):
                 self.next_test = now + UPSTREAM_TEST_INTERVAL
         self._report(settings, outcome)
+        if outcome.answered:
+            self.down_since = None
+        elif outcome.answered is False and self.down_since is None:
+            self.down_since = now
         st = outcome.state
-        if st.applied and (st.reachable is False or (st.decisive is None and st.reachable is not True)
-                           or st.test_due or self.channel.restart_pending):
+        # A test owed (nothing decided yet, or it came back) - unless the last
+        # test request got no answer in time: then the next one comes at the
+        # normal interval (B2-3).
+        owed = st.slow_tests == 0 and (st.test_due or (st.decisive is None and st.reachable is not True))
+        in_window = self.down_since is None or now - self.down_since < UPSTREAM_FAST_WINDOW
+        if st.applied and in_window and (st.reachable is False or owed or self.channel.restart_pending):
             # Down, restarting or a test owed: ask every few seconds, so that
             # the 400s after it is back (trust gone, or nothing decided yet)
-            # stay few. A merely slow answer does not count here.
+            # stay few. A merely slow answer does not count here; after
+            # UPSTREAM_FAST_WINDOW seconds without an answer the normal
+            # interval.
             return UPSTREAM_FAST_INTERVAL
         if self._periodic(settings, st):
             return max(0.5, min(UPSTREAM_CONTROL_INTERVAL, self.next_test - now))
@@ -617,12 +643,14 @@ class UpstreamWatch:
         if outcome.card != self.card or state.reload_error != self.logged_error:
             if outcome.card == upstream.RELOAD_FAILED or outcome.card != self.card:
                 level, text = _CARD_LOG.get(outcome.card, (logging.INFO, "Connection to {target}: {card}."))
+                down, down_detail = upstream.unreachable_reason(state)
                 LOG.log(level, text.format(
                     Name=upstream.upstream_name(settings, start=True),
                     name=upstream.upstream_name(settings),
                     title=upstream.card_title(settings),
                     source=state.source_address or "this add-on", target=settings.target,
-                    error=state.error or "no answer", effect=upstream.unreachable_effect(state.error_kind),
+                    down=down, down_detail=down_detail, slow_tests=state.slow_tests,
+                    effect=upstream.unreachable_effect(state.error_kind),
                     card=outcome.card, mode=state.mode, running=state.running_mode,
                     reload_error=state.reload_error or "-", interval=UPSTREAM_CONTROL_INTERVAL,
                     broken=(" - every request is answered 400" if upstream.is_broken(settings, state) else ""),

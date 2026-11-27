@@ -31,7 +31,9 @@
 #   back    settings removed, restart, confirm: the add-on switches to strip.
 # With the monitor's default intervals (control 12 s, test 60 s):
 #   first-boot  Core down at the add-on's first start: polled every 2.5 s, the
-#         switch to strip within 5 s of Core's first answer (review B-5).
+#         switch to strip within 5 s of Core's first answer (review B-5); no
+#         "addresses hidden" notification - Core never trusted the add-on
+#         (re-review B2-1).
 #   early-restart  Core gets the reverse-proxy settings (restart) 1 s after
 #         the add-on started: noticed without Check again (B-4).
 #   untrust  settings removed while in pass: strip within 20 s of Core being
@@ -425,6 +427,12 @@ if boot_addon first "${IMAGE}" auto; then
         test "${window}" -le 5
     n400="$(printf '%s\n' "${codes[@]}" | grep -c ':400$' || true)"
     note "first-boot: Core answered after ${first_answer:-?} s, the add-on switched to strip after ${switched:-never} s (${window} s later); 400s seen by a visitor polling every 0.5 s: ${n400}; Core log lines: $(( $(refused_lines) - r0 )) (1 probe + the visitor's refused requests)"
+    sleep 3 # the monitor raises its notifications in the tick that switched
+    check "first-boot: no 'visitor addresses are hidden' notification (Core never trusted the add-on; B2-1)" \
+        eval '! hidden_raised'
+    # shellcheck disable=SC2016
+    check "first-boot: ... while the fake Supervisor got the start's dismiss of it (it does record)" \
+        supervisor_got '.body.notification_id == "caddy_mtls_upstream_addresses_hidden" and (.path | endswith("/dismiss"))'
 else
     fail "first-boot: add-on booted"
 fi

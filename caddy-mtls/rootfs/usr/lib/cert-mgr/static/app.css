@@ -136,6 +136,10 @@
   --hc-accent: var(--color-danger-solid);
 }
 
+.hc--too_slow {
+  --hc-accent: var(--color-warn-solid);
+}
+
 .hc__error {
   margin: 0 0 var(--space-3);
   padding: var(--space-3) var(--space-4);
