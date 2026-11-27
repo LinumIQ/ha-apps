@@ -42,8 +42,22 @@
 #              monitor raises the notification; a certificate placed in
 #              Caddy's storage turns the card green and dismisses it; a
 #              failed renewal turns it yellow.
+#   fwd-*      forwarded_headers (2.2.0) beside a fake Home Assistant
+#              (tests/fake-upstream.py, in a container whose network namespace
+#              the add-on shares): auto with mTLS (start probe -> strip, the
+#              headers that arrive, switch to pass after a "restart", back to
+#              strip by the periodic test, Check again, refusal counts), the
+#              last known mode while the upstream is down, always (400, red
+#              card, notification, dismissed), never, auto without mTLS.
+#   lan*       the local-network port 4443 (host port seeded): proxied without
+#              a client certificate from private sources, 403 for public IPv4
+#              / IPv6 sources and for the container's default gateway,
+#              session tickets of 4443 not resumable on 443 (TLS 1.2 and
+#              1.3), SNI/Host tricks, revocation still at once on 443, the
+#              redirect to 443; mTLS off with the port on.
 #   dns-*      one boot per DNS provider (cloudflare, route53, hetzner, dummy
-#              tokens, public domain): the rendered `dns` directive passes
+#              tokens, public domain, local-network port on): the rendered
+#              `dns` directive (in both HTTPS sites, one automation policy) passes
 #              `caddy validate` and Caddy runs with it (the module syntax at the
 #              pinned versions), the token stays out of the Caddyfile and the
 #              log, and Caddy's environment carries the credentials.
@@ -369,6 +383,16 @@ check "fwd: runtime.json carries the upstream, mTLS and forwarded_headers" \
 check "fwd: /data/upstream.json 600: unreachable, mode pass" eval '
     file_mode_is /data/upstream.json 600 &&
     test "$(cexec jq -c "[.reachable, .mode, .decisive]" /data/upstream.json)" == "[false,\"pass\",null]"'
+# --- local-network port (2.2.0): off without a host port for 4443/tcp -----------
+check "lan: off without a host port for 4443/tcp: no :4443 site, logged, runtime.json" eval '
+    ! cexec grep -F ":4443 {" /etc/caddy/Caddyfile >/dev/null &&
+    logs_contain "Host ports:  80/tcp -> 8080, 443/tcp -> 8443, 4443/tcp -> disabled" &&
+    logs_contain "LAN port:    off (4443/tcp has no host port" &&
+    test "$(cexec jq -c "[.lan_state, .lan_host_port, .lan_refused]" /run/caddy-mtls/runtime.json)" == "[\"off\",null,[]]"'
+check "lan: admin API config has no listener on 4443" \
+    adapted '[.apps.http.servers[].listen[]] | index(":4443") == null'
+check "lan: the plain-HTTP site is the add-on's own (CRL + redirect), not Caddy's automatic one" \
+    cexec grep -F "redir https://{host}{uri} permanent" /etc/caddy/Caddyfile
 check "fwd: card 'Home Assistant connection' unreachable (502 explained)" eval '
     upstream_card_is unreachable && upstream_card_contains "<code>127.0.0.1:8123</code> does not answer" &&
     upstream_card_contains "502 Bad Gateway"'
@@ -662,6 +686,9 @@ check "card: at the top of the dashboard" eval '
 check "card: the dashboard reloads it every 30 s" eval '[[ "$(dashboard /)" == *"fetch(\"public-cert\""*"30000"* ]]'
 check "fwd: dashboard shows the connection card between the public certificate and the CA" eval '
     html="$(dashboard /)" && pre="${html%%id=\"upstream\"*}" && [[ "${pre}" != "${html}" && "${pre}" == *"id=\"public-cert\""* && "${pre}" != *"Certificate Authority"* ]]'
+check "lan: dashboard card 'Local network' off, with the steps (Show disabled ports, 4443/tcp)" eval '
+    html="$(dashboard /)" && [[ "${html}" == *"id=\"lan\""*"data-state=\"off\""* &&
+    "${html}" == *"Show disabled ports"* && "${html}" == *"<code>4443/tcp</code>"* ]]'
 check "fwd: the dashboard reloads the connection card every 30 s" eval '[[ "$(dashboard /)" == *"fetch(\"upstream\""*"30000"* ]]'
 check "panel: no /openapi.json (FastAPI schema) -> 404" \
     test "$(cexec curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8099/openapi.json)" == 404
@@ -806,6 +833,10 @@ if wait_for "${BOOT_TIMEOUT}" booted; then
     check "no-mtls: upstream_port unset -> Core's port from the Supervisor info (homeassistant:80)" \
         eval 'logs_contain "Upstream:    homeassistant:80 (Home Assistant Core'"'"'s port from the Supervisor API)" &&
         cexec grep -F "reverse_proxy homeassistant:80 {" /etc/caddy/Caddyfile >/dev/null'
+    check "no-mtls: port 80 redirects with 301 to https://<domain>/ (the add-on's plain-HTTP site, no CRL)" eval '
+        test "$(cexec curl -s --max-time 5 --resolve home.example.com:80:127.0.0.1 -o /dev/null -w "%{http_code} %{redirect_url}" http://home.example.com/x?y=1)" \
+            == "301 https://home.example.com/x?y=1" &&
+        test "$(cexec curl -s --max-time 5 --resolve home.example.com:80:127.0.0.1 -o /dev/null -w "%{http_code}" http://home.example.com/mTLS-CA.crl)" == 301'
     check "no-mtls: log_level debug renders the site's access log, uvicorn logs requests" eval '
         logs_contain "Access log:  on" && cexec grep -E "^[[:space:]]+log \{" /etc/caddy/Caddyfile >/dev/null &&
         cexec curl -fsS -o /dev/null http://127.0.0.1:8099/_health && sleep 1 && logs_contain "\"GET /_health"'
@@ -971,15 +1002,23 @@ fexec() { "${DOCKER}" exec "${FAKE_UP}" "$@"; }
 fake_up_ok() { fexec curl -fsS -o /dev/null --max-time 2 http://127.0.0.1:8124/manifest.json 2>/dev/null; }
 # The fake's container also names 127.0.0.1 "homeassistant" (/etc/hosts, which
 # the add-on shares), so the add-on treats it as Home Assistant.
+# FAKE_NET_SETUP: shell commands run in the fake's network namespace (with
+# NET_ADMIN) before the add-on joins it.
+FAKE_NET_SETUP=""
 start_fake_upstream() { # start_fake_upstream <name> [trust]
+    local caps=()
     FAKE_UP="${PREFIX}-up-$1"
     CONTAINERS+=("${FAKE_UP}")
+    [[ -n "${FAKE_NET_SETUP}" ]] && caps=(--cap-add NET_ADMIN)
     "${DOCKER}" create --name "${FAKE_UP}" --network none --add-host homeassistant:127.0.0.1 \
-        -e "FAKE_TRUST=${2:-}" --entrypoint /bin/sh "${IMAGE}" -c \
+        "${caps[@]+"${caps[@]}"}" -e "FAKE_TRUST=${2:-}" --entrypoint /bin/sh "${IMAGE}" -c \
         'mkdir -p /tmp/up; [ -z "${FAKE_TRUST}" ] || touch /tmp/up/trust; while :; do if [ ! -e /tmp/up/down ]; then python3 /tmp/fake-upstream.py 8124 /tmp/up & echo $! >/tmp/up/pid; wait; fi; sleep 0.5; done' \
         >/dev/null
     tar -C "${SCRIPT_DIR}" --owner=0 --group=0 --numeric-owner -cf - fake-upstream.py | "${DOCKER}" cp - "${FAKE_UP}:/tmp"
     "${DOCKER}" start "${FAKE_UP}" >/dev/null
+    if [[ -n "${FAKE_NET_SETUP}" ]]; then
+        "${DOCKER}" exec "${FAKE_UP}" sh -ec "${FAKE_NET_SETUP}" || return 1
+    fi
     wait_for 20 fake_up_ok
 }
 fake_trust() { if [[ "$1" == on ]]; then fexec touch /tmp/up/trust; else fexec rm -f /tmp/up/trust; fi; }
@@ -1205,6 +1244,148 @@ fi
 show_log_on_failure "${before}"
 
 # ==============================================================================
+# 2e. lan: the local-network HTTPS port (container port 4443, host port 9443)
+# ==============================================================================
+# The fake upstream's network namespace gets (NET_ADMIN, before the add-on
+# joins it) a default route via 10.99.0.1 - the "Docker gateway" init-caddy
+# must refuse - and loopback addresses to connect from: 10.99.0.1 (that
+# gateway), 10.99.0.2 (private), 198.51.100.7 and 2001:db8::7 (public).
+LAN_DOMAIN="${DOMAIN}"
+# lan_get <source-address> [curl args...]: "<code>" of GET https://<domain>:4443/
+# without a client certificate, connecting from <source-address>.
+lan_get() {
+    local src="$1" ip="$1"
+    shift
+    [[ "${src}" == *:* ]] && ip="[${src}]"
+    cexec curl -sk --max-time 10 --interface "${src}" --resolve "${LAN_DOMAIN}:4443:${ip}" \
+        "$@" "https://${LAN_DOMAIN}:4443/lan-check" 2>/dev/null || true
+}
+# s_client <port> <tls1_2|tls1_3> <session-arg> <file> [extra args]: the lines
+# "New, ..." / "Reused, ..." / alerts of an openssl handshake with one request.
+s_client() {
+    cexec sh -c 'printf "GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" "$4" |
+        openssl s_client -connect "127.0.0.1:$0" -servername "$4" -"$1" -ign_eof "$2" "$3" 2>&1 |
+        grep -E "^(New|Reused),|alert|HTTP/1.1 [0-9]+" || true' "$1" "$2" "$3" "$4" "${LAN_DOMAIN}"
+}
+log "lan: booting (mTLS, local-network port on, a fake Home Assistant that trusts the proxy)"
+before=${FAIL_COUNT}
+FAKE_NET_SETUP='ip addr add 10.99.0.2/24 dev lo; ip addr add 10.99.0.1/32 dev lo;
+    ip route add default via 10.99.0.1 dev lo; ip addr add 198.51.100.7/32 dev lo;
+    ip -6 addr add 2001:db8::7/128 dev lo'
+SEED_NETWORK='{"80/tcp":8080,"443/tcp":8443,"4443/tcp":9443}'
+boot_fwd lan "$(options "${DOMAIN}" true none "" homeassistant 8124)" trust
+SEED_NETWORK='{"80/tcp":8080,"443/tcp":8443}'
+FAKE_NET_SETUP=""
+if wait_for "${BOOT_TIMEOUT}" booted; then
+    pass "lan: add-on booted"
+    check "lan: site https://<domain>:4443 rendered, without client_auth, refusing the default gateway 10.99.0.1" eval '
+        cexec grep -F "https://${DOMAIN}:4443 {" /etc/caddy/Caddyfile >/dev/null &&
+        cexec grep -F "@docker_gateway remote_ip 10.99.0.1" /etc/caddy/Caddyfile >/dev/null &&
+        test "$(cexec grep -c client_auth /etc/caddy/Caddyfile)" == 1'
+    check "lan: logged (host port, URL, never forward, the refused gateway), runtime.json" eval '
+        logs_contain "4443/tcp -> 9443" && logs_contain "LAN port:    https://${DOMAIN}:9443/" &&
+        logs_contain "never forward it on the router" && logs_contain "also refused: 10.99.0.1" &&
+        test "$(cexec jq -c "[.lan_state, .lan_host_port, .lan_refused]" /run/caddy-mtls/runtime.json)" == "[\"on\",9443,[\"10.99.0.1\"]]"'
+    check "lan: admin API config: :443 requires client certificates, :4443 does not" adapted '
+        ([.apps.http.servers[] | select(.listen == [":443"]) | .. | objects | select(.mode? == "require_and_verify")] | length == 1)
+        and ([.apps.http.servers[] | select(.listen == [":4443"]) | .. | objects | select(has("client_authentication"))] | length == 0)'
+    check "lan: strict SNI-Host enforcement still on for the mTLS server (srv0), not added to others" eval '
+        logs_contain "enabling strict SNI-Host enforcement because TLS client auth is configured" &&
+        ! "${DOCKER}" logs "${CTR}" 2>&1 | grep -F "strict SNI-Host" | grep -v "\"srv0\"" >/dev/null &&
+        adapted "(.apps.http.servers.srv0.listen == [\":443\"])"'
+    check "lan: forwarding snippet imported by both sites" \
+        test "$(cexec grep -c "import /etc/caddy/forwarded-headers.caddy" /etc/caddy/Caddyfile)" == 2
+    lan_ok="$(lan_get 127.0.0.1)"
+    check "lan: no client certificate, from 127.0.0.1 -> proxied (the fake's echo)" \
+        test "$(jq -r .path <<<"${lan_ok}" 2>/dev/null)" == /lan-check
+    check "lan: headers in mode pass: X-Forwarded-For = the LAN client" \
+        test "$(echo_header "${lan_ok}" X-Forwarded-For)" == 127.0.0.1
+    check "lan: from 10.99.0.2 (private) -> proxied" \
+        test "$(jq -r .path <<<"$(lan_get 10.99.0.2)" 2>/dev/null)" == /lan-check
+    out="$(lan_get 198.51.100.7 -w ' %{http_code} %{content_type}')"
+    check "lan: from 198.51.100.7 (public IPv4) -> 403 plain text naming the address" eval '
+        [[ "${out}" == "403 Forbidden: this HTTPS port"*"came from 198.51.100.7."*" 403 text/plain"* ]]'
+    out="$(lan_get 2001:db8::7 -w ' %{http_code}')"
+    check "lan: from 2001:db8::7 (public IPv6) -> 403 naming the address" eval '
+        [[ "${out}" == "403 Forbidden:"*"came from 2001:db8::7."*" 403" ]]'
+    # shellcheck disable=SC2034 # used in an eval'd check
+    out="$(lan_get 10.99.0.1 -w ' %{http_code}')"
+    check "lan: from 10.99.0.1 (the container's default gateway: Docker's proxy) -> 403 explaining the hidden source" eval '
+        [[ "${out}" == "403 Forbidden: this connection came from 10.99.0.1, the address of Docker"*"Connect over IPv4"*" 403" ]]'
+    check "lan: refused sources never reached the upstream" \
+        test "$(fexec sh -c 'grep -c "/lan-check" /tmp/up/requests.jsonl')" == 2
+    # The mTLS port is untouched by the local-network site.
+    check "lan: port 443 without a client certificate still refused in the handshake" mtls_is 000 "" ""
+    check "lan: port 443 with alice's certificate -> proxied (200)" \
+        mtls_is 200 /data/certs/mTLS-client-alice.crt /data/certs/mTLS-client-alice.key
+    check "lan: port 443, SNI other.invalid, Host <domain>, no certificate -> no answer from the upstream" eval '
+        test "$(cexec curl -sk --max-time 5 -o /dev/null -w "%{http_code}" --resolve other.invalid:443:127.0.0.1 -H "Host: ${DOMAIN}" https://other.invalid/)" == 000'
+    check "lan: port 443 without SNI (IP address), Host <domain>, no certificate -> no answer" eval '
+        test "$(cexec curl -sk --max-time 5 -o /dev/null -w "%{http_code}" -H "Host: ${DOMAIN}" https://127.0.0.1/)" == 000'
+    check "lan: port 4443, Host other.invalid -> the upstream is not asked" eval '
+        cexec curl -sk --max-time 5 -o /dev/null --resolve "${DOMAIN}:4443:127.0.0.1" -H "Host: other.invalid" "https://${DOMAIN}:4443/sni-host-check" &&
+        ! fexec grep -F "/sni-host-check" /tmp/up/requests.jsonl >/dev/null'
+    # A TLS session of the local-network port cannot be resumed on the mTLS
+    # port (one session-ticket key in Caddy; Go refuses to resume a session
+    # without client certificates where they are required).
+    for v in tls1_3 tls1_2; do
+        cexec rm -f "/tmp/lan-${v}.sess"
+        # shellcheck disable=SC2034 # used in an eval'd check
+        first="$(s_client 4443 "${v}" -sess_out "/tmp/lan-${v}.sess")"
+        check "lan: ${v}: a session on 4443 (no certificate) with a ticket" eval '
+            [[ "${first}" == "New, "*"HTTP/1.1 200"* ]] &&
+            cexec sh -c "openssl sess_id -in /tmp/lan-${v}.sess -noout -text | grep -F \"TLS session ticket:\"" >/dev/null'
+        # shellcheck disable=SC2034 # used in an eval'd check
+        again="$(s_client 4443 "${v}" -sess_in "/tmp/lan-${v}.sess")"
+        check "lan: ${v}: control - the session resumes on 4443 (Reused)" eval '[[ "${again}" == "Reused, "* ]]'
+        # shellcheck disable=SC2034 # used in an eval'd check
+        mtls_try="$(s_client 443 "${v}" -sess_in "/tmp/lan-${v}.sess")"
+        check "lan: ${v}: the same session on 443 is not resumed, the handshake fails without a certificate" eval '
+            [[ "${mtls_try}" != *"Reused, "* && "${mtls_try}" == *alert* && "${mtls_try}" != *"HTTP/1.1"* ]]'
+    done
+    check "lan: port 80 redirects with 301 to https://<domain>/ (port 443, not 4443)" \
+        test "$(http80 -o /dev/null -w '%{http_code} %{redirect_url}' "http://${DOMAIN}/x?y=1")" == "301 https://${DOMAIN}/x?y=1"
+    check "lan: dashboard card 'Local network' on: URL, local DNS, never forward, the refused gateway" eval '
+        html="$(dashboard /)" && [[ "${html}" == *"data-state=\"on\""*"https://${DOMAIN}:9443/"* &&
+        "${html}" == *"Never forward host port 9443"* && "${html}" == *"<code>10.99.0.1</code>"* ]]'
+    # Revoking a client still takes effect at once on 443 with the LAN site.
+    check "lan: POST revoke alice -> 303" \
+        test "$(panel_post /api/clients/alice/revoke reason=keyCompromise)" == "303 http://127.0.0.1:8099${INGRESS_PREFIX}/?ok=Client+%27alice%27+revoked."
+    check "lan: alice refused on 443 at once" mtls_is 000 /data/certs/mTLS-client-alice.crt /data/certs/mTLS-client-alice.key
+    check "lan: the local-network port still answers (no certificate)" \
+        test "$(jq -r .path <<<"$(lan_get 127.0.0.1)" 2>/dev/null)" == /lan-check
+    check "lan: no Traceback, no failed validation in the log" eval 'logs_lack "Traceback" && logs_lack "failed validation"'
+    check "lan: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
+else
+    fail "lan: add-on booted"
+fi
+show_log_on_failure "${before}"
+
+# --- mTLS off with the local-network port: both sites without certificates,
+#     the plain-HTTP site still redirects to 443 ------------------------------
+log "lan-nomtls: mtls_enabled false, local-network host port 443"
+before=${FAIL_COUNT}
+SEED_NETWORK='{"80/tcp":8080,"443/tcp":8443,"4443/tcp":443}'
+boot lan-nomtls "$(options home.example.com false none "")"
+SEED_NETWORK='{"80/tcp":8080,"443/tcp":8443}'
+if wait_for "${BOOT_TIMEOUT}" booted; then
+    pass "lan-nomtls: add-on booted"
+    check "lan-nomtls: LAN site rendered, no client_auth anywhere, no gateway to refuse (--network none)" eval '
+        cexec grep -F "https://home.example.com:4443 {" /etc/caddy/Caddyfile >/dev/null &&
+        ! cexec grep -E "client_auth|@docker_gateway|mTLS-CA.crl" /etc/caddy/Caddyfile >/dev/null &&
+        logs_contain "LAN port:    https://home.example.com/ -"'
+    check "lan-nomtls: caddy validate" caddy_validate
+    check "lan-nomtls: every ACME issuer uses the sinkhole" issuers_only_sinkhole
+    check "lan-nomtls: port 80 redirects with 301 to https://<domain>/" \
+        test "$(cexec curl -s --max-time 5 --resolve home.example.com:80:127.0.0.1 -o /dev/null -w "%{http_code} %{redirect_url}" http://home.example.com/x)" \
+        == "301 https://home.example.com/x"
+    check "lan-nomtls: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
+else
+    fail "lan-nomtls: add-on booted"
+fi
+show_log_on_failure "${before}"
+
+# ==============================================================================
 # 3. DNS providers (dummy tokens, public domain, ACME sinkhole)
 # ==============================================================================
 # caddy_env_has <VAR> <value>: the running Caddy process has VAR=value.
@@ -1214,10 +1395,12 @@ caddy_env_has() {
 dns_case() { # dns_case <provider> <token> <env-var=value...>
     local provider="$1" token="$2" kv secret_file_path
     shift 2
-    log "dns-${provider}: booting"
+    log "dns-${provider}: booting (local-network port on: host port 9443)"
     before=${FAIL_COUNT}
     secret_file_path="$(secret_file "secret-dns-${provider}" "${token}")"
+    SEED_NETWORK='{"80/tcp":8080,"443/tcp":8443,"4443/tcp":9443}'
     boot "dns-${provider}" "$(options home.example.com true "${provider}" "${token}" homeassistant "")"
+    SEED_NETWORK='{"80/tcp":8080,"443/tcp":8443}'
     if ! wait_for "${BOOT_TIMEOUT}" booted; then
         fail "dns-${provider}: add-on booted (Caddy runs with the dns directive)"
         show_log_on_failure "${before}"
@@ -1235,8 +1418,16 @@ dns_case() { # dns_case <provider> <token> <env-var=value...>
             token="$(cat)"; dns_provider_export "$0" "${token}"
             caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1' \
         "${provider}" <"${secret_file_path}"
-    check "dns-${provider}: admin API config uses dns.providers.${provider}" \
+    check "dns-${provider}: admin API config uses dns.providers.${provider} (one automation policy for both HTTPS sites)" \
         adapted "[.. | objects | select(.provider?.name? == \"${provider}\")] | length == 1"
+    check "dns-${provider}: LAN site rendered with the same dns directive, without client_auth" eval '
+        test "$(cexec grep -cE "^[[:space:]]+dns ${provider} " /etc/caddy/Caddyfile)" == 2 &&
+        test "$(cexec grep -c "client_auth" /etc/caddy/Caddyfile)" == 1'
+    check "dns-${provider}: two HTTPS servers (:443 with client auth, :4443 without), one policy for the domain" adapted '
+        ([.apps.http.servers[] | select(.listen == [":443"]) | .tls_connection_policies[] | select(.client_authentication != null)] | length == 1)
+        and ([.apps.http.servers[] | select(.listen == [":4443"]) | .tls_connection_policies[]? | select(.client_authentication != null)] | length == 0)
+        and ([.apps.http.servers[] | select(.listen == [":4443"])] | length == 1)
+        and ([.apps.tls.automation.policies[] | select((.subjects // []) | index("home.example.com"))] | length == 1)'
     check "dns-${provider}: every ACME issuer uses the sinkhole (no Let's Encrypt / ZeroSSL)" issuers_only_sinkhole
     for kv in "$@"; do
         check "dns-${provider}: Caddy's environment has ${kv%%=*}" caddy_env_has "${kv%%=*}" "${kv#*=}"

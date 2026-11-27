@@ -140,3 +140,14 @@ configuration:
       never: never passed on.
       The add-on's web interface shows the state and how to let Home
       Assistant trust the add-on.
+
+network:
+  80/tcp: >-
+    HTTP (Let's Encrypt HTTP-01, CRL, redirect to HTTPS).
+    Router: forward external TCP 80 to this port.
+  443/tcp: >-
+    HTTPS with mTLS client certificates.
+    Router: forward external TCP 443 to this port.
+  4443/tcp: >-
+    HTTPS for your local network without a client certificate (private
+    addresses only). Empty = off. Never forward this port on the router.

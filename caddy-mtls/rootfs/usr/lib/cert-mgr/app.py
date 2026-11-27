@@ -6,7 +6,8 @@ Supervisor's ingress proxy at 172.30.32.2. Provides a dashboard with the
 state of the public (Let's Encrypt) server certificate (public_cert.py,
 refreshed every 30 s), the connection to Home Assistant (upstream.py: does
 it accept forwarded requests, are visitor addresses passed on; refreshed
-every 30 s, "Check again"), the CA and client certificate metadata, client
+every 30 s, "Check again"), the local-network HTTPS port (on or off), the
+CA and client certificate metadata, client
 bundle downloads, regenerating or revoking individual client certs, and
 (with a typed confirmation) regenerating the entire CA (the mTLS CA - the
 public server certificate is Caddy's).
@@ -319,6 +320,8 @@ def index(request: Request) -> Any:
             "flash_ok": flash_ok,
             **_public_cert_context(),
             **_upstream_context(),
+            # The "Local network" card (the facts of this start).
+            "lan_rt": public_cert.read_runtime(),
         },
     )
 

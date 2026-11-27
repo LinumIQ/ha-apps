@@ -54,6 +54,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when that is over.
 - `tests/real-core.sh`: checks the behaviour against a real Home Assistant
   Core 2026.11.3 (not part of CI).
+- **HTTPS in the local network without a client certificate** (optional):
+  container port `4443/tcp` serves the same domain with the same Let's
+  Encrypt certificate and no client certificate, to private source
+  addresses only (10/8, 172.16/12, 192.168/16, 127/8, 169.254/16, fc00::/7,
+  fe80::/10, ::1); everyone else gets `403 Forbidden` naming the address. It
+  also refuses the add-on's Docker gateway address, under which Docker
+  forwards IPv6 connections (and connections from the host itself) and
+  hides their real source. Off by default: it is on exactly while the port
+  has a host port (Network settings, **Show disabled ports**). Never forward
+  it on the router. The web interface has a card **Local network** (off:
+  how to turn it on; on: the address, the local DNS record, the warnings).
+  A TLS session of this port cannot be resumed on the client-certificate
+  port.
 
 ### Changed
 
@@ -70,6 +83,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answered 400.
 - Installation step 4 (adding the add-on to Home Assistant's trusted
   proxies) is no longer required.
+- The plain-HTTP site (port 80) is rendered always, also with
+  `mtls_enabled: false` (then without the CRL): its redirect keeps pointing
+  at `https://<domain>/` (port 443) with a second HTTPS site for the domain.
+  With `mtls_enabled: false` the redirect is now `301` (was Caddy's automatic
+  `308`).
+- The add-on's log names all three host ports and the state of the
+  local-network port.
 
 ## [2.1.3] - 2026-11-24
 

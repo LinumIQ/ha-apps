@@ -258,6 +258,7 @@ jobs:
           caddy-mtls/rootfs/usr/lib/cert-mgr/monitor.py
           caddy-mtls/rootfs/usr/lib/cert-mgr/public_cert.py
           caddy-mtls/rootfs/usr/lib/cert-mgr/upstream.py
+          caddy-mtls/rootfs/usr/lib/cert-mgr/lan.py
           caddy-mtls/tests/fake-upstream.py
 
       # The expiry monitor, public_cert.py and upstream.py (standard library
@@ -266,7 +267,8 @@ jobs:
       # log events, storage, checklist) and its notification with a mocked
       # Supervisor, the forwarding headers (probe against a fake Home
       # Assistant on 127.0.0.1, decision table, snippet, the monitor's
-      # cadence and noise rules with a mocked clock, the notification).
+      # cadence and noise rules with a mocked clock, the notification), the
+      # local-network port (lan.py: private ranges, default gateways).
       - name: Unit tests
         run: python -m unittest discover -s caddy-mtls/tests/unit -v
 

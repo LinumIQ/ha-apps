@@ -11,6 +11,7 @@ A Home Assistant add-on that provides a Caddy reverse proxy with mutual TLS (mTL
 - 🔐 **mTLS Authentication** - Require client certificates for access
 - 📱 **Easy Distribution** - certificate downloads in the add-on's web interface (Home Assistant sidebar, administrators only)
 - 🚦 **Certificate status** - the web interface shows whether the Let's Encrypt certificate exists, and if not, the last error and what to check in the router; a Home Assistant notification while it is missing
+- 🏠 **HTTPS at home without a certificate** - optional second port for your local network (private addresses only, never forwarded)
 - 🔁 **No Home Assistant configuration needed** - the add-on asks Home Assistant whether it trusts it as a reverse proxy and adapts (option `forwarded_headers`); the web interface shows whether Home Assistant sees the visitors' own addresses and how to turn that on
 - 🌐 **DNS Challenge Support** - Cloudflare, Route53, and Hetzner for when port 80 is unavailable
 - 👥 **Multiple Users** - Generate individual certificates for each user/device
@@ -92,6 +93,12 @@ to 80/443 where Home Assistant does not use them). In the LAN, use
 `https://<domain>:8443` (or the public URL with NAT loopback). See
 [DOCS.md](DOCS.md#ports-8080-and-8443-on-the-host-since-200).
 
+**HTTPS at home without a client certificate** (since 2.2.0): give container
+port `4443/tcp` a host port (Network settings, **Show disabled ports**) and
+let your local DNS resolve the domain to the host's IPv4 address. The port
+answers private addresses only - **never forward it on the router**. See
+[DOCS.md](DOCS.md#https-in-your-local-network-without-a-client-certificate-since-220).
+
 ## Certificate Management
 
 ### Adding Users
@@ -145,6 +152,7 @@ Internet → Router:443 → host:8443 → Caddy :443 (mTLS) → Home Assistant:8
 Internet → Router:80  → host:8080 → Caddy :80  (HTTP-01, CRL, redirect to https)
                                        ↓
                                  Let's Encrypt
+LAN (optional) ───────→ host:9443 → Caddy :4443 (no certificate, private addresses only)
 ```
 
 ## License

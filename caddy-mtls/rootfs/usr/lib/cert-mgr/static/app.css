@@ -188,6 +188,47 @@
   font-size: var(--text-sm);
 }
 
+/* ---------- Local network card ---------- */
+.lan {
+  border-left: 4px solid var(--lan-accent, var(--color-border));
+}
+
+.lan--on {
+  --lan-accent: var(--color-success-solid);
+}
+
+.lan--off {
+  --lan-accent: var(--color-primary);
+}
+
+.lan--unknown {
+  --lan-accent: var(--color-warn-solid);
+}
+
+.lan__lead {
+  margin: 0 0 var(--space-3);
+}
+
+.lan__note {
+  margin: 0 0 var(--space-2);
+  color: var(--color-text-muted);
+  font-size: var(--text-sm);
+}
+
+.lan__note strong {
+  color: var(--color-text);
+}
+
+.lan__list {
+  margin: 0;
+  padding-left: var(--space-6);
+  font-size: var(--text-sm);
+}
+
+.lan__list li {
+  margin-bottom: var(--space-1);
+}
+
 /* ---------- Notices ("No CA metadata", "CRL not yet generated") ---------- */
 .warn {
   margin: 0 0 var(--space-4);

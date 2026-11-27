@@ -28,13 +28,19 @@ startup: services
 # add-on cannot publish those there. Users forward external 80/443 from the
 # router to these host ports (or change them in the add-on's Network
 # settings, e.g. back to 80/443 where those are free).
+# 4443 (since 2.2.0): HTTPS for the local network without client
+# certificates, private source addresses only. Off by default (no host
+# port); it is on exactly while it has a host port, which must never be
+# forwarded by the router.
 ports:
   "80/tcp": 8080
   "443/tcp": 8443
+  "4443/tcp": null
 
 ports_description:
   "80/tcp": "HTTP (Let's Encrypt HTTP-01, CRL, redirect to HTTPS). Router: forward external TCP 80 to this port."
   "443/tcp": "HTTPS with mTLS client certificates. Router: forward external TCP 443 to this port."
+  "4443/tcp": "HTTPS for your local network without a client certificate (private addresses only). Never forward this port on the router."
 
 # Ingress configuration for the certificate management web UI (FastAPI app
 # served by the cert-mgr s6 service on port 8099 inside the container).

@@ -79,12 +79,21 @@ class Runtime:
     acme_ca: str = ""
     acme_log: str = DEFAULT_ACME_LOG
     caddy_storage: str = DEFAULT_STORAGE
+    # The local-network site (container port 4443, since 2.2.0): its host
+    # port (None: off); "on", "off" or "unknown" (the host port could not be
+    # read: off); the private addresses it refuses nevertheless (the
+    # container's default gateways - Docker's userland proxy, see lan.py).
+    lan_host_port: int | None = None
+    lan_state: str = "off"
+    lan_refused: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Runtime:
         def port(value: Any) -> int | None:
             return value if isinstance(value, int) and 0 < value < 65536 else None
 
+        refused = data.get("lan_refused")
+        lan_state = str(data.get("lan_state") or "off")
         return cls(
             domain=str(data.get("domain") or ""),
             started_at=float(data.get("started_at") or 0),
@@ -95,6 +104,9 @@ class Runtime:
             acme_ca=str(data.get("acme_ca") or ""),
             acme_log=str(data.get("acme_log") or DEFAULT_ACME_LOG),
             caddy_storage=str(data.get("caddy_storage") or DEFAULT_STORAGE),
+            lan_host_port=port(data.get("lan_host_port")),
+            lan_state=lan_state if lan_state in ("on", "off", "unknown") else "off",
+            lan_refused=tuple(str(a) for a in refused) if isinstance(refused, list) else (),
         )
 
 

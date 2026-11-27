@@ -13,6 +13,7 @@ This add-on provides a Caddy reverse proxy with mutual TLS (mTLS) authentication
 - ♻️ **Certificate Revocation List (CRL)** - revoked clients are rejected on the next handshake without restarts
 - 📅 **Expiration Notifications** - per-cert sensors and persistent notifications as expiry approaches
 - 🚦 **Public certificate status** - the web UI shows whether the Let's Encrypt certificate exists; if not, the last error and a port-forwarding checklist (plus a Home Assistant notification)
+- 🏠 **HTTPS at home without a client certificate** (since 2.2.0, optional) - a second port for the local network, same domain and certificate, for private addresses only
 - 🔁 **Works without editing Home Assistant** (since 2.2.0) - the add-on asks Home Assistant whether it trusts it as a reverse proxy and adapts; the web UI shows what Home Assistant sees and how to pass real visitor addresses on
 
 ## Requirements
@@ -38,6 +39,7 @@ and **8443** by default:
 | ----------------- | ----------------- | ---------------------------------------- |
 | `80/tcp` (HTTP)   | `8080`            | external TCP 80 -> `<HA host>:8080`      |
 | `443/tcp` (HTTPS) | `8443`            | external TCP 443 -> `<HA host>:8443`     |
+| `4443/tcp` (HTTPS, local network, since 2.2.0) | none (off) | **never** - see [HTTPS in your local network](#https-in-your-local-network-without-a-client-certificate-since-220) |
 
 - You can change the host ports in the add-on's **Network** settings, e.g.
   back to 80 and 443 on an installation where Home Assistant itself does not
@@ -51,11 +53,76 @@ and **8443** by default:
   through the router's port forwarding.
 - **In your LAN**, either use the public URL (if your router supports NAT
   loopback / hairpin NAT) or `https://<domain>:8443` with `<domain>`
-  resolving to the Home Assistant host (local DNS or hosts file). The
-  certificate and the mTLS site are bound to the domain name, so
-  `https://<ip-address>:8443` does not work. A plain-HTTP request to
-  `http://<domain>:8080/` is redirected to `https://<domain>/` - port 443,
-  i.e. the router path.
+  resolving to the Home Assistant host (local DNS or hosts file) - both with
+  a client certificate - or turn on the
+  [local-network port](#https-in-your-local-network-without-a-client-certificate-since-220),
+  which needs none. The certificate and the mTLS site are bound to the
+  domain name, so `https://<ip-address>:8443` does not work. A plain-HTTP
+  request to `http://<domain>:8080/` is redirected to `https://<domain>/` -
+  port 443, i.e. the router path.
+
+### HTTPS in your local network without a client certificate (since 2.2.0)
+
+At home you may not want to install a client certificate on every device
+(a wall tablet, a guest's phone). The add-on can serve the same Home
+Assistant over HTTPS **without a client certificate** on a second port,
+container port `4443/tcp`, for devices in your local network only. It uses
+the same domain and the same Let's Encrypt certificate.
+
+Why a second port and not "no certificate needed from the LAN" on the main
+port: the address the add-on sees for a connection depends on your router
+and on Docker; where it is wrong, such a rule would let the internet in
+without a certificate. A separate port that your router does not forward
+keeps the internet path certificate-only.
+
+**Turn it on:**
+
+1. Open **Settings > Apps > Caddy mTLS Proxy > Configuration**.
+2. In the **Network** card, turn on **Show disabled ports** (a port without
+   a host port counts as disabled and is hidden otherwise).
+3. Enter a free host port for `4443/tcp`, for example `9443`. Keep the host
+   ports of `80/tcp` and `443/tcp` as they are - do **not** use **Reset to
+   defaults**, which also sets them back to 8080/8443.
+4. Select **Save**, then restart the add-on.
+
+The add-on's web interface (card **Local network**) and its log then show
+the address, e.g. `https://home.example.com:9443/`. Without a host port the
+port is off; there is no option for it.
+
+**Make the name work at home.** The certificate is issued for your domain,
+so the address must be `https://home.example.com:9443/`, not
+`https://192.168.1.10:9443/` (the browser would refuse the certificate). In
+your local network the name has to lead to the Home Assistant host: add a
+local DNS record that points `home.example.com` to the host's **IPv4**
+address (an A record) - in your router's DNS settings, in AdGuard Home (DNS
+rewrites), in Pi-hole (Local DNS records) or in the Dnsmasq app (`hosts`).
+Use the IPv4 address: if a device connects over IPv6 (for example because
+the name also has a public AAAA record that your DNS passes on), the
+connection either does not reach the add-on or arrives under an address
+that hides the device, and the add-on answers it with a 403 that says to use
+IPv4. Check what your devices get with `nslookup home.example.com`.
+
+**Tip:** where host port 443 is free on your Home Assistant host (not on new
+Home Assistant OS installations, which serve Home Assistant itself on 443),
+give `4443/tcp` the host port 443: at home `https://home.example.com/` then
+opens without a certificate, and away the same URL asks for one.
+
+**Only local addresses.** The port answers only connections from private
+addresses (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8,
+169.254.0.0/16, fc00::/7, fe80::/10, ::1). Every other connection gets
+`403 Forbidden` with the address the add-on saw. It also refuses the
+add-on's Docker gateway address (for example `172.30.32.1`): Docker
+forwards IPv6 connections to an add-on without IPv6, and connections from
+the host itself, from that address, which hides where they really come
+from - possibly from the internet. This rule is a second line of defence,
+not the boundary:
+
+- **Never forward this port on your router.** It needs no client
+  certificate.
+- A published port is reachable over IPv6 wherever your router's IPv6
+  firewall lets connections in, without any port forwarding: keep your
+  router's IPv6 firewall on (most routers block incoming IPv6 connections
+  by default).
 
 ### Port 80 Availability
 
@@ -588,6 +655,15 @@ Supervisor waits up to 60 seconds (`timeout` in the add-on configuration)
 before it kills the container. Warnings such as `finish script lifetime
 reached maximum value` or `unable to stop service init-caddy: command exited
 111` appeared on every stop up to 2.0.0 and are fixed in 2.0.1.
+
+### The local-network port answers "403 Forbidden"
+
+The port answers private addresses only. The message names the address the
+add-on saw. A public address means the connection did not come from your
+local network - or came over IPv6 with a public address: let the domain
+resolve to the host's IPv4 address in your local DNS. "The address of
+Docker" means Docker hid the real address (an IPv6 connection, or one from
+the Home Assistant host itself): connect over IPv4 from another device.
 
 ### "Connection refused" errors
 

@@ -18,7 +18,8 @@
 # notification at a fake Supervisor inside the container, then its
 # dismissal), the forwarding headers (the start probe, a fake Home Assistant
 # that refuses X-Forwarded-For: the monitor's switch to mode strip with a
-# rewritten snippet and a reload, "Check again"), a clean `docker stop`
+# rewritten snippet and a reload, "Check again"), the local-network port
+# (lan.py, the listener on 4443), a clean `docker stop`
 # (< 10 s, exit 0, no s6 warnings) and a
 # restart as Supervisor does it (a new container with the previous /data)
 # with a new client name and a new client_cert_password (issuance and .p12
@@ -120,6 +121,9 @@ cat >"${WORK}/data/options.json" <<'JSON'
  "cert_expiry_warn_days": [30, 14, 7, 1], "cert_check_interval_hours": 6}
 JSON
 cp "${WORK}/data/options.json" "${WORK}/tmp/.bashio/addons.self.options.config.cache"
+# The add-on's network settings with the local-network port (4443/tcp) on.
+printf '%s\n' '{"name":"Caddy mTLS Proxy","network":{"80/tcp":8080,"443/tcp":8443,"4443/tcp":9443}}' \
+    >"${WORK}/tmp/.bashio/addons.self.info.cache"
 chmod -R go+rX "${WORK}"
 # Files go in owned by root (as Supervisor creates them): `docker cp` would
 # keep the runner's uid, which root could only read with CAP_DAC_OVERRIDE.
@@ -156,6 +160,14 @@ state() { cexec jq -r "$1" /data/state.json 2>/dev/null; }
 check "panel healthy under ${PROFILE}" wait_for 90 health
 check "Caddy admin API up under ${PROFILE}" wait_for 30 admin_up
 check "init-caddy completed (CA, clients, CRL, Caddyfile validated)" logs_contain "Init complete:"
+# The local-network site (lan.py read the container's routes under the
+# profile) and Caddy's listener on 4443.
+check "local-network port rendered (LAN port logged)" logs_contain "LAN port:    https://home.example.com:9443/"
+lan_listening() {
+    cexec curl -fsS http://127.0.0.1:2019/config/ 2>/dev/null | jq -e '[.apps.http.servers[].listen[]] | index(":4443") != null' >/dev/null &&
+        cexec sh -c 'grep -qi ":115B " /proc/net/tcp6 /proc/net/tcp' # 0x115B = 4443, listening
+}
+check "Caddy listens on 4443 under ${PROFILE}" wait_for 30 lan_listening
 # Read from the host: the profile itself does not allow reading AppArmor labels.
 pid1="$("${DOCKER}" inspect -f '{{.State.Pid}}' "${CTR}")"
 check "PID 1 confined by ${PROFILE} (enforce)" \
