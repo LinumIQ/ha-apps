@@ -169,7 +169,8 @@ network:
     HTTP (Let's Encrypt HTTP-01, CRL, redirect to HTTPS).
     Router: forward external TCP 80 to this port.
   443/tcp: >-
-    HTTPS with mTLS client certificates.
+    HTTPS for the internet: with a client certificate (mTLS), or with the
+    header key if one is set (header authentication).
     Router: forward external TCP 443 to this port.
   4443/tcp: >-
     HTTPS for your local network without a client certificate (private
