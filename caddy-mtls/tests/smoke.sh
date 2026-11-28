@@ -2184,9 +2184,15 @@ EOF
             gen_cert "${dir}" w '*.localhost'
             printf 'other.caddy-mtls-smoke.localhost {\n\ttls /config/caddy/w.crt /config/caddy/w.key\n\trespond "other"\n}\n' >"${dir}/sites.caddy"
             ;;
-        livecert)
+        livecert|norename)
             gen_cert "${dir}" o other.caddy-mtls-smoke.localhost
             printf 'other.caddy-mtls-smoke.localhost {\n\ttls /config/caddy/o.crt /config/caddy/o.key\n\trespond "other" 200\n}\n' >"${dir}/sites.caddy"
+            ;;
+        # B2-2: a snippet refers to named pipes (the reviewer's FIFO case):
+        # Caddy's check would wait for ever.
+        fifocert)
+            mkfifo "${dir}/f.crt" "${dir}/f.key"
+            printf 'other.caddy-mtls-smoke.localhost {\n\ttls /config/caddy/f.crt /config/caddy/f.key\n\trespond "other"\n}\n' >"${dir}/sites.caddy"
             ;;
         # B-6: refused with the real cause; a log that includes the access logs.
         keytype) printf '%s\n' 'key_type rsa2048' >"${dir}/global.caddy" ;;
@@ -2227,6 +2233,10 @@ custom_state() { cexec jq -r "$1" /run/caddy-mtls/custom.json 2>/dev/null; }
 other_site() {
     cexec curl -sk --max-time 10 -o - -w ' %{http_code}' --resolve "other.caddy-mtls-smoke.localhost:443:127.0.0.1" \
         "$@" https://other.caddy-mtls-smoke.localhost/ 2>/dev/null || true
+}
+# pids_with <command line prefix>: a process in the container runs it.
+pids_with() {
+    cexec sh -c 'for p in /proc/[0-9]*; do tr "\0" " " < "$p/cmdline" 2>/dev/null; echo; done' | grep -F -- "$1" >/dev/null
 }
 # flash_ok <text>: the panel's redirect after a change that worked.
 flash_ok() { printf '303 http://127.0.0.1:8099%s/?ok=%s' "${INGRESS_PREFIX}" "$1"; }
@@ -2665,6 +2675,19 @@ if wait_for "${BOOT_TIMEOUT}" booted; then
     save_fixture livecert key
     check "custom-livecert-caddyrun: loaded, the start skipped the caddy service's own check (marker consumed)" eval '
         test "$(custom_state .state)" == loaded && file_absent /run/caddy-mtls/caddyfile-validated'
+    # B2-1: the add-on's reload path with an admin address nobody listens
+    # on (its existing CADDY_ADMIN setting): Caddy is never reached - a
+    # failure as before, no fallback, nothing dropped.
+    unreachable_reload() {
+        cexec env CADDY_ADMIN=127.0.0.1:2020 /usr/lib/cert-mgr/.venv/bin/python3 -c 'import sys
+sys.path.insert(0, "/usr/lib/cert-mgr")
+import caddyctl
+r = caddyctl.reload_detailed()
+print(r.reloaded, bool(r.dropped), "performing request" in r.caddy_error)' 2>/dev/null
+    }
+    check "custom-livecert-caddyrun: a reload that cannot reach the admin endpoint fails and drops nothing (B2-1)" eval '
+        test "$(unreachable_reload)" == "False False True" && test "$(custom_state .state)" == loaded &&
+        file_exists /etc/caddy/Caddyfile.own && cexec test -s /etc/caddy/custom/sites.caddy'
     cexec rm /config/caddy/o.key
     caddy_pid="$(cexec pidof caddy 2>/dev/null || true)"
     caddy_back() {
@@ -2678,6 +2701,13 @@ if wait_for "${BOOT_TIMEOUT}" booted; then
         [[ "$(custom_state .error)" == "Caddy could not load the configuration with your custom files when it was started again ("*"o.key"* ]] &&
         file_absent /etc/caddy/Caddyfile.own && ! cexec grep -F /etc/caddy/custom/ /etc/caddy/Caddyfile >/dev/null'
     check "custom-livecert-caddyrun: the log says so" logs_contain "Caddy could not load the configuration with your custom files when it was started again"
+    # plain_error: the state's error has no colour code, level or time stamp.
+    plain_error() {
+        local err
+        err="$(custom_state .error)" || return 1
+        [[ "${err}" != *$'\e'* && "${err}" != *ERROR* && ! "${err}" =~ [0-9]{4}/[0-9]{2}/[0-9]{2} ]]
+    }
+    check "custom-livecert-caddyrun: Caddy's message without time stamp, level or colour codes (B2-3)" plain_error
     check "custom-livecert-caddyrun: the add-on works (alice 502: no upstream here; no certificate or key: 403); a reload works" eval '
         test "$(creq /x "${CERT_ALICE[@]}")" == 502 && test "$(creq /x)" == 403 &&
         test "$(panel_post /api/clients/bob/revoke reason=superseded)" == "$(flash_ok Client+%27bob%27+revoked.)" &&
@@ -2687,6 +2717,52 @@ else
     fail "custom-livecert-caddyrun: add-on booted"
 fi
 show_log_on_failure "${before}"
+
+# --- B2-5: the drop cannot replace the Caddyfile at an s6 restart -----------
+# The Caddyfile made a directory: its validation fails and the rename onto
+# it fails (EISDIR) - Caddy must start with the fallback file itself.
+log "custom-norename: booting (sites.caddy loads o.crt and o.key)"
+before=${FAIL_COUNT}
+custom_boot norename true
+if wait_for "${BOOT_TIMEOUT}" booted; then
+    pass "custom-norename: add-on booted"
+    auth_headers
+    cexec sh -c 'rm /etc/caddy/Caddyfile && mkdir /etc/caddy/Caddyfile'
+    caddy_pid="$(cexec pidof caddy 2>/dev/null || true)"
+    caddy_back() {
+        local pid
+        pid="$(cexec pidof caddy 2>/dev/null)" && [[ -n "${pid}" && "${pid}" != "${caddy_pid}" ]] && admin_up
+    }
+    check "custom-norename: SIGTERM to Caddy alone -> Caddy runs again, with /etc/caddy/Caddyfile.own" eval '
+        [[ -n "${caddy_pid}" ]] && cexec kill -TERM "${caddy_pid}" && wait_for 30 caddy_back && running &&
+        pids_with "/usr/bin/caddy run --config /etc/caddy/Caddyfile.own"'
+    check "custom-norename: the log says why; state rejected (restart), the fallback file still there" eval '
+        logs_contain "The Caddyfile could not be replaced; Caddy starts with the add-on'"'"'s own configuration (/etc/caddy/Caddyfile.own)." &&
+        test "$(custom_state .state)" == rejected && test "$(custom_state .dropped)" == restart &&
+        file_exists /etc/caddy/Caddyfile.own'
+    check "custom-norename: the gate holds (no certificate or key 403, the key 502: no upstream here)" eval '
+        test "$(creq /x)" == 403 && test "$(creq /x -H @/tmp/h-ok)" == 502'
+    check "custom-norename: a revocation through the panel falls back again and applies (alice refused)" eval '
+        r="$(panel_post /api/clients/alice/revoke reason=superseded)" &&
+        [[ "${r}" == "303 "*"&ok=Client+%27alice%27+revoked." ]] && test "$(creq /x "${CERT_ALICE[@]}")" == 000'
+    check "custom-norename: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
+else
+    fail "custom-norename: add-on booted"
+fi
+show_log_on_failure "${before}"
+
+# --- B2-2: a snippet refers to named pipes: the check's time limit --------
+# (The one case of the suite that waits for the 60 s limit.)
+fifo_checks() {
+    check "custom-$1: the card and the log name the time limit" eval '
+        [[ "$(dashboard /)" == *"data-state=\"rejected\""*"did not finish checking the configuration with your custom files within 60 seconds"* ]] &&
+        logs_contain "did not finish checking the configuration with your custom files within 60 seconds"'
+    check "custom-$1: no process of the expired check is left" eval '! pids_with "/usr/bin/caddy validate" && ! pids_with "timeout -k"'
+}
+BOOT_TIMEOUT_SAVED="${BOOT_TIMEOUT}"
+BOOT_TIMEOUT=$(( BOOT_TIMEOUT + 75 ))
+reject_case fifocert true "Caddy did not finish checking the configuration with your custom files within 60 seconds. A file a snippet refers to probably cannot be read to its end (a named pipe, or a network folder that does not answer)." /custom-check fifo_checks
+BOOT_TIMEOUT="${BOOT_TIMEOUT_SAVED}"
 fi
 
 printf '\n%d passed, %d failed\n' "${PASS_COUNT}" "${FAIL_COUNT}"
