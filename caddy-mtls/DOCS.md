@@ -544,7 +544,7 @@ the folder; the web interface names it):
 | `global.caddy` | at the **start** of the global options block, before the add-on's own options: for an option given twice Caddy keeps the later one, so the add-on's `email`, `storage`, `admin`, `grace_period` and its logs win - do not repeat them (a second `log default` is an error) |
 | `site.caddy`  | in the public site: after the authentication (client certificate / header key) and after the header removal, before the proxy to Home Assistant; the directives run in the order written |
 | `lan.caddy`   | in the local-network site (only while that port is on): after its private-address checks, before the proxy; in the order written |
-| `sites.caddy` | at the end of the configuration: further sites and named snippets |
+| `sites.caddy` | at the end of the configuration: further sites and named snippets; a site uses the add-on's ports only - 80, 443 and (while it is on) 4443 - without `bind` |
 
 `import mtls` (in `sites.caddy`, only with `mtls_enabled: true`) gives a site
 the add-on's strict client certificate check - the add-on's certificate
@@ -554,13 +554,23 @@ does not exist, and a file that uses it is rejected.
 
 **Applied when the add-on starts, from copies.** At every start the add-on
 reads the four files and uses checked copies of them. Change a file, then
-restart the add-on; until then nothing changes, also not when the add-on
-reloads Caddy for a revoked client. A file counts when it is a regular file
-(not a symbolic link), at most 256 KiB and not blank; anything else is
-ignored (the log and the card say why). Windows line endings and a UTF-8
-byte-order mark are fine. A file may import a snippet by its name (`import
-mtls`), but no other file. The add-on writes a `README.txt` into the folder
-at every start.
+restart the add-on; until then the four files are not read again, also not
+when the add-on reloads Caddy for a revoked client. Files they **refer to**
+(a site's `tls` certificate and key, a `trust_pool` file, CA files of a
+`transport`, ...) are a different matter: Caddy reads those at every reload,
+so a change of such a file takes effect at the next reload. If Caddy cannot
+load the configuration with the snippets any more while the add-on applies a
+change - say the key file of a `tls` line was removed - the add-on drops the
+snippets and reloads with its own configuration, so that the change (for
+example a revocation) takes effect: the panel says so next to the change,
+the card **Custom Caddy configuration** turns red with Caddy's message and a
+Home Assistant notification appears; the snippets are read again at the next
+start. A file counts when it is a regular file (not a symbolic link), at
+most 256 KiB, UTF-8 text and not blank; anything else is ignored (the log
+and the card say why). `lan.caddy` counts only while the local-network port
+is on. Windows line endings and a UTF-8 byte-order mark are fine. A file may
+import a snippet by its name (`import mtls`), but no other file. The add-on
+writes a `README.txt` into the folder at every start.
 
 **All or nothing, never down because of a snippet.** Caddy validates the
 configuration with the files, and the add-on checks that its own sites came
@@ -575,6 +585,26 @@ log shows a warning block with the reason, the card **Custom Caddy
 configuration** turns red and a Home Assistant notification appears.
 **Do not rely on a snippet for a restriction without checking the card after
 the restart.**
+
+What is refused (all four files are then dropped):
+
+- a site on another port than 80, 443 or (while it is on) 4443, or with
+  `bind` - inside the container other ports belong to the add-on (2019:
+  Caddy's admin interface, which the add-on uses to apply revocations; 8099:
+  the web interface), and the add-on publishes no other port;
+- a second site for the add-on's own host name (also with a path or a port),
+  a site without a host name, and a wildcard site that covers the add-on's
+  name (`*.example.com` while the domain is `home.example.com`);
+- changes to the add-on's TLS and certificate settings - global options
+  such as `key_type`, `ocsp_stapling`, `cert_issuer`, `acme_ca`,
+  `default_sni`, switching `strict_sni_host` off -, to `admin`, `storage`,
+  `grace_period` and the add-on's logs (a log of your own is fine, also one
+  that includes the access logs; while a header key is set it must drop
+  request headers: `format filter { ...; request>headers delete }`);
+- a certificate a site of yours loads (`tls <certificate> <key>`) that
+  covers the add-on's domain, and certificate loaders the add-on cannot check
+  (anything but certificate files);
+- imports of files, and files that are not UTF-8 text.
 
 A snippet runs with Caddy's rights: whatever Caddy can read - the add-on's
 files, its environment with the DNS credentials - a snippet can put into a
@@ -770,8 +800,9 @@ the Supervisor ingress IP):
   browser. See [Header authentication](#header-authentication-since-230).
 - **Custom Caddy configuration** (since 2.3.0) - shown only when custom
   files exist: in use (the files, the folder), or not in use (red, with
-  Caddy's or the integrity check's message and what to do), and ignored
-  entries. See [Custom Caddyfile snippets](#custom-caddyfile-snippets-since-230).
+  Caddy's or the integrity check's message and what to do - also when a
+  reload dropped them), and ignored entries. See
+  [Custom Caddyfile snippets](#custom-caddyfile-snippets-since-230).
 
 - **Add a client** - issues a new client certificate, adds it to the
   active allowlist and reloads Caddy in-place. A name has 1-64 characters
@@ -976,9 +1007,12 @@ The card **Custom Caddy configuration** and the log at the start say what
 happened. File not listed: it is not in `app_configs/<slug>/caddy/` (in some
 apps `addon_configs/<slug>/caddy/`), its
 name is not exactly one of the four, or it was ignored (symbolic link,
-larger than 256 KiB, blank - the reason is shown). Listed, red: it was
-rejected - the message says why, and none of the files is in use. Listed,
-green: it is in use - after a change, restart the add-on.
+larger than 256 KiB, blank, `lan.caddy` while the local-network port is off
+- the reason is shown). Listed, red: it was rejected - the message says why,
+and none of the files is in use; "Caddy could not reload with your custom
+files while applying a change" means a file a snippet refers to (a
+certificate or key, ...) broke after the start: fix it and restart the
+add-on. Listed, green: it is in use - after a change, restart the add-on.
 
 ### "Connection refused" errors
 

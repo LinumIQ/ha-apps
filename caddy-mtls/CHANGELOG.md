@@ -34,12 +34,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the old name), imported at four fixed places (global
   options first, so the add-on's own win; the public and the local-network
   site after their access checks, before the proxy; further sites last;
-  `import mtls` = the add-on's strict client certificate check). Read at
-  every start and used as checked copies; Caddy validates them and the
-  add-on checks that its own sites stayed as it wrote them. If either
-  rejects them, none is used and the add-on starts with its own
-  configuration: a warning block in the log, a red card **Custom Caddy
-  configuration** and a Home Assistant notification.
+  `import mtls` = the add-on's strict client certificate check; further
+  sites only on the add-on's ports 80, 443 and 4443, without `bind`). Read
+  at every start and used as checked copies (`lan.caddy` only while the
+  local-network port is on); Caddy validates them and the add-on checks
+  that its own sites stayed as it wrote them. If either rejects them, none
+  is used and the add-on starts with its own configuration: a warning block
+  in the log, a red card **Custom Caddy configuration** and a Home
+  Assistant notification. Files the snippets refer to (a `tls` certificate
+  and key, ...) are read by Caddy at every reload; if Caddy cannot reload
+  with the snippets any more while the add-on applies a change such as a
+  revocation, the add-on drops them until the next start and reloads with
+  its own configuration, so that the change takes effect (the panel, the
+  card and a notification say so).
 
 ### Changed
 
@@ -52,17 +59,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `log_level: trace` no longer turns on bashio's own trace output, which
   printed the add-on's whole options - `client_cert_password`,
   `dns_api_token` and now the header key included - into the log.
-- Caddy no longer gets the Supervisor token in its environment (a custom
-  snippet could read it).
+- Every Caddy process that reads the configuration - the checks at the
+  start, Caddy itself and the reloads by the web interface and the monitor -
+  runs with the same small environment: `PATH`, `HOME`, `TZ`, the `XDG_*`
+  locations and the DNS provider credentials, nothing else. A custom
+  snippet's `{$VAR}` therefore gets the same value at the start and at every
+  reload, and no Caddy process has the Supervisor token (until now the
+  reloads adapted the configuration in the web interface's environment,
+  which has it).
+- Caddy's admin endpoint and everything that talks to it use
+  `127.0.0.1:2019` explicitly instead of `localhost:2019` (in the container
+  `localhost` resolves to `::1` first, where the admin endpoint does not
+  listen).
 
 ### Fixed
 
 - The documentation of "Method 2: File Access" named a folder that exists
   only for a local copy: the copies are in `<slug>/certs/` of the app
-  configuration folders (`2644ca2c_caddy_mtls` for this repository), called
-  `app_configs` in the official apps of today and `addon_configs` in apps
-  that still use the old name (for example Advanced SSH & Web Terminal); the
-  web interface now names the folder.
+  configuration folders (usually `2644ca2c_caddy_mtls` for this repository;
+  the prefix depends on the exact repository address that was added), which
+  appear as `app_configs` or under the earlier name `addon_configs`,
+  depending on the app and its version; the content is the same. The web
+  interface now names the exact folder.
 - The `.p12` copy of a revoked client stayed in that folder for good; it is
   now removed at the next start.
 - Test data no longer uses a real host name or address.
