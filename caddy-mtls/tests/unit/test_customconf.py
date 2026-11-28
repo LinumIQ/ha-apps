@@ -286,6 +286,18 @@ class DropTest(unittest.TestCase):
         self.assertEqual(len(long), customconf.CADDY_MESSAGE_MAX)
         self.assertTrue(long.endswith("..."))
 
+    def test_caddy_message_of_a_console_log_line(self) -> None:
+        """B2-3: the reviewer's line (Caddy's console log format, the level
+        coloured): no time stamp, no level, no colour codes."""
+        line = ("2026/11/28 01:08:48.373\t\x1b[31mERROR\x1b[0m\tloading http app module: provision http: "
+                "loading certificates: open /config/caddy/o.key: no such file or directory\n")
+        self.assertEqual(customconf.caddy_message("2026/11/28 01:08:48.370\tINFO\tusing config from file\n" + line),
+                         "loading http app module: provision http: loading certificates: open /config/caddy/o.key: "
+                         "no such file or directory")
+        with_fields = ('2026/11/28 01:08:48.373\tERROR\ttls\tloading failed\t{"error": "open /x: denied"}\n')
+        self.assertEqual(customconf.caddy_message(with_fields), "loading failed: open /x: denied")
+        self.assertEqual(customconf.log_entry("plain text"), None)
+
     def test_reload_lock_excludes_another_holder(self) -> None:
         import fcntl
         lock = self.tmp / "run" / "reload.lock"
@@ -305,6 +317,28 @@ class DropTest(unittest.TestCase):
 
 
 class MessageTest(unittest.TestCase):
+    def test_console_format_at_the_start(self) -> None:
+        """B2-3: the same message in Caddy's console format (colours)."""
+        out = ("2026/11/28 01:08:48.373\t\x1b[31mERROR\x1b[0m\tadapting config using caddyfile: File to import "
+               "not found: foo, at /etc/caddy/custom/site.caddy:1\n")
+        self.assertEqual(customconf.describe_error(out),
+                         ("adapting config using caddyfile: File to import not found: foo, at caddy/site.caddy:1",
+                          "site.caddy"))
+
+    def test_a_relative_path(self) -> None:
+        """B2-4: Caddy could not open a relative path - say that paths must
+        be absolute instead of the generic hint."""
+        out = ('{"level":"error","msg":"loading http app module: provision http: loading certificates: open '
+               'config/caddy/o.crt: no such file or directory"}\n')
+        text, file = customconf.describe_error(out)
+        self.assertIsNone(file)
+        self.assertTrue(text.startswith("a snippet refers to config/caddy/o.crt, a relative path: give files by their "
+                                        "absolute path"), text)
+        self.assertNotIn("unbalanced braces", text)
+        # An absolute path that is missing keeps the generic text.
+        out = out.replace("config/caddy/o.crt", "/config/caddy/o.crt")
+        self.assertIn("unbalanced braces", customconf.describe_error(out)[0])
+
     def test_named_file(self) -> None:
         out = ('{"level":"info","msg":"using config from file"}\n'
                '{"level":"error","ts":1.5,"msg":"adapting config using caddyfile: File to import not found: foo, '
@@ -584,6 +618,14 @@ class IntegrityTest(unittest.TestCase):
                               ctx.exception.message)
         self.assertEqual(len(self.mutated("ok", loading("automate", ["printer.example.com"]), read_file)), 4)
         self.assert_rule(3, "ok", loading("automate", ["*.localhost"]))
+        # B2-4: relative paths (resolved in a directory of the add-on's own).
+        for entry, kind in (({"certificate": "config/caddy/o.crt", "key": "/config/caddy/o.key"}, "certificate"),
+                            ({"certificate": "/config/caddy/o.crt", "key": "o.key"}, "key")):
+            with self.subTest(entry=entry):
+                with self.assertRaises(customconf.Violation) as ctx:
+                    self.mutated("ok", loading("load_files", [entry]), read_file)
+                self.assertIn(f"the {kind} file {entry[kind]}, which a site of yours loads, is given by a relative "
+                              "path: give files by their absolute path", ctx.exception.message)
 
     def test_rule_3_reads_regular_files_only(self) -> None:
         """B2-2: the check's own reader never blocks on a named pipe and

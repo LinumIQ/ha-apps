@@ -355,29 +355,71 @@ def reload_lock(path: Path | None = None) -> Iterator[None]:
 
 
 _HTTP_ERROR_BODY = re.compile(r"HTTP \d{3}: (\{.*\})\s*$")
+#: Terminal colour codes (Caddy's console log format colours the level).
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+#: A line of Caddy's console log format: time stamp, level, [logger,]
+#: message, [JSON fields] - separated by tabs.
+_CONSOLE_LINE = re.compile(r"^\d{4}/\d\d/\d\d \d\d:\d\d:\d\d(?:\.\d+)?\t(?P<level>[A-Z]+)\t(?P<rest>.*)$")
+_LOGGER_NAME = re.compile(r"[a-z0-9_]+(?:\.[a-z0-9_]+)*")
+
+
+def log_entry(line: str) -> dict[str, str] | None:
+    """A line of Caddy's own log output as {level, msg[, error]} - a JSON
+    line, or a console-format line (time stamp and level dropped, colour
+    codes removed); None for anything else."""
+    line = _ANSI.sub("", line).strip()
+    try:
+        entry = json.loads(line)
+    except ValueError:
+        entry = None
+    if isinstance(entry, dict):
+        out = {"level": str(entry.get("level") or "").lower(), "msg": str(entry.get("msg") or "")}
+        if entry.get("error"):
+            out["error"] = str(entry["error"])
+        return out
+    match = _CONSOLE_LINE.match(line)
+    if not match:
+        return None
+    parts = match.group("rest").split("\t")
+    fields: Any = {}
+    if len(parts) > 1 and parts[-1].startswith("{"):
+        with contextlib.suppress(ValueError):
+            fields = json.loads(parts[-1])
+            parts = parts[:-1]
+    if len(parts) > 1 and _LOGGER_NAME.fullmatch(parts[0]):
+        parts = parts[1:]  # the logger's name
+    out = {"level": match.group("level").lower(), "msg": "\t".join(parts)}
+    if isinstance(fields, dict) and fields.get("error"):
+        out["error"] = str(fields["error"])
+    return out
+
+
+def _error_message(output: str) -> str:
+    """The last "Error:" line or error log line of a Caddy CLI output (with
+    its error field), else its last line - plain text either way ("" for no
+    output)."""
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    for line in reversed(lines):
+        plain = _ANSI.sub("", line).strip()
+        if plain.startswith("Error:"):
+            return plain[len("Error:"):].strip()
+        entry = log_entry(line)
+        if entry and entry["level"] in ("error", "fatal", "panic") and entry["msg"]:
+            return entry["msg"] + (f": {entry['error']}" if entry.get("error") else "")
+    if not lines:
+        return ""
+    last = log_entry(lines[-1])
+    return last["msg"] if last and last["msg"] else _ANSI.sub("", lines[-1]).strip()
 
 
 def caddy_message(output: str, copy_dir: Path = COPY_DIR) -> str:
     """The cause in the output of a failed ``caddy reload`` / ``caddy
     validate``, for a message to the user: its last "Error:" line or error
-    log line (the admin endpoint's {"error": ...} unwrapped), the copies
-    named as the user's files, at most CADDY_MESSAGE_MAX characters. Scrub
-    the header key before (headerauth.scrub)."""
-    lines = [line.strip() for line in output.splitlines() if line.strip()]
-    message = ""
-    for line in reversed(lines):
-        if line.startswith("Error:"):
-            message = line[len("Error:"):].strip()
-            break
-        try:
-            entry = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(entry, dict) and entry.get("level") == "error" and entry.get("msg"):
-            message = str(entry["msg"]) + (f": {entry['error']}" if entry.get("error") else "")
-            break
-    if not message:
-        message = lines[-1] if lines else "no message"
+    log line (JSON or console format, without time stamp, level and colour
+    codes; the admin endpoint's {"error": ...} unwrapped), the copies named
+    as the user's files, at most CADDY_MESSAGE_MAX characters. Scrub the
+    header key before (headerauth.scrub)."""
+    message = _error_message(output) or "no message"
     body = _HTTP_ERROR_BODY.search(message)
     if body:
         with contextlib.suppress(ValueError, AttributeError):
@@ -426,6 +468,7 @@ def drop(cause: str, *, when: str = "reload", caddyfile: Path | None = None, fal
 # Caddy's messages
 # ---------------------------------------------------------------------------
 
+_RELATIVE_OPEN = re.compile(r"open (?P<path>[^/\s\"'][^\s:]*): no such file or directory")
 _GENERATED = re.compile(r"(?:, )?at /etc/caddy/Caddyfile(?:\.[a-z]+)?:\d+")
 _COPY = re.compile(r"/etc/caddy/custom/(global|site|lan|sites)\.caddy")
 
@@ -433,26 +476,20 @@ _COPY = re.compile(r"/etc/caddy/custom/(global|site|lan|sites)\.caddy")
 def describe_error(output: str, copy_dir: Path = COPY_DIR) -> tuple[str, str | None]:
     """A user-facing text of a failed ``caddy validate`` with custom files,
     and the file it names (None if Caddy names only the generated file)."""
-    lines = [line.strip() for line in output.splitlines() if line.strip()]
-    message = ""
-    for line in reversed(lines):
-        try:
-            entry = json.loads(line)
-        except ValueError:
-            entry = None
-        if isinstance(entry, dict) and entry.get("level") == "error" and entry.get("msg"):
-            message = str(entry["msg"])
-            break
-        if line.startswith("Error:"):
-            message = line[len("Error:"):].strip()
-            break
-    if not message:
-        message = lines[-1] if lines else "caddy validate failed"
+    message = _error_message(output) or "caddy validate failed"
+    relative = _RELATIVE_OPEN.search(message)
     copy = re.escape(str(copy_dir).rstrip("/"))
     named = re.search(copy + r"/(global|site|lan|sites)\.caddy", message)
     message = re.sub(copy + r"/((?:global|site|lan|sites)\.caddy)", r"caddy/\1", message)
     message = re.sub(r" import chain \[[^\]]*\]", "", message)
-    if named:
+    if relative:
+        # B2-4: a file given by a relative path.
+        message = _GENERATED.sub("", message)
+        text = (f"a snippet refers to {relative.group('path')}, a relative path: give files by their absolute "
+                "path (for example /config/caddy/...) - a relative path is resolved in a directory of the "
+                f"add-on's own that holds none of your files. Caddy's message: {message}")
+        file = f"{named.group(1)}.caddy" if named else None
+    elif named:
         message = _GENERATED.sub("", message)
         text = message
         file = f"{named.group(1)}.caddy"
@@ -762,6 +799,12 @@ def _check_certificates(adapted: dict[str, Any], reference: dict[str, Any], doma
                 entry = entry if isinstance(entry, dict) else {}
                 if loader == "load_files":
                     what = f"the certificate file {entry.get('certificate')}"
+                    for kind in ("certificate", "key"):
+                        if not os.path.isabs(str(entry.get(kind) or "")):
+                            raise Violation(3, f"the {kind} file {entry.get(kind)}, which a site of yours loads, is "
+                                               "given by a relative path: give files by their absolute path - a "
+                                               "relative path is resolved in a directory of the add-on's own that "
+                                               "holds none of your files", file)
                     try:
                         pem = read_file(str(entry.get("certificate")))
                     except NotRegularFile:
