@@ -169,15 +169,15 @@ CERT = public_cert.Certificate(
 OBTAIN_ERROR = public_cert.AcmeEvent(
     ts=NOW - 300, logger="tls.obtain", level="error", msg="could not get certificate from issuer",
     identifier=DOMAIN, problem_type="connection",
-    error="86.62.32.88: Timeout during connect (likely firewall problem)")
+    error="203.0.113.10: Timeout during connect (likely firewall problem)")
 CHALLENGES = [
     public_cert.AcmeEvent(ts=NOW - 305, logger="http.acme_client", level="error", msg="challenge failed",
                           identifier=DOMAIN, challenge_type="http-01", problem_type="connection",
-                          error=f"86.62.32.88: Fetching http://{DOMAIN}/.well-known/acme-challenge/y0_Ss4VQ: "
+                          error=f"203.0.113.10: Fetching http://{DOMAIN}/.well-known/acme-challenge/test-token: "
                                 "Timeout during connect (likely firewall problem)"),
     public_cert.AcmeEvent(ts=NOW - 302, logger="http.acme_client", level="error", msg="challenge failed",
                           identifier=DOMAIN, challenge_type="tls-alpn-01", problem_type="connection",
-                          error="86.62.32.88: Error getting validation data"),
+                          error="203.0.113.10: Error getting validation data"),
 ]
 RETRY = public_cert.AcmeEvent(ts=NOW - 299, logger="tls.obtain", level="error", msg="will retry",
                               identifier=DOMAIN, attempt=3, retrying_in=600)

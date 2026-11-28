@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import unittest
@@ -240,11 +241,104 @@ class ProcessOnceTest(unittest.TestCase):
         self.assertFalse(any("persistent_notification" in path for _, path, _ in self.calls))
 
 
+class CustomConfigWatchTest(unittest.TestCase):
+    """2.3.0: the notification about rejected custom snippets - raised while
+    the state is rejected (at the start, or when a reload dropped them at
+    run time: B-2), retried until sent, once per state; otherwise a leftover
+    dismissed once; it names both folder names (C-1)."""
+
+    REJECTED = {
+        "state": "rejected", "files": [{"name": "site.caddy", "bytes": 3}], "ignored": [],
+        "error": "File to import not found: x, at caddy/site.caddy:2", "error_file": "site.caddy",
+        "folder": "app_configs/2644ca2c_caddy_mtls/caddy"}
+
+    def setUp(self) -> None:
+        self.calls: list[tuple[str, str, dict]] = []
+        self.ok = True
+
+        def fake_request(method: str, path: str, payload: dict | None = None) -> bool:
+            self.calls.append((method, path, payload or {}))
+            return self.ok
+
+        patcher = mock.patch.object(monitor, "_supervisor_request", side_effect=fake_request)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.state = self.tmp / "custom.json"
+        patcher = mock.patch.object(monitor.customconf, "STATE_FILE", self.state)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.watch = monitor.CustomConfigWatch()
+
+    def paths(self) -> list[str]:
+        return [p.rsplit("/", 1)[-1] for _, p, _ in self.calls]
+
+    def test_rejected_raises_with_both_folder_names(self) -> None:
+        self.state.write_text(json.dumps(self.REJECTED))
+        self.ok = False
+        self.watch.check(now=0.0)
+        self.assertFalse(self.watch.done)  # retried until the Supervisor took it
+        self.ok = True
+        self.watch.check(now=1.0)  # not before the retry interval
+        self.assertEqual(len(self.calls), 1)
+        self.watch.check(now=monitor.CUSTOM_RETRY_SECONDS)
+        self.assertTrue(self.watch.done)
+        method, path, payload = self.calls[-1]
+        self.assertTrue(path.endswith("/persistent_notification/create"))
+        self.assertEqual(payload["notification_id"], "caddy_mtls_custom_config")
+        self.assertIn("`app_configs/2644ca2c_caddy_mtls/caddy/`", payload["message"])
+        self.assertIn("`addon_configs/2644ca2c_caddy_mtls/caddy/` in apps that still use the old name",
+                      payload["message"])
+        self.assertIn("caddy/site.caddy:2", payload["message"])
+        self.assertIn("Correct the file and restart the app.", payload["message"])
+        self.watch.check(now=1000.0)  # sent: no repeat
+        self.assertEqual(len(self.calls), 2)
+
+    def test_not_rejected_dismisses_once(self) -> None:
+        self.state.write_text(json.dumps({"state": "loaded", "files": [], "ignored": [], "folder": None}))
+        self.watch.check(now=0.0)
+        self.assertTrue(self.watch.done)
+        self.assertEqual([p for _, p, _ in self.calls], ["/core/api/services/persistent_notification/dismiss"])
+        self.watch.check(now=1000.0)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_a_state_that_turns_rejected_at_run_time_raises_once(self) -> None:
+        """B-2: a reload dropped the snippets after the start."""
+        self.state.write_text(json.dumps({"state": "loaded", "files": [{"name": "sites.caddy", "bytes": 9}],
+                                          "ignored": [], "folder": "app_configs/local_caddy_mtls/caddy"}))
+        self.watch.check(now=0.0)
+        self.assertEqual(self.paths(), ["dismiss"])
+        for now in (5.0, 10.0):
+            self.watch.check(now=now)
+        self.assertEqual(self.paths(), ["dismiss"])
+        dropped = dict(self.REJECTED, error="Caddy could not reload with your custom files while applying a "
+                       "change (open /config/caddy/o.key: no such file or directory). To apply the change the "
+                       "add-on dropped them; they are read again at the next start.", error_file=None,
+                       dropped="reload", dropped_at=1795789792.5)
+        self.state.write_text(json.dumps(dropped))
+        self.ok = False
+        self.watch.check(now=12.0)  # noticed at once, the Supervisor does not take it
+        self.assertEqual(self.paths(), ["dismiss", "create"])
+        self.ok = True
+        self.watch.check(now=13.0)
+        self.assertEqual(len(self.calls), 2)
+        self.watch.check(now=12.0 + monitor.CUSTOM_RETRY_SECONDS)
+        self.assertEqual(self.paths(), ["dismiss", "create", "create"])
+        message = self.calls[-1][2]["message"]
+        self.assertIn("while applying a change", message)
+        self.assertIn("Correct the file (or the file it refers to) and restart the app.", message)
+        self.assertIn("any more while the app applied a change, so the app dropped them until its next start", message)
+        for now in (100.0, 200.0):
+            self.watch.check(now=now)
+        self.assertEqual(len(self.calls), 3)
+
+
 class PublicCertWatchTest(unittest.TestCase):
     """The public certificate notification (fast lane, notify after 2
     minutes, dismiss when the certificate exists) with a mocked Supervisor."""
 
-    DOMAIN = "ladyfit.duckdns.org"
+    DOMAIN = "home.example.com"
 
     def setUp(self) -> None:
         self.calls: list[tuple[str, str, dict]] = []
@@ -275,7 +369,7 @@ class PublicCertWatchTest(unittest.TestCase):
         error = json.dumps({
             "level": "error", "ts": now - 1, "logger": "tls.obtain",
             "msg": "could not get certificate from issuer", "identifier": self.DOMAIN,
-            "error": "HTTP 400 urn:ietf:params:acme:error:connection - 86.62.32.88: Error getting validation data",
+            "error": "HTTP 400 urn:ietf:params:acme:error:connection - 203.0.113.10: Error getting validation data",
         })
         cert = None
         if with_cert:
@@ -311,7 +405,7 @@ class PublicCertWatchTest(unittest.TestCase):
         warnings = [r for r in logs.records if r.levelname == "WARNING"]
         self.assertEqual(len(warnings), 1, logs.output)  # one line per state change
         self.assertIn(self.DOMAIN, warnings[0].getMessage())
-        self.assertIn("86.62.32.88: Error getting validation data", warnings[0].getMessage())
+        self.assertIn("203.0.113.10: Error getting validation data", warnings[0].getMessage())
         self.assertEqual(watch.state, "notified")
 
         creates = self.creates()
@@ -321,7 +415,7 @@ class PublicCertWatchTest(unittest.TestCase):
         self.assertEqual(note["title"], f"Caddy mTLS: no public certificate for {self.DOMAIN}")
         for text in (
             "port 8080", "port 8443", f"{self.DOMAIN} resolves to your public IP",
-            "connection: 86.62.32.88: Error getting validation data",
+            "connection: 203.0.113.10: Error getting validation data",
             "restart the app to retry immediately",
         ):
             with self.subTest(text=text):

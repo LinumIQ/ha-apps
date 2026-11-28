@@ -55,7 +55,7 @@ _SUCCESS_MESSAGES = {"certificate obtained successfully", "certificate renewed s
 _ERROR_LEVELS = {"error", "fatal", "panic", "dpanic"}
 _ACME_ERROR_PREFIX = "urn:ietf:params:acme:error:"
 # An ACME problem as certmagic prints it in "error" strings, e.g.
-# "HTTP 400 urn:ietf:params:acme:error:connection - 86.62.32.88: Error getting
+# "HTTP 400 urn:ietf:params:acme:error:connection - 203.0.113.10: Error getting
 # validation data" (optionally after "[<domain>] Obtain: ").
 _PROBLEM_IN_TEXT = re.compile(
     r"HTTP \d+ urn:ietf:params:acme:error:(?P<type>[A-Za-z0-9_.-]+) - (?P<detail>.*)", re.S
@@ -86,6 +86,24 @@ class Runtime:
     lan_host_port: int | None = None
     lan_state: str = "off"
     lan_refused: tuple[str, ...] = ()
+    # The add-on's slug = its folder in Home Assistant's app configuration
+    # folders (app_configs/<slug>/, /config inside the add-on; since 2.3.0).
+    # "" outside Supervisor.
+    config_slug: str = ""
+
+    @property
+    def config_folder(self) -> str:
+        """The add-on's configuration folder as the official Samba share,
+        Terminal & SSH and File editor apps of today show it
+        (``app_configs/<slug>``), or "" when the slug is unknown."""
+        return f"app_configs/{self.config_slug}" if self.config_slug else ""
+
+    @property
+    def config_folder_legacy(self) -> str:
+        """The same folder in apps that still map Supervisor's legacy name
+        (``addon_configs/<slug>``: older versions of those apps, and e.g.
+        the community Advanced SSH & Web Terminal), or ""."""
+        return f"addon_configs/{self.config_slug}" if self.config_slug else ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Runtime:
@@ -107,7 +125,16 @@ class Runtime:
             lan_host_port=port(data.get("lan_host_port")),
             lan_state=lan_state if lan_state in ("on", "off", "unknown") else "off",
             lan_refused=tuple(str(a) for a in refused) if isinstance(refused, list) else (),
+            config_slug=_slug(data.get("config_slug")),
         )
+
+
+_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
+
+
+def _slug(value: Any) -> str:
+    """A slug from runtime.json, or "" (missing or malformed)."""
+    return value if isinstance(value, str) and _SLUG_RE.fullmatch(value) else ""
 
 
 @dataclass(frozen=True)

@@ -32,6 +32,11 @@ raised; another one when the add-on starts hiding the visitor addresses at
 run time because the upstream stopped trusting it; each is dismissed when
 that is over.
 
+When the custom Caddyfile snippets are rejected (2.3.0, customconf.py: at
+the start, or dropped at run time because Caddy could not reload with them),
+a persistent notification says so (retried until sent); at a start where
+they are not rejected a leftover of an earlier run is dismissed.
+
 Failure to reach the Supervisor never crashes the loop - we log and try
 again on the next iteration.
 
@@ -56,6 +61,7 @@ from typing import Any
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+import customconf
 import public_cert
 import upstream
 
@@ -97,6 +103,11 @@ UPSTREAM_FAST_INTERVAL = float(os.environ.get("CADDY_MTLS_UPSTREAM_FAST_SECONDS"
 UPSTREAM_FAST_WINDOW = 600.0
 UPSTREAM_NOTIFICATION_ID = "caddy_mtls_upstream_refuses"
 UPSTREAM_HIDDEN_NOTIFICATION_ID = "caddy_mtls_upstream_addresses_hidden"
+# Custom Caddyfile snippets rejected (2.3.0); retried this often until the
+# Supervisor took the notification (or its dismissal). The state is read at
+# every pass of the loop (it can change at run time).
+CUSTOM_NOTIFICATION_ID = "caddy_mtls_custom_config"
+CUSTOM_RETRY_SECONDS = float(os.environ.get("CADDY_MTLS_CUSTOM_RETRY_SECONDS", "60"))
 
 # Tracks which (cert_id, threshold_days) pairs we've already notified for
 # in the current state, so we don't spam HA on every loop iteration.
@@ -679,6 +690,80 @@ class UpstreamWatch:
                 self._hidden_dismiss_pending = False
 
 
+def custom_notification(state: dict[str, Any]) -> tuple[str, str]:
+    """Title and Markdown text of the "custom snippets not in use"
+    notification."""
+    folder = state.get("folder") or "caddy/ in the app's configuration folder"
+    legacy = customconf.legacy_folder(state.get("folder"))
+    where = f"`{folder}/`" + (f" (`{legacy}/` in apps that still use the old name)" if legacy else "")
+    error = str(state.get("error") or "no message")[:customconf.ERROR_MAX]
+    if state.get("dropped_at"):
+        first = (f"Caddy could not load your custom Caddyfile snippets in {where} any more while the app applied "
+                 "a change, so the app dropped them until its next start and runs with its own configuration "
+                 "only - the change took effect.")
+    else:
+        first = (f"Caddy or the add-on's integrity check rejected your custom Caddyfile snippets in {where}, "
+                 "so the app runs with its own configuration only - one rejected file drops all of them.")
+    lines = [
+        first,
+        "",
+        "Message:",
+        "",
+        "```",
+        error,
+        "```",
+        "",
+        ("Correct the file (or the file it refers to) and restart the app." if state.get("dropped_at")
+         else "Correct the file and restart the app.")
+        + ' The app\'s web interface (Caddy mTLS, card "Custom Caddy configuration") shows the details.',
+    ]
+    return "Caddy mTLS: your custom Caddyfile snippets are not in use", "\n".join(lines)
+
+
+class CustomConfigWatch:
+    """The notification about rejected custom snippets. The state is read
+    at every call: rejected at the start, or later when a reload dropped the
+    snippets (customconf.drop). One call to the Supervisor per state (the
+    state, its error and the run-time marker), retried every
+    CUSTOM_RETRY_SECONDS until it took it: raise it while rejected,
+    otherwise dismiss a leftover of an earlier run."""
+
+    def __init__(self) -> None:
+        #: The state the Supervisor has taken the call for, the state seen
+        #: last, and when to try again after a failed call.
+        self.handled: tuple[Any, ...] | None = None
+        self._seen: tuple[Any, ...] | None = None
+        self._next_try = 0.0
+
+    @property
+    def done(self) -> bool:
+        """Nothing owed for the state seen last."""
+        return self.handled is not None and self.handled == self._seen
+
+    def check(self, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        state = customconf.read_state()
+        rejected = state.get("state") == "rejected"
+        key = (True, str(state.get("error") or ""), state.get("dropped_at")) if rejected else (False,)
+        if key != self._seen:
+            self._seen = key
+            self._next_try = 0.0
+        if key == self.handled or now < self._next_try:
+            return
+        if rejected:
+            title, message = custom_notification(state)
+            sent = _send_notification(title, message, CUSTOM_NOTIFICATION_ID)
+            if sent:
+                LOG.warning("Custom Caddyfile snippets not in use (%s): notification raised.",
+                            "dropped at run time" if state.get("dropped_at") else "rejected at the start")
+        else:
+            sent = _dismiss_notification(CUSTOM_NOTIFICATION_ID)
+        if sent:
+            self.handled = key
+        else:
+            self._next_try = now + CUSTOM_RETRY_SECONDS
+
+
 def main() -> None:
     LOG.info(
         "cert-monitor starting (interval=%ds thresholds=%s state=%s)",
@@ -689,6 +774,7 @@ def main() -> None:
     started = time.monotonic()
     watch = PublicCertWatch(started)
     upstream_watch = UpstreamWatch(started)
+    custom_watch = CustomConfigWatch()
     # On startup, Home Assistant Core may not yet be ready (Supervisor
     # returns 502 Bad Gateway while HA boots). Retry quickly with
     # exponential backoff until the first publication succeeds, instead
@@ -735,7 +821,14 @@ def main() -> None:
             except Exception as exc:  # noqa: BLE001 - never crash the loop
                 LOG.exception("upstream check failed: %s", exc)
                 next_upstream = now + UPSTREAM_CONTROL_INTERVAL
-        time.sleep(max(0.5, min(next_expiry, next_public, next_upstream) - time.monotonic()))
+        # Every pass (the upstream watch wakes the loop every few seconds):
+        # a reload by the panel can drop the custom files at any time.
+        try:
+            custom_watch.check(now)
+        except Exception as exc:  # noqa: BLE001 - never crash the loop
+            LOG.exception("custom configuration check failed: %s", exc)
+        wake = min(next_expiry, next_public, next_upstream, now + CUSTOM_RETRY_SECONDS)
+        time.sleep(max(0.5, wake - time.monotonic()))
 
 
 if __name__ == "__main__":

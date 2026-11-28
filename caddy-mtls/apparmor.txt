@@ -49,12 +49,31 @@ profile caddy_mtls flags=(attach_disconnected,mediate_deleted) {
   /usr/lib/cert-mgr/** r,
   /usr/lib/python3*/** mr,
   /etc/caddy/** r,
+  # Written at run time: the forwarding snippet (upstream.py), the header
+  # key (0600) and the list of active client certificates (headerauth.py,
+  # caddyctl.py; since 2.3.0), each through a temporary file + rename.
+  /etc/caddy/forwarded-headers.caddy rw,
+  /etc/caddy/.forwarded-headers.caddy.* rw,
+  /etc/caddy/header-auth.key rw,
+  /etc/caddy/.header-auth.key.* rw,
+  /etc/caddy/client-fingerprints.caddy rw,
+  /etc/caddy/.client-fingerprints.caddy.* rw,
+  /etc/caddy/Caddyfile rw,
+  # Custom Caddyfile snippets (2.3.0): the add-on's own rendering (the
+  # integrity check's reference, and the fallback a reload switches to by
+  # renaming it to the Caddyfile), the checked copies (customconf.py) that
+  # Caddy imports. The reload lock is in /run/caddy-mtls/ (above).
+  /etc/caddy/Caddyfile.own rw,
+  /etc/caddy/custom/ rw,
+  /etc/caddy/custom/* rw,
 
   # Persistent add-on data and config
   /data/** rwk,
   /ssl/** rwk,
   /share/** rwk,
   /config/** rwk,
+  # (includes /config/caddy/: the user's custom snippets are read - lstat
+  # first, regular files only - and README.txt is written there.)
 
   # Deny dangerous operations
   deny /sys/kernel/security/** wl,

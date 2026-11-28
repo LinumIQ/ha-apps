@@ -25,7 +25,7 @@ sys.path.insert(0, str(CERT_MGR))
 
 import public_cert  # noqa: E402
 
-DOMAIN = "ladyfit.duckdns.org"
+DOMAIN = "home.example.com"
 
 
 def owner_log(t0: float) -> list[str]:
@@ -34,11 +34,11 @@ def owner_log(t0: float) -> list[str]:
     problem_http = {
         "type": "urn:ietf:params:acme:error:connection",
         "title": "",
-        "detail": f"86.62.32.88: Fetching http://{DOMAIN}/.well-known/acme-challenge/y0_Ss4VQ: Error getting validation data",
+        "detail": f"203.0.113.10: Fetching http://{DOMAIN}/.well-known/acme-challenge/test-token: Error getting validation data",
         "instance": "",
         "subproblems": None,
     }
-    problem_alpn = dict(problem_http, detail="86.62.32.88: Error getting validation data")
+    problem_alpn = dict(problem_http, detail="203.0.113.10: Error getting validation data")
     lines = [
         {"level": "info", "ts": t0 + 0.5, "logger": "tls.obtain", "msg": "obtaining certificate", "identifier": DOMAIN},
         {"level": "info", "ts": t0 + 2.0, "logger": "http.acme_client", "msg": "trying to solve challenge",
@@ -52,9 +52,9 @@ def owner_log(t0: float) -> list[str]:
          "identifier": DOMAIN, "challenge_type": "tls-alpn-01", "problem": problem_alpn},
         {"level": "error", "ts": t0 + 8.7, "logger": "tls.obtain", "msg": "could not get certificate from issuer",
          "identifier": DOMAIN, "issuer": "acme-v02.api.letsencrypt.org-directory",
-         "error": "HTTP 400 urn:ietf:params:acme:error:connection - 86.62.32.88: Error getting validation data"},
+         "error": "HTTP 400 urn:ietf:params:acme:error:connection - 203.0.113.10: Error getting validation data"},
         {"level": "error", "ts": t0 + 9.0, "logger": "tls.obtain", "msg": "will retry",
-         "error": f"[{DOMAIN}] Obtain: HTTP 400 urn:ietf:params:acme:error:connection - 86.62.32.88: Error getting validation data",
+         "error": f"[{DOMAIN}] Obtain: HTTP 400 urn:ietf:params:acme:error:connection - 203.0.113.10: Error getting validation data",
          "attempt": 1, "retrying_in": 60, "elapsed": 9.1, "max_duration": 2592000},
     ]
     return [json.dumps(line) for line in lines]
@@ -93,8 +93,8 @@ class ParseEventTest(unittest.TestCase):
         verdict = evs[5]
         # The ACME problem inside the error string is split into type + detail.
         self.assertEqual(verdict.problem_type, "connection")
-        self.assertEqual(verdict.error, "86.62.32.88: Error getting validation data")
-        self.assertEqual(verdict.text, "connection: 86.62.32.88: Error getting validation data")
+        self.assertEqual(verdict.error, "203.0.113.10: Error getting validation data")
+        self.assertEqual(verdict.text, "connection: 203.0.113.10: Error getting validation data")
         retry = evs[6]
         self.assertEqual(retry.retrying_in, 60.0)
         self.assertEqual(retry.attempt, 1)
@@ -147,7 +147,7 @@ class EvaluateTest(unittest.TestCase):
         self.assertEqual(status.state, "missing")
         assert status.last_error is not None
         self.assertEqual(status.last_error.msg, "could not get certificate from issuer")
-        self.assertEqual(status.last_error.text, "connection: 86.62.32.88: Error getting validation data")
+        self.assertEqual(status.last_error.text, "connection: 203.0.113.10: Error getting validation data")
         self.assertEqual([c.challenge_type for c in status.challenges], ["http-01", "tls-alpn-01"])
         self.assertIn(f"Fetching http://{DOMAIN}/", status.challenges[0].text)
         self.assertEqual(status.next_attempt, started + 9.0 + 60)
@@ -294,6 +294,33 @@ class StorageTest(unittest.TestCase):
                 public_cert.RUNTIME_FILE = original
             self.assertEqual(status.state, "ok")
             self.assertEqual(status.certificate.issuer if status.certificate else None, "Let's Encrypt, Inc. (E7)")
+
+
+class RuntimeTest(unittest.TestCase):
+    def test_config_slug_and_folder(self) -> None:
+        """2.3.0: the add-on's folder in app_configs from the Supervisor's
+        slug; unknown (outside Supervisor, a runtime.json of 2.2.0, garbage)
+        -> no folder."""
+        cases = {
+            "2644ca2c_caddy_mtls": "app_configs/2644ca2c_caddy_mtls",
+            "local_caddy_mtls": "app_configs/local_caddy_mtls",
+            None: "",
+            "": "",
+            "null": "app_configs/null",  # init-caddy never writes "null" (filtered there)
+            "../etc": "",
+            "a/b": "",
+            "x" * 101: "",
+            7: "",
+        }
+        for slug, folder in cases.items():
+            with self.subTest(slug=slug):
+                data = {"domain": DOMAIN, "started_at": 1.0}
+                if slug is not None:
+                    data["config_slug"] = slug
+                rt = public_cert.Runtime.from_dict(data)
+                self.assertEqual(rt.config_folder, folder)
+                # C-1: the same folder under the legacy name.
+                self.assertEqual(rt.config_folder_legacy, folder.replace("app_configs/", "addon_configs/", 1))
 
 
 if __name__ == "__main__":

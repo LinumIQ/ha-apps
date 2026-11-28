@@ -15,6 +15,8 @@ This add-on provides a Caddy reverse proxy with mutual TLS (mTLS) authentication
 - 🚦 **Public certificate status** - the web UI shows whether the Let's Encrypt certificate exists; if not, the last error and a port-forwarding checklist (plus a Home Assistant notification)
 - 🏠 **HTTPS at home without a client certificate** (since 2.2.0, optional) - a second port for the local network, same domain and certificate, for private addresses only
 - 🔁 **Works without editing Home Assistant** (since 2.2.0) - the add-on asks Home Assistant whether it trusts it as a reverse proxy and adapts; the web UI shows what Home Assistant sees and how to pass real visitor addresses on
+- 🔑 **Header authentication** (since 2.3.0, optional) - for clients that cannot present a client certificate but can send one fixed header (for example a watch app): a pre-shared key on the same address
+- 🧩 **Custom Caddyfile snippets** (since 2.3.0, for experts) - global options, extra directives for the two sites and extra sites, checked at every start
 
 ## Requirements
 
@@ -187,8 +189,10 @@ the header):
 - **Home Assistant does not trust the add-on, mTLS on** (the default): the
   add-on removes the forwarding headers. It works, and **Home Assistant sees
   every visitor under the add-on's own address** (for example
-  `172.30.33.3`). Visitors on the public port have a client certificate,
-  and visitors on the [local-network port](#https-in-your-local-network-without-a-client-certificate-since-220)
+  `172.30.33.3`). Visitors on the public port have a client certificate
+  (or, with [header authentication](#header-authentication-since-230), the
+  header key - treated like a certificate here), and visitors on the
+  [local-network port](#https-in-your-local-network-without-a-client-certificate-since-220)
   come from private addresses, so this is an acceptable default, but it
   has consequences, which the web interface lists:
   - Logins, the "Login attempt failed" notifications and Home Assistant's
@@ -196,13 +200,14 @@ the header):
   - Home Assistant counts that address as a device in your local network:
     users marked **Can only log in from the local network** can log in, and
     webhooks marked **Only accessible from the local network** accept
-    requests, from every device with a client certificate.
+    requests, from every device with a client certificate (or the header
+    key).
   - If you set a limit of login attempts (IP banning), too many failed
     logins ban the add-on's address - that is everyone who uses the add-on -
     until you delete it from `ip_bans.yaml` and restart Home Assistant.
   - If you use the trusted networks login provider and its networks include
-    the add-on's address, every device with a client certificate logs in
-    without a password.
+    the add-on's address, every device with a client certificate (or the
+    header key) logs in without a password.
 - **Home Assistant does not trust the add-on, mTLS off**: the addresses are
   still passed on, so every request is answered `400: Bad Request`. Without
   client certificates the visitors are anyone on the internet; they must
@@ -307,9 +312,11 @@ network works as well.
 | `mtls_enabled`              | `true`           | Enable client certificate authentication                                                                                |
 | `client_names`              | `["user"]`       | Client certificate names; a name the add-on does not know yet gets a certificate at every start (see [Adding New Users](#adding-new-users)) |
 | `client_cert_password`      | `LinumIQ`        | Password for .p12 files - set your own; changing it re-encrypts the existing bundles at the next start (see [Changing the certificate password](#changing-the-certificate-password)) |
-| `log_level`                 | `info`           | Add-on / Caddy log verbosity (`trace`, `debug`, `info`, `notice`, `warning`, `error`, `fatal`); `debug` and `trace` also turn the access logs on |
+| `log_level`                 | `info`           | Add-on / Caddy log verbosity (`trace`, `debug`, `info`, `notice`, `warning`, `error`, `fatal`); `debug` and `trace` also turn the access logs on. Since 2.3.0 `trace` no longer turns on bashio's own trace output, which printed the whole options - passwords and keys included |
 | `access_log`                | `false`          | Log every proxied request (Caddy's access log, ~1.5 KB per request); see [Logs](#logs)                                  |
 | `forwarded_headers`         | `auto`           | Whether Home Assistant gets each visitor's own address (`auto`, `always`, `never`; `never` only with `mtls_enabled: true`); see [Home Assistant Core Configuration](#home-assistant-core-configuration) |
+| `header_auth_name`          | `X-Custom-PSK`   | The header that carries the key (since 2.3.0); see [Header authentication](#header-authentication-since-230) |
+| `header_auth_key`           | (empty)          | The pre-shared key: 32-256 characters (`A-Z a-z 0-9 . _ ~ + / = -`); empty = header authentication off (since 2.3.0) |
 | `cert_expiry_warn_days`     | `[30, 14, 7, 1]` | List of days-before-expiry thresholds at which to fire a notification (one notification per crossed threshold per cert) |
 | `cert_check_interval_hours` | `6`              | How often the `cert-monitor` service polls certificate metadata and publishes sensor states (`1`-`168`)                 |
 
@@ -405,6 +412,238 @@ no longer work with the add-on.
    create a token with **Read & Write** permission
 3. Copy the token to `dns_api_token`
 
+## Header authentication (since 2.3.0)
+
+Some clients cannot present a client certificate, but can add one fixed HTTP
+header to every request - for example a smartwatch app with settings like
+"additional header: key / value". With a pre-shared key set, the add-on
+accepts such requests on the same address and port as the client
+certificates:
+
+| `mtls_enabled` | `header_auth_key` | A request is passed on when ... |
+| -------------- | ----------------- | ------------------------------- |
+| `true`         | empty (default)   | the TLS handshake presented an active client certificate (as up to 2.2.0) |
+| `true`         | set               | the connection presented an active client certificate, **or** the request carries the header `header_auth_name` with exactly the key |
+| `false`        | set               | the request carries the header with exactly the key |
+| `false`        | empty             | always (the add-on protects nothing) |
+
+Every other request gets `403 Forbidden` (with mTLS on: `403 Forbidden: this
+site needs a client certificate.` - the text does not name the header). The
+local-network port and the plain-HTTP port keep their own rules.
+
+**Use it only for a client that cannot use a client certificate.** A
+certificate is the stronger protection (see "The attack surface" below).
+
+### The options
+
+- `header_auth_name` (default `X-Custom-PSK`): the header's name, 1-64
+  characters - a letter first, then letters, digits or `-`. Names that
+  browsers, Home Assistant or the proxy use are refused (for example
+  `Authorization`, `Cookie`, `Host`, `Origin`, `Upgrade`, `X-Real-IP` and
+  every name starting with `Accept`, `Content-`, `Sec-`, `Proxy-`, `If-`,
+  `Cache-`, `X-Forwarded-`, `X-Hass`, `X-Ingress`, `X-Supervisor`, `X-HA-` or
+  `CF-`).
+- `header_auth_key` (default empty: off): 32 to 256 characters from
+  `A-Z a-z 0-9 . _ ~ + / = -`. Nothing is trimmed: a key with a blank or a
+  line break refuses the start, as do other characters (outside this set a
+  value could act as a wildcard or a placeholder in Caddy's header matcher).
+  Messages name at most the key's length, never the key.
+
+**Making a key:** the card **Header authentication** in the web interface
+has **Suggest a key** - it creates one in your browser from 32 random bytes
+(43 characters); nothing is sent to the add-on or stored. Or run
+`openssl rand -base64 32` (44 characters). Copy the key into
+`header_auth_key` and into the client's settings, save, restart the add-on.
+
+**Changing the key:** enter the new one, restart the add-on, change it in
+every client. **Switching it off:** empty `header_auth_key` and restart.
+
+### How the add-on handles the header
+
+- The value is compared exactly and case-sensitively: no wildcard, prefix or
+  placeholder ever applies; an empty or missing header never matches. The
+  header's name is case-insensitive. If a client sends the header twice, one
+  matching value is enough. Over HTTP/2 a trailing blank makes the value a
+  different one (HTTP/1.1 drops trailing blanks before the comparison).
+- The header is removed from the request before Home Assistant (or the
+  upstream of a custom snippet) receives it - also on the local-network
+  port.
+- With mTLS on, a client certificate that **is** presented is checked in the
+  TLS handshake as before (signed by the add-on's CA, valid, active): a
+  revoked or unknown certificate ends the connection, also for a request
+  that would carry the key. A client without a certificate completes the
+  handshake and meets the key check.
+- The forwarding headers follow the same rules as for visitors with a client
+  certificate (`forwarded_headers` depends on `mtls_enabled` only).
+- **Logs:** while a key is set, no line of the add-on's log contains request
+  headers - Caddy's access log and the error line of a failed request
+  normally list them - also when a client sends the key under a misspelt
+  header name. With `access_log: true` each request line has a field `auth`
+  instead: `certificate`, `header key`, `refused: no certificate, header
+  absent`, `refused: no certificate, header present with a wrong value` or
+  `refused: certificate not in the active list` (without mTLS: `refused:
+  header absent` / `refused: header present with a wrong value`).
+- The key is kept in the add-on's options (by the Supervisor, and included
+  in backups of the add-on, like `client_cert_password` and
+  `dns_api_token`) and, while the add-on runs, inside its container (in the
+  option cache of the add-on's scripts, and in a file with mode 0600 that
+  Caddy reads per request). It is not in the generated Caddyfile, Caddy's
+  saved configuration, the log, the web interface (which shows only its
+  length) or a notification.
+
+### Visitors without a certificate, browsers
+
+Without a key, a visitor without a client certificate fails in the TLS
+handshake. With a key, the handshake completes for everybody and the add-on
+answers `403 Forbidden`. A browser whose certificate prompt was dismissed
+therefore shows that 403 page instead of a connection error, and may keep
+doing so: browsers can remember the choice (Chrome until it is restarted,
+Firefox when "remember this decision" was ticked - not tested by us).
+Restart the browser to be asked again.
+
+### Example: a watch app
+
+In the app's settings: the URL `https://home.example.com`, the additional
+header's name `X-Custom-PSK` (your `header_auth_name`) and as its value the
+key. The app has to send the header with **every** request. Requests it
+makes without it are refused like any other - the add-on makes no exception
+for any path. An app that renews its access token (`/auth/token`) or logs in
+through the phone's browser without the header therefore fails there: give
+such an app a Home Assistant **long-lived access token** (your user profile
+in Home Assistant, tab Security, "Long-lived access tokens") instead of a
+login.
+
+### Without mTLS
+
+With `mtls_enabled: false` and a key, the key is the only protection in
+front of Home Assistant's login page; the log and the card say so.
+
+### The attack surface
+
+Without a key, nobody without a client certificate gets past the TLS
+handshake: Caddy reads no HTTP request of theirs. With a key, the handshake
+completes for everybody, so Caddy's HTTP handling (HTTP/1.1 and HTTP/2) is
+reachable from the internet and the key check decides (HTTP/3 is not
+reachable: the add-on publishes TCP ports only, no UDP port). The key
+is a static secret sent in every request and seen by everything on the way
+(the phone app, a TLS-inspecting proxy); Caddy compares it with a plain
+string comparison and limits no attempts - hence the minimum of 32
+characters (the suggestion has 256 random bits). Home Assistant's own login
+and access tokens still stand behind it.
+
+## Custom Caddyfile snippets (since 2.3.0)
+
+For experts who know Caddy's Caddyfile: four optional files in the
+add-on's configuration folder, sub-folder `caddy` - `app_configs/<slug>/caddy/`,
+or `addon_configs/<slug>/caddy/` in apps that still use the old name (see
+[Method 2: File Access](#method-2-file-access) for the slug and how to reach
+the folder; the web interface names it):
+
+| File          | Imported ... |
+| ------------- | ------------ |
+| `global.caddy` | at the **start** of the global options block, before the add-on's own options: for an option given twice Caddy keeps the later one, so the add-on's `email`, `storage`, `admin`, `grace_period` and its logs win - do not repeat them (a second `log default` is an error) |
+| `site.caddy`  | in the public site: after the authentication (client certificate / header key) and after the header removal, before the proxy to Home Assistant; the directives run in the order written |
+| `lan.caddy`   | in the local-network site (only while that port is on): after its private-address checks, before the proxy; in the order written |
+| `sites.caddy` | at the end of the configuration: further sites and named snippets; a site uses the add-on's ports only - 80, 443 and (while it is on) 4443 - without `bind` |
+
+`import mtls` (in `sites.caddy`, only with `mtls_enabled: true`) gives a site
+the add-on's strict client certificate check - the add-on's certificate
+settings and `client_auth` with `require_and_verify`, its CA and its active
+clients - always strict, also while a header key is set. With mTLS off it
+does not exist, and a file that uses it is rejected.
+
+**Applied when the add-on starts, from copies.** At every start the add-on
+reads the four files and uses checked copies of them. Change a file, then
+restart the add-on; until then the four files are not read again, also not
+when the add-on reloads Caddy for a revoked client. Files they **refer to**
+(a site's `tls` certificate and key, a `trust_pool` file, CA files of a
+`transport`, ...) are a different matter: Caddy reads those at every reload,
+so a change of such a file takes effect at the next reload. Refer to regular
+files only. If such a file cannot be read to its end at run time (for
+example a named pipe), Caddy's reload does not finish: the panel reports
+that reloading Caddy failed, and the change takes effect after a restart of
+the add-on (whose check then refuses the snippets). If Caddy refuses
+the configuration with the snippets while the add-on applies a change - say
+the key file of a `tls` line was removed - the add-on drops the
+snippets and reloads with its own configuration, so that the change (for
+example a revocation) takes effect: the panel says so next to the change,
+the card **Custom Caddy configuration** turns red with Caddy's message and a
+Home Assistant notification appears; the snippets are read again at the next
+start. A file counts when it is a regular file (not a symbolic link), at
+most 256 KiB, UTF-8 text and not blank; anything else is ignored (the log
+and the card say why). `lan.caddy` counts only while the local-network port
+is on. Windows line endings and a UTF-8 byte-order mark are fine. A file may
+import a snippet by its name (`import mtls`), but no other file. The add-on
+writes a `README.txt` into the folder at every start.
+
+**All or nothing, never down because of a snippet.** Caddy validates the
+configuration with the files, and the add-on checks that its own sites came
+out as it wrote them: its routes for the domain are unchanged except for
+your directives at their place, no other site answers the add-on's domain
+(also not with a path, a port or without a host name), the TLS settings for
+the domain, `admin`, `storage`, the add-on's logs and listeners are
+unchanged, `strict_sni_host` stays on, and - while a header key is set - a
+log you add drops request headers as well. If either check fails, **none**
+of the four files is used: the add-on starts with its own configuration, the
+log shows a warning block with the reason, the card **Custom Caddy
+configuration** turns red and a Home Assistant notification appears. A check
+that does not finish within 60 seconds - Caddy waits for a file a snippet
+refers to that cannot be read to its end, for example a named pipe - counts
+as a rejection.
+**Do not rely on a snippet for a restriction without checking the card after
+the restart.**
+
+What is refused (all four files are then dropped):
+
+- a site on another port than 80, 443 or (while it is on) 4443, or with
+  `bind` - inside the container other ports belong to the add-on (2019:
+  Caddy's admin interface, which the add-on uses to apply revocations; 8099:
+  the web interface), and the add-on publishes no other port;
+- a second site for the add-on's own host name (also with a path or a port),
+  a site without a host name, and a wildcard site that covers the add-on's
+  name (`*.example.com` while the domain is `home.example.com`);
+- changes to the add-on's TLS and certificate settings - global options
+  such as `key_type`, `ocsp_stapling`, `cert_issuer`, `acme_ca`,
+  `default_sni`, switching `strict_sni_host` off -, to `admin`, `storage`,
+  `grace_period` and the add-on's logs (a log of your own is fine, also one
+  that includes the access logs; while a header key is set it must drop
+  request headers: `format filter { ...; request>headers delete }`);
+- a certificate of a site of yours that covers the add-on's domain (`tls
+  <certificate> <key>`), a certificate file given by a relative path or that
+  is not a regular file, and certificates loaded from a folder or from
+  Caddy's storage, which the add-on cannot check;
+- imports of files, and files that are not UTF-8 text.
+
+Give every file a snippet refers to by its **absolute path** (for example
+`/config/caddy/printer.crt` - the add-on's configuration folder is `/config`
+in here - or a file in Home Assistant's `/ssl` folder): a relative path
+is resolved in a directory of the add-on's own that holds none of your
+files. For the same reason give `file_server` a `root` - without one it
+serves that directory, which holds the add-on's own start script.
+
+A snippet runs with Caddy's rights: whatever Caddy can read - the add-on's
+files, its environment with the DNS credentials - a snippet can put into a
+response (for example with a placeholder). Do not paste snippets you do not
+understand.
+
+Example - a response header on the public site (`site.caddy`):
+
+```caddyfile
+header Strict-Transport-Security "max-age=31536000"
+```
+
+Example - another device in your network, reachable from outside with a
+client certificate (`sites.caddy`; the name needs a certificate of its own,
+so it must resolve to your public address like the add-on's domain, or use
+`acme_dns_provider`):
+
+```caddyfile
+printer.home.example.com {
+	import mtls
+	reverse_proxy 192.0.2.50:80
+}
+```
+
 ## Downloading Client Certificates
 
 ### Method 1: Web Interface (Recommended)
@@ -419,9 +658,41 @@ no longer work with the add-on.
 
 ### Method 2: File Access
 
-Certificates are also available at:
+At every start (with mTLS on) the add-on copies these files into the `certs`
+folder of its own configuration folder in Home Assistant:
 
-- `/addon_configs/local_caddy_mtls/certs/` (via Samba or SSH add-ons)
+- `mTLS-CA.crt` - the CA certificate,
+- `mTLS-CA.crl` - the certificate revocation list,
+- `mTLS-client-<name>.p12` - the bundle of each **active** client.
+
+The folder is `<slug>/certs/` in Home Assistant's app configuration
+folders. The slug ends in `_caddy_mtls` and starts with a hash of the exact
+repository address you added: `2644ca2c_caddy_mtls` for
+`https://github.com/LinumIQ/ha-apps` (an address with a trailing `/` or
+`.git` gives another one), `local_caddy_mtls` for a local copy in the
+`local_apps` (formerly `addons`) folder. **The web interface shows the exact
+folder** under **Client certificates**.
+
+Depending on the app and its version, the parent folder appears as
+`app_configs` or under its earlier name `addon_configs`; the content is the
+same:
+
+- **Samba share** app: from version 12.10.0 the shares `app_configs` and
+  (still) `addon_configs`, folder `<slug>/certs/`; before 12.10.0 only the
+  share `addon_configs`;
+- **Terminal & SSH** app: from version 10.5.0 `/app_configs/<slug>/certs/`,
+  before that `/addon_configs/<slug>/certs/`;
+- **File editor** app: from version 6.1.0 `/app_configs/<slug>/certs/`,
+  before that `/addon_configs/<slug>/certs/` - in both cases only with its
+  option `enforce_basepath: false`;
+- **Advanced SSH & Web Terminal** (community app):
+  `/addon_configs/<slug>/certs/`.
+
+The copy is refreshed only when the add-on starts: a client you create,
+regenerate or revoke in the web interface, and a regenerated CA, show up there
+after the next restart. Since 2.3.0 the bundle of a client that is no longer
+active is removed from the folder at the start (before, it stayed there).
+The copies are for download only: deleting them revokes nothing.
 
 ## Installing Client Certificates
 
@@ -536,6 +807,17 @@ the Supervisor ingress IP):
   notification), or does not answer at all; with the steps to change it and
   **Check again**. See
   [Home Assistant Core Configuration](#home-assistant-core-configuration).
+- **Local network** (since 2.2.0) - the local-network port: on (with its
+  URL) or off (with the steps to turn it on).
+- **Header authentication** (since 2.3.0) - off (what it is for, how to turn
+  it on) or on (the header's name, the key's length - never the key - and
+  what it means); both with **Suggest a key**, which creates a key in your
+  browser. See [Header authentication](#header-authentication-since-230).
+- **Custom Caddy configuration** (since 2.3.0) - shown only when custom
+  files exist: in use (the files, the folder), or not in use (red, with
+  Caddy's or the integrity check's message and what to do - also when a
+  reload dropped them), and ignored entries. See
+  [Custom Caddyfile snippets](#custom-caddyfile-snippets-since-230).
 
 - **Add a client** - issues a new client certificate, adds it to the
   active allowlist and reloads Caddy in-place. A name has 1-64 characters
@@ -578,8 +860,9 @@ again, so pick a new name for a replacement device.
 public - set your own). After you change it, the add-on checks at the next
 start whether each active client's bundle opens with the new password and
 re-encrypts every one that does not (the log shows one line per bundle);
-the copies in the add-on's `certs` folder in `/addon_configs/` are refreshed
-too. Download the bundles again and give your users the new password -
+the copies in the add-on's `certs` folder (`app_configs/<slug>/certs/` or,
+in some apps, `addon_configs/<slug>/certs/` - see
+[Method 2: File Access](#method-2-file-access)) are refreshed too. Download the bundles again and give your users the new password -
 bundles they downloaded before keep the old one.
 
 ## Certificate Revocation
@@ -600,9 +883,9 @@ bundle and issues new certificates for the **active** clients - download
 and distribute them again. Revoked clients stay revoked; revoke the clients
 you want to drop for good before regenerating the CA.
 
-Deleting files in the add-on's `certs` folder in `/addon_configs/` or
-removing names from `client_names` revokes nothing: that folder only holds
-copies for download.
+Deleting files in the add-on's `certs` folder (`app_configs/<slug>/certs/`,
+in some apps `addon_configs/<slug>/certs/`) or removing names from
+`client_names` revokes nothing: that folder only holds copies for download.
 
 ## Expiration Notifications
 
@@ -717,6 +1000,35 @@ Devices that come through a VPN (for example Tailscale, whose addresses
 connections arrive under Docker's address) are refused as well: they use
 the client-certificate address `https://<domain>/`.
 
+### "403 Forbidden" with a header key set
+
+The request had neither an active client certificate nor the header with
+exactly the key. With `access_log: true`, the request's line says which
+(field `auth`): `header absent` - the client sends no header of that name
+(check its spelling in the client; the name's case does not matter);
+`header present with a wrong value` - check for a blank or a line break
+copied with the key; `certificate not in the active list` - restart the
+add-on. A 403 only when an app renews its token or logs in: use a
+long-lived access token (see [Example: a watch app](#example-a-watch-app)).
+No log line at all, and the client reports a connection error: the TLS
+connection itself failed. Reports in Garmin's developer forum say that some
+watches' own TLS stack fails against ECDSA server certificates (Caddy's
+default); the add-on does not change that - try the connection through the
+phone (not tested by us).
+
+### My custom snippet is ignored
+
+The card **Custom Caddy configuration** and the log at the start say what
+happened. File not listed: it is not in `app_configs/<slug>/caddy/` (in some
+apps `addon_configs/<slug>/caddy/`), its
+name is not exactly one of the four, or it was ignored (symbolic link,
+larger than 256 KiB, blank, `lan.caddy` while the local-network port is off
+- the reason is shown). Listed, red: it was rejected - the message says why,
+and none of the files is in use; "Caddy could not reload with your custom
+files while applying a change" means a file a snippet refers to (a
+certificate or key, ...) broke after the start: fix it and restart the
+add-on. Listed, green: it is in use - after a change, restart the add-on.
+
 ### "Connection refused" errors
 
 - Ensure the external ports 80 and 443 are forwarded to the add-on's host
@@ -773,6 +1085,9 @@ The image can be started without Supervisor (this is what the smoke tests in
   `CERT_MONITOR_PUBLIC_CERT_GRACE_SECONDS` (default 120) and
   `CERT_MONITOR_FAST_INTERVAL_SECONDS` (default 60) shorten the public
   certificate notification's delay and check interval for the tests.
+- `CADDY_MTLS_CUSTOM_RETRY_SECONDS` (default 60; test-only): how often the
+  monitor retries the notification about rejected custom snippets (or its
+  dismissal) until the Supervisor took it.
 - `CADDY_MTLS_UPSTREAM_CONTROL_SECONDS` (default 12),
   `CADDY_MTLS_UPSTREAM_TEST_SECONDS` (default 60) and
   `CADDY_MTLS_UPSTREAM_FAST_SECONDS` (default 2.5) (environment variables,
@@ -822,15 +1137,36 @@ caddy-mtls/tests/real-core.sh caddy-mtls-test [ghcr.io/linumiq/amd64-addon-caddy
   reload (red card, what Caddy really runs, one ERROR line, the repair), the
   last known mode while the upstream is down, `always`, `never` and `auto`
   without mTLS, `never` without mTLS refused at the start, the texts for an
-  upstream that is not Home Assistant.
+  upstream that is not Home Assistant. Header authentication (2.3.0, group
+  `auth`): the gate on HTTP/1.1 and HTTP/2 (no key, wrong and similar
+  values, the key, certificates, the header twice, trailing blanks,
+  websocket upgrades), the header never reaching the upstream, the key file
+  emptied or removed at run time (refuses everybody without a certificate),
+  revocation in the handshake also with the key, the list of active
+  certificates regenerated before every reload (and what a stale list does),
+  a forwarding-mode switch, the key in no log, file, process or panel page
+  at `access_log: true`, `log_level: debug` and `trace`, mTLS off, refused
+  starts. Custom snippets (group `custom`): harmless files of all four kinds
+  (each takes effect; `site.caddy` only after the gate), a broken file
+  (all dropped, the add-on starts, card, notification), ignored entries
+  (symbolic link, oversized file, FIFO, blank file), the break-outs and
+  other changes of the add-on's own sites (all rejected; requests without
+  certificate and key still get 403), global options that lose to the
+  add-on's own, files edited after the start, `import mtls` without mTLS.
+  `SMOKE_ONLY="auth custom"` runs only the named groups (`main`, `no-mtls`,
+  `access-log`, `acme`, `fwd`, `lan`, `dns`, `bad`, `auth`, `custom`);
+  `SMOKE_FIXTURES_DIR` collects the configurations Caddy built for the
+  integrity check (the unit tests' fixtures).
   Prints PASS/FAIL per check; exit 0 = all passed, 1 = a check failed,
   2 = usage error.
 - `tests/apparmor-smoke.sh <image> <apparmor.txt>` (needs root or sudo and an
   AppArmor kernel) loads the profile in enforce mode, boots the image under
-  it, adds and revokes a client, shows the "Public certificate" card, raises
-  and dismisses the notification at a fake Supervisor, restarts it with a new
-  client name and a new `client_cert_password` and fails on any AppArmor
-  denial (kernel log and, if auditd runs, the audit log).
+  it with a header key and a custom file, adds and revokes a client, shows
+  the "Public certificate" card, raises and dismisses the notification at a
+  fake Supervisor, restarts it with a new client name and a new
+  `client_cert_password`, sends requests through the header-authentication
+  gate and fails on any AppArmor denial (kernel log and, if auditd runs, the
+  audit log).
 - `tests/unit/` (standard library only, also run by CI): the expiry
   monitor's entity ids and notification thresholds, the public certificate
   state (Caddy's log events, storage, checklist) and the notification's
@@ -839,7 +1175,13 @@ caddy-mtls/tests/real-core.sh caddy-mtls-test [ghcr.io/linumiq/amd64-addon-caddy
   on 127.0.0.1, the decision for every combination of option, mTLS and the
   last result, the snippet, the state file, the trusted-proxy suggestion,
   the monitor's cadence and noise rules over a simulated day, the
-  notification); the panel's templates (with Jinja2, inside the image).
+  notification); header authentication (`headerauth.py`: the option rules,
+  the key file, scrubbing; `caddyctl.py`: the fingerprint list derived from
+  the active folder - never the hash of an empty certificate - and the
+  reload that regenerates it first); the custom snippets (`customconf.py`:
+  which files count, the import rule, Caddy's messages, the integrity check
+  against configurations Caddy built, `fixtures/customconf/`); the panel's
+  templates (with Jinja2, inside the image).
 - `tests/real-core.sh <image> [<2.1.x image>]` (not in CI) runs Home
   Assistant Core 2026.11.3 on an `--internal` Docker network as
   `homeassistant:8123`, onboards a test user and checks against it: 2.1.x
@@ -856,8 +1198,10 @@ caddy-mtls/tests/real-core.sh caddy-mtls-test [ghcr.io/linumiq/amd64-addon-caddy
   notification), a Core restart right after the add-on's start, trust
   removed while passing addresses on (noticed within one control interval,
   the "addresses hidden" notification), Core paused
-  for 15 s (nothing happens) and for 40 s (unreachable, no 502 claim). It
-  counts the lines that each phase writes into Core's log.
+  for 15 s (nothing happens) and for 40 s (unreachable, no 502 claim). With
+  a header key (2.3.0): the page, the API and the websocket of the real Core
+  with the key and no client certificate, 403 without it. It counts the
+  lines that each phase writes into Core's log.
   `REALCORE_PREFIX`, `REALCORE_SUBNET` and `REALCORE_EVIDENCE` set the name
   prefix, the test network and a directory for the logs.
 
@@ -894,6 +1238,11 @@ What the log shows with the default `log_level: info` (since 2.0.1):
 
 `log_level: debug` (or `trace`) turns all of these on again, including the
 access logs.
+
+While a header key is set (since 2.3.0), no log line contains request
+headers; each access-log line says instead how the request was let in or why
+it was refused (field `auth`, see
+[Header authentication](#header-authentication-since-230)).
 
 ## Support
 

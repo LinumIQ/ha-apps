@@ -5,6 +5,88 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-11-28
+
+### Added
+
+- **Header authentication** (options `header_auth_name`, default
+  `X-Custom-PSK`, and `header_auth_key`, default empty = off). For clients
+  that cannot present a client certificate but can send one fixed header,
+  such as a watch app: with a key set, the public site accepts a request
+  that presents an active client certificate **or** carries the header with
+  exactly the key; every other request gets `403 Forbidden`. A presented
+  certificate is still checked in the TLS handshake as before (a revoked
+  one ends the connection, also with the key), and the HTTP check accepts
+  a certificate only by the fingerprint of an active one (a list
+  regenerated from the allowlist before every reload). The key: 32-256
+  characters of
+  `A-Z a-z 0-9 . _ ~ + / = -`, never in the generated configuration, a log
+  line or the web interface (Caddy reads it from a 0600 file per request).
+  The header is removed before Home Assistant sees the request. While a key
+  is set, the add-on's log lines carry no request headers; the access log
+  says per request how it was let in or why not (field `auth`). Web
+  interface: a card **Header authentication** with a key suggestion made in
+  the browser. With `mtls_enabled: false` the key is the only protection
+  (the log and the card say so).
+- **Custom Caddyfile snippets for experts**: `global.caddy`, `site.caddy`,
+  `lan.caddy` and `sites.caddy` in the add-on's configuration folder
+  (`app_configs/<slug>/caddy/` - `addon_configs/...` in apps that still use
+  the old name), imported at four fixed places (global
+  options first, so the add-on's own win; the public and the local-network
+  site after their access checks, before the proxy; further sites last;
+  `import mtls` = the add-on's strict client certificate check; further
+  sites only on the add-on's ports 80, 443 and 4443, without `bind`). Read
+  at every start and used as checked copies (`lan.caddy` only while the
+  local-network port is on); Caddy validates them and the add-on checks
+  that its own sites stayed as it wrote them. If either rejects them, none
+  is used and the add-on starts with its own configuration: a warning block
+  in the log, a red card **Custom Caddy configuration** and a Home
+  Assistant notification; a check that does not finish within 60 seconds
+  (a referenced file that cannot be read to its end) counts as a rejection.
+  Files the snippets refer to (a `tls` certificate and key, ...) are read
+  by Caddy at every reload; if Caddy refuses the configuration with the
+  snippets while the add-on applies a change such as a revocation, the
+  add-on drops them until the next start and reloads with its own
+  configuration, so that the change takes effect (the panel, the card and a
+  notification say so).
+
+### Changed
+
+- Only for users who set `header_auth_key`: a visitor without a client
+  certificate now completes the TLS handshake and gets `403 Forbidden`
+  instead of a failed handshake; a browser that dismissed the certificate
+  prompt shows that page. Without a key, nothing changes.
+- Only for users who add custom files: see above. Without them, nothing
+  changes.
+- `log_level: trace` no longer turns on bashio's own trace output, which
+  printed the add-on's whole options - `client_cert_password`,
+  `dns_api_token` and now the header key included - into the log.
+- Every Caddy process that reads the configuration - the checks at the
+  start, Caddy itself and the reloads by the web interface and the monitor -
+  runs with the same small environment: `PATH`, `HOME`, `TZ`, the `XDG_*`
+  locations and the DNS provider credentials, nothing else. A custom
+  snippet's `{$VAR}` therefore gets the same value at the start and at every
+  reload, and no Caddy process has the Supervisor token (until now the
+  reloads adapted the configuration in the web interface's environment,
+  which has it).
+- Caddy's admin endpoint and everything that talks to it use
+  `127.0.0.1:2019` explicitly instead of `localhost:2019` (in the container
+  `localhost` resolves to `::1` first, where the admin endpoint does not
+  listen).
+
+### Fixed
+
+- The documentation of "Method 2: File Access" named a folder that exists
+  only for a local copy: the copies are in `<slug>/certs/` of the app
+  configuration folders (usually `2644ca2c_caddy_mtls` for this repository;
+  the prefix depends on the exact repository address that was added), which
+  appear as `app_configs` or under the earlier name `addon_configs`,
+  depending on the app and its version; the content is the same. The web
+  interface now names the exact folder.
+- The `.p12` copy of a revoked client stayed in that folder for good; it is
+  now removed at the next start.
+- Test data no longer uses a real host name or address.
+
 ## [2.2.0] - 2026-11-27
 
 ### Fixed

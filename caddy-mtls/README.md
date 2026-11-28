@@ -13,6 +13,8 @@ A Home Assistant add-on that provides a Caddy reverse proxy with mutual TLS (mTL
 - 🚦 **Certificate status** - the web interface shows whether the Let's Encrypt certificate exists, and if not, the last error and what to check in the router; a Home Assistant notification while it is missing
 - 🏠 **HTTPS at home without a certificate** - optional second port for your local network (private addresses only, never forwarded)
 - 🔁 **No Home Assistant configuration needed** - the add-on asks Home Assistant whether it trusts it as a reverse proxy and adapts (option `forwarded_headers`); the web interface shows whether Home Assistant sees the visitors' own addresses and how to turn that on
+- 🔑 **Header authentication** (optional) - for clients that cannot present a client certificate but can send one fixed header (for example a watch app): a pre-shared key on the same address; everyone else still needs a certificate
+- 🧩 **Custom Caddyfile snippets** (for experts) - global options, extra directives for the public and the local-network site, extra sites (`import mtls` for the add-on's certificate check); checked at every start, and dropped as a whole if Caddy or the add-on's integrity check rejects them
 - 🌐 **DNS Challenge Support** - Cloudflare, Route53, and Hetzner for when port 80 is unavailable
 - 👥 **Multiple Users** - Generate individual certificates for each user/device
 - 🏠 **Home Assistant Native** - Full integration with HA add-on system
@@ -74,7 +76,18 @@ access_log: false
 # Visitor addresses for Home Assistant (X-Forwarded-For): auto passes them on
 # when Home Assistant trusts the add-on, otherwise (with mTLS) removes them
 forwarded_headers: auto # or: always, never (never needs mtls_enabled: true)
+
+# Header authentication (optional): with a key (32-256 characters), a
+# request that carries this header with exactly the key gets in without a
+# client certificate - for clients that cannot present one
+header_auth_name: X-Custom-PSK
+header_auth_key: "" # empty = off; the web interface suggests a key
 ```
+
+Custom Caddyfile snippets for experts go into the add-on's configuration
+folder, sub-folder `caddy` (`global.caddy`, `site.caddy`, `lan.caddy`,
+`sites.caddy`); see
+[DOCS.md](DOCS.md#custom-caddyfile-snippets-since-230).
 
 ## Network Requirements
 
@@ -132,7 +145,9 @@ administrators only):
   download and distribute again. Revoked clients stay revoked - revoke the
   clients you want to drop for good *before* regenerating the CA.
 
-Deleting certificate files in `/addon_configs/` or removing names from
+Deleting certificate files in the add-on's configuration folder
+(`app_configs/<slug>/certs/`, in some apps `addon_configs/<slug>/certs/`;
+see [DOCS.md](DOCS.md#method-2-file-access)) or removing names from
 `client_names` revokes nothing: that folder only holds copies for download,
 and the CA and the list of accepted certificates live in the add-on's own
 storage. See [DOCS.md](DOCS.md#certificate-revocation).
@@ -148,7 +163,7 @@ See [DOCS.md](DOCS.md) for detailed documentation including:
 ## Architecture
 
 ```
-Internet → Router:443 → host:8443 → Caddy :443 (mTLS) → Home Assistant:8123
+Internet → Router:443 → host:8443 → Caddy :443 (mTLS, or the header key) → Home Assistant:8123
 Internet → Router:80  → host:8080 → Caddy :80  (HTTP-01, CRL, redirect to https)
                                        ↓
                                  Let's Encrypt

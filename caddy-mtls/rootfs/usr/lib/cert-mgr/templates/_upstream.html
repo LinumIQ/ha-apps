@@ -73,7 +73,8 @@
     <code>{{ hc.source }}</code>. {{ hc.Name }} does not trust this add-on as
     a reverse proxy, so the add-on does not pass visitor addresses on
     (<code>forwarded_headers: auto</code> with mTLS: visitors on the public
-    port have a client certificate, visitors on the local-network port come
+    port have a client certificate{% if s.header_auth %} or the header
+    key{% endif %}, visitors on the local-network port come
     from private addresses).
   </p>
   <p class="hc__note"><strong>What this means:</strong></p>

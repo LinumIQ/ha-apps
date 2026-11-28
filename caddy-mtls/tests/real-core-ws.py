@@ -3,12 +3,15 @@
 library only).
 
 usage: real-core-ws.py <url> <token> [--cert FILE --key FILE] [--connect HOST:PORT]
-                       <command> [<json>]
+                       [--header-file FILE] <command> [<json>]
 
   <url>       ws://homeassistant:8123/api/websocket or
               wss://<domain>/api/websocket (through the add-on)
   --connect   connect to HOST:PORT instead of the URL's host (keeps the URL's
               host as SNI and Host header, like curl --resolve)
+  --header-file  extra request header lines ("Name: value") for the upgrade
+              request (header authentication: the key stays off the command
+              line)
   command     ping            auth, then ping -> prints "pong"
               call <json>     auth, then send <json> (an "id" is added) and
                               print the result as JSON
@@ -28,7 +31,8 @@ from urllib.parse import urlsplit
 
 
 class WebSocket:
-    def __init__(self, url: str, connect: str | None, cert: str | None, key: str | None) -> None:
+    def __init__(self, url: str, connect: str | None, cert: str | None, key: str | None,
+                 extra_headers: str = "") -> None:
         parts = urlsplit(url)
         secure = parts.scheme == "wss"
         host = parts.hostname or ""
@@ -51,7 +55,9 @@ class WebSocket:
         nonce = base64.b64encode(os.urandom(16)).decode()
         request = (
             f"GET {parts.path or '/'} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
-            f"Connection: Upgrade\r\nSec-WebSocket-Key: {nonce}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            f"Connection: Upgrade\r\nSec-WebSocket-Key: {nonce}\r\nSec-WebSocket-Version: 13\r\n"
+            + "".join(f"{line}\r\n" for line in extra_headers.splitlines() if line.strip())
+            + "\r\n"
         )
         sock.sendall(request.encode())
         head = self._read_until(b"\r\n\r\n")
@@ -137,11 +143,13 @@ def main() -> int:
     parser.add_argument("--cert")
     parser.add_argument("--key")
     parser.add_argument("--connect")
+    parser.add_argument("--header-file")
     parser.add_argument("command", choices=("ping", "call"))
     parser.add_argument("json", nargs="?")
     args = parser.parse_args()
     try:
-        ws = WebSocket(args.url, args.connect, args.cert, args.key)
+        extra = open(args.header_file, encoding="utf-8").read() if args.header_file else ""
+        ws = WebSocket(args.url, args.connect, args.cert, args.key, extra)
         ws.auth(args.token)
         if args.command == "ping":
             answer = ws.call({"type": "ping"})

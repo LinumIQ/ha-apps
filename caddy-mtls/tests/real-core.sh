@@ -29,6 +29,9 @@
 #         the client's own address; the websocket works.
 #   start   a new add-on container with that Core: pass at the start.
 #   back    settings removed, restart, confirm: the add-on switches to strip.
+#   header  header authentication (2.3.0, mTLS on, a per-run fake key): the
+#         page, the API and the websocket of the real Core with the key and
+#         no client certificate; 403 without it.
 # With the monitor's default intervals (control 12 s, test 60 s):
 #   first-boot  Core down at the add-on's first start: polled every 2.5 s, the
 #         switch to strip within 5 s of Core's first answer (review B-5); no
@@ -80,6 +83,8 @@ PASS_COUNT=0
 FAIL_COUNT=0
 ADDON=""
 ADDON_IP=""
+# A file with the header key for the next boot_addon (header authentication).
+ADDON_KEY_FILE=""
 TOKEN=""
 SUMMARY=()
 
@@ -185,12 +190,13 @@ boot_addon() {
     local name="${P}-$1" image="$2" fwd="$3" dir="${WORK}/$1"
     ADDON="${name}"
     mkdir -p "${dir}/data" "${dir}/tmp/.bashio"
-    jq -n --arg fwd "${fwd}" '{domain: "caddy-mtls-core.localhost", email: "test@example.com",
+    jq -n --arg fwd "${fwd}" --rawfile key "${ADDON_KEY_FILE:-/dev/null}" '{domain: "caddy-mtls-core.localhost", email: "test@example.com",
         upstream_host: "homeassistant", upstream_port: 8123, mtls_enabled: true,
         ca_country: "AT", ca_state: "Styria", ca_locality: "Graz", ca_organization: "LinumIQ",
         ca_common_name: "Real Core test CA", client_names: ["alice"], client_cert_password: "real-core-test",
         acme_dns_provider: "none", dns_api_token: "", log_level: "info", access_log: false,
-        forwarded_headers: $fwd, cert_expiry_warn_days: [30, 14, 7, 1], cert_check_interval_hours: 6}' \
+        forwarded_headers: $fwd, cert_expiry_warn_days: [30, 14, 7, 1], cert_check_interval_hours: 6}
+        + (if $key == "" then {} else {header_auth_key: $key} end)' \
         >"${dir}/data/options.json"
     cp "${dir}/data/options.json" "${dir}/tmp/.bashio/addons.self.options.config.cache"
     printf '%s\n' '{"name":"Caddy mTLS Proxy","network":{"80/tcp":8080,"443/tcp":8443}}' >"${dir}/tmp/.bashio/addons.self.info.cache"
@@ -387,6 +393,42 @@ else
     fail "start: add-on booted"
 fi
 stop_addon
+
+# --- header: header authentication (2.3.0) -------------------------------------------
+# A per-run fake key, read from files only (never on a command line).
+log "header: header authentication (mTLS on, a key), no client certificate"
+printf 'fakekey.NOT-A-SECRET.%s' "$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')" >"${WORK}/key"
+printf 'X-Custom-PSK: %s\n' "$(cat "${WORK}/key")" | "${DOCKER}" exec -i "${CLIENT}" sh -c 'cat > /tmp/h-key'
+# keyed <path> [curl args]: "<body> <code>" through port 443 WITHOUT a client
+# certificate.
+keyed() {
+    local path="$1"
+    shift
+    client curl -sk --max-time 15 --resolve "${DOMAIN}:443:${ADDON_IP}" -w ' %{http_code}' "$@" \
+        "https://${DOMAIN}${path}" 2>/dev/null || true
+}
+ADDON_KEY_FILE="${WORK}/key"
+if boot_addon header "${IMAGE}" auto; then
+    out="$(keyed /manifest.json -H @/tmp/h-key)"
+    check "header: with the key, no certificate: Core's manifest.json 200" eval '[[ "${out}" == *"\"name\""*" 200" ]]'
+    out="$(keyed / -L -H @/tmp/h-key)"
+    check "header: with the key: the frontend loads (/, redirects followed: 200 with HTML)" eval '[[ "${out}" == *"<html"*" 200" ]]'
+    out="$(keyed /api/ -H @/tmp/h-key -H "Authorization: Bearer ${TOKEN}")"
+    check "header: with the key and the long-lived token: Core's API answers (200 API running)" eval '[[ "${out}" == *"API running"*" 200" ]]'
+    check "header: without certificate and key: 403 (page and API)" eval '
+        [[ "$(keyed / -o /dev/null)" == " 403" && "$(keyed /api/ -o /dev/null -H "Authorization: Bearer ${TOKEN}")" == " 403" ]]'
+    check "header: websocket with the key, no certificate: auth_ok + pong" eval '
+        [[ "$(client python3 /tmp/real-core-ws.py "wss://${DOMAIN}/api/websocket" "${TOKEN}" --connect "${ADDON_IP}:443" \
+            --header-file /tmp/h-key ping 2>&1)" == pong ]]'
+    check "header: websocket without the key: refused (403)" eval '
+        [[ "$(client python3 /tmp/real-core-ws.py "wss://${DOMAIN}/api/websocket" "${TOKEN}" --connect "${ADDON_IP}:443" ping 2>&1)" == *"handshake failed"*"403"* ]]'
+    check "header: alice's certificate still works without the key" eval '[[ "$(code_of /manifest.json -o /dev/null)" == 200 ]]'
+    check "header: the key is not in the add-on log" eval '! "${DOCKER}" logs "${ADDON}" 2>&1 | grep -F -f "${WORK}/key" >/dev/null'
+else
+    fail "header: add-on booted"
+fi
+stop_addon
+ADDON_KEY_FILE=""
 
 # ==================================================================================
 # The review's scenarios with the default intervals (control 12 s, test 60 s).

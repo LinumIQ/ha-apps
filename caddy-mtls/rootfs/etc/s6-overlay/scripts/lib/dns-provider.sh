@@ -73,6 +73,56 @@ dns_provider_directive() {
 }
 
 ###############################################################################
+# Caddy's environment (2.3.0). A {$VAR} in a custom Caddyfile snippet is
+# expanded by the process that adapts the Caddyfile, so every caddy
+# invocation that reads it - init-caddy (fmt, validate, adapt), the caddy
+# service (validate, run) and cert-mgr's reloads (caddyctl.py) - runs with
+# the same small environment: what Caddy needs (PATH; HOME and the XDG
+# variables decide its data and autosave locations) and the DNS provider
+# variables dns_provider_export sets, nothing else (no Supervisor token, no
+# internals). The same names as CADDY_ENV_NAMES in caddyctl.py (its unit
+# test compares both).
+###############################################################################
+CADDY_ENV_NAMES=(PATH HOME TZ XDG_CONFIG_HOME XDG_DATA_HOME
+    DNS_API_TOKEN DNS_AWS_ACCESS_KEY_ID DNS_AWS_SECRET_ACCESS_KEY)
+
+# caddy_env_only: stop exporting every variable that is not in
+# CADDY_ENV_NAMES (in the calling shell: use it in a subshell, or right
+# before exec). No values on any command line.
+caddy_env_only() {
+    local name
+    while IFS= read -r name; do
+        # shellcheck disable=SC2163 # the variable named by ${name}
+        [[ " ${CADDY_ENV_NAMES[*]} " == *" ${name} "* ]] || export -n "${name}"
+    done < <(compgen -e)
+}
+
+# caddy_cmd <caddy arguments...>: /usr/bin/caddy in that environment.
+caddy_cmd() {
+    (
+        caddy_env_only
+        exec /usr/bin/caddy "$@"
+    )
+}
+
+# caddy_cmd_limited <seconds> <caddy arguments...>: caddy_cmd under a time
+# limit (the image's busybox timeout: SIGTERM at the limit, SIGKILL 5 s
+# later, so that no process is left behind).
+caddy_cmd_limited() {
+    local seconds="$1"
+    shift
+    (
+        caddy_env_only
+        exec timeout -k 5 "${seconds}" /usr/bin/caddy "$@"
+    )
+}
+
+# limit_expired <exit status>: busybox timeout's status for an expired
+# limit - 143 (the command ended by its SIGTERM; GNU's 124 does not apply
+# here) or 137 (by the SIGKILL that follows).
+limit_expired() { [[ "$1" == 143 || "$1" == 137 ]]; }
+
+###############################################################################
 # Copy stdin to stdout with every DNS credential replaced by <redacted>: the
 # raw option value (argument), and the exported variables.
 # Arguments:

@@ -8,7 +8,16 @@
 # Caddyfile only references them through {env.*} placeholders, which Caddy
 # resolves in this process - on the initial load and on every `caddy reload`
 # by cert-mgr. The init-caddy oneshot's own exports do not reach this service.
+# Caddy runs with nothing else in its environment (caddy_env_only, 2.3.0).
 # ==============================================================================
+
+# bashio's trace output prints the arguments of its functions - among them
+# the add-on's whole options with every secret (header_auth_key,
+# dns_api_token, client_cert_password): never more than debug here (2.3.0).
+# shellcheck disable=SC2154,SC2034
+if (( __BASHIO_LOG_LEVEL > __BASHIO_LOG_LEVEL_DEBUG )); then
+    __BASHIO_LOG_LEVEL="${__BASHIO_LOG_LEVEL_DEBUG}"
+fi
 
 # shellcheck source=rootfs/etc/s6-overlay/scripts/lib/dns-provider.sh
 source /etc/s6-overlay/scripts/lib/dns-provider.sh
@@ -22,5 +31,57 @@ if [[ "${ACME_DNS_PROVIDER}" != "none" ]]; then
     unset DNS_TOKEN
 fi
 
+readonly CADDYFILE="/etc/caddy/Caddyfile"
+
+# Custom Caddyfile snippets (2.3.0): files they refer to (a site's tls
+# certificate and key, ...) are read by Caddy at every load. If s6 starts
+# Caddy again within this run (it exited with 0 by itself) and the Caddyfile
+# no longer loads, switch to the add-on's own configuration - the step a
+# failed reload takes (customconf.py drop: the Caddyfile becomes
+# /etc/caddy/Caddyfile.own, the snippets are dropped until the next start of
+# the add-on) - instead of stopping the add-on. Only while the snippets are
+# in use (the fallback file exists), and not at the add-on's start:
+# init-caddy has just validated the Caddyfile (its marker is consumed here).
+# The validation runs under the time limit of the start's check (a file a
+# snippet refers to may block); an expired limit is a failed validation.
+# If the drop could not replace the Caddyfile (the fallback file is still
+# there), Caddy starts with the fallback file itself; the next reload by the
+# panel fails on the Caddyfile, falls back and tries the switch again.
+readonly CADDYFILE_OWN="/etc/caddy/Caddyfile.own"
+readonly CADDYFILE_CHECKED="/run/caddy-mtls/caddyfile-validated"
+RUN_CONFIG="${CADDYFILE}"
+if ! rm "${CADDYFILE_CHECKED}" 2>/dev/null && [[ -f "${CADDYFILE_OWN}" ]]; then
+    VALIDATE_OUT="$(mktemp)"
+    VALIDATE_RC=0
+    caddy_cmd_limited 60 validate --config "${CADDYFILE}" --adapter caddyfile >"${VALIDATE_OUT}.raw" 2>&1 \
+        || VALIDATE_RC=$?
+    if limit_expired "${VALIDATE_RC}"; then
+        printf 'Error: Caddy did not finish checking the configuration within 60 seconds - a file a snippet refers to probably cannot be read to its end\n' \
+            >>"${VALIDATE_OUT}.raw"
+    fi
+    dns_provider_redact <"${VALIDATE_OUT}.raw" >"${VALIDATE_OUT}" || true
+    rm -f "${VALIDATE_OUT}.raw"
+    if (( VALIDATE_RC != 0 )); then
+        if caddy_cmd validate --config "${CADDYFILE_OWN}" --adapter caddyfile >/dev/null 2>&1; then
+            DROP_RC=0
+            /usr/lib/cert-mgr/.venv/bin/python3 /usr/lib/cert-mgr/customconf.py drop --when restart \
+                --output "${VALIDATE_OUT}" >"${VALIDATE_OUT}.drop" 2>&1 || DROP_RC=$?
+            while IFS= read -r line; do bashio::log.warning "${line}"; done <"${VALIDATE_OUT}.drop"
+            rm -f "${VALIDATE_OUT}.drop"
+            if (( DROP_RC != 0 )) && [[ -f "${CADDYFILE_OWN}" ]]; then
+                bashio::log.warning "The Caddyfile could not be replaced; Caddy starts with the add-on's own configuration (${CADDYFILE_OWN})."
+                RUN_CONFIG="${CADDYFILE_OWN}"
+            fi
+        else
+            bashio::log.error "Caddy cannot load the Caddyfile, nor the add-on's own configuration without the custom snippets."
+        fi
+    fi
+    rm -f "${VALIDATE_OUT}"
+fi
+
 bashio::log.info "Starting Caddy server..."
-exec /usr/bin/caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+# Caddy needs no access to the Supervisor; a custom Caddyfile snippet (2.3.0)
+# could read its environment through {$VAR} or {env.*} placeholders. (bash's
+# exec exports SHLVL again; env drops it.)
+caddy_env_only
+exec env -u SHLVL /usr/bin/caddy run --config "${RUN_CONFIG}" --adapter caddyfile

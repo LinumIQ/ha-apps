@@ -24,6 +24,8 @@ CERT_MGR = Path(
 )
 sys.path.insert(0, str(CERT_MGR))
 
+import customconf  # noqa: E402
+import headerauth  # noqa: E402
 import public_cert  # noqa: E402
 import upstream  # noqa: E402
 
@@ -199,7 +201,7 @@ class RenderTests(unittest.TestCase):
             fingerprint_sha256="ab" * 32, mtime=self.NOW - 3600)
         error = public_cert.AcmeEvent(ts=self.NOW - 60, logger="tls.obtain", level="error",
                                       msg="could not get certificate from issuer",
-                                      error="86.62.32.88: Timeout during connect", problem_type="connection")
+                                      error="203.0.113.10: Timeout during connect", problem_type="connection")
         if state == "ok":
             return public_cert.Status(state="ok", runtime=runtime, certificate=cert, served=True, now=self.NOW)
         return public_cert.Status(state="missing", runtime=runtime, last_error=error, now=self.NOW)
@@ -219,6 +221,8 @@ class RenderTests(unittest.TestCase):
                 upstream.State(upstream="homeassistant:8123", result="refused", decisive="refused",
                                mode="strip", reachable=True, source_address="172.30.33.3"),
             ),
+            "ha": headerauth.card_context({"domain": "home.example.org", "mtls_enabled": True}),
+            "cc": customconf.card_context({"state": "none", "files": [], "ignored": []}),
         }
 
     def test_dashboard(self):
@@ -244,6 +248,22 @@ class RenderTests(unittest.TestCase):
                 for url in ATTR_URL_RE.findall(html):
                     if ABSOLUTE_RE.match(url):
                         self.assertIn(url, ALLOWED_ABSOLUTE)
+
+    def test_certificate_copies_folder(self):
+        """2.3.0 (Method 2): the real folder of the certificate copies, only
+        when the slug is known."""
+        rt = public_cert.Runtime(domain="home.example.org", started_at=self.NOW, config_slug="2644ca2c_caddy_mtls")
+        html = self.env.get_template("index.html").render(self._context("ok") | {"rt": rt, "lan_rt": rt})
+        self.assertIn("<code>app_configs/2644ca2c_caddy_mtls/certs/</code>", html)
+        # C-1: the name in apps that still map the legacy folder name.
+        self.assertIn("<code>addon_configs/2644ca2c_caddy_mtls/certs/</code> in apps that still\n"
+                      "          use the old name, for example Advanced SSH &amp; Web Terminal", html)
+        self.assertNotIn("in the SSH app", html)
+        self.assertIn('class="clients__mirror"', html)
+        for rt in (None, public_cert.Runtime(domain="home.example.org", started_at=self.NOW)):
+            with self.subTest(rt=rt):
+                html = self.env.get_template("index.html").render(self._context("ok") | {"rt": rt, "lan_rt": rt})
+                self.assertNotIn("clients__mirror", html)
 
     def test_card_alone_is_a_fragment(self):
         html = self.env.get_template("_public_cert.html").render(self._context("missing"))
@@ -390,6 +410,168 @@ class UpstreamCardTests(unittest.TestCase):
         self.assertLess(index.index('"_public_cert.html"'), index.index('"_upstream.html"'))
         self.assertIn('fetch("upstream"', index)
         self.assertIn('fetch("public-cert"', index)
+
+
+@unittest.skipIf(jinja2 is None, "Jinja2 not installed (run inside the add-on image)")
+class HeaderAuthCardTests(unittest.TestCase):
+    """The "Header authentication" card (2.3.0): off, on (with and without
+    mTLS, with and without the access log) - the length of the key, never
+    the key; the key suggestion is made in the browser."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.env = jinja2.Environment(loader=jinja2.FileSystemLoader(str(TEMPLATES)), autoescape=True)
+
+    def render(self, runtime):
+        return self.env.get_template("_headerauth.html").render({"ha": headerauth.card_context(runtime)})
+
+    def runtime(self, enabled=True, mtls=True, access_log=False, name="Garmin-Key", length=43):
+        return {"domain": "home.example.org", "mtls_enabled": mtls, "access_log": access_log,
+                "header_auth": {"enabled": enabled, "name": name, "key_length": length}}
+
+    def test_off(self):
+        html = self.render(self.runtime(enabled=False, length=0))
+        self.assertTrue(html.lstrip().startswith("<section"), html[:60])
+        for needle in ('id="header-auth"', 'data-state="off"', "status--info", ">Off<",
+                       "<code>header_auth_key</code>", "32 to\n      256 characters",
+                       "<code>X-Custom-PSK</code>", 'id="ha-suggest"', ">Suggest a key<",
+                       "nothing is sent to the\n      app or stored"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, html)
+        self.assertNotIn("a key of", html)
+
+    def test_on_with_mtls(self):
+        html = self.render(self.runtime(access_log=True))
+        for needle in ('data-state="on"', "status--success", ">On<", "Header <code>Garmin-Key</code>",
+                       "a key of 43\n    characters is set", "without a client certificate",
+                       "removed before Home Assistant sees the request", '"403\n      Forbidden" instead of a failed TLS handshake',
+                       "revoked or unknown one ends the\n      connection, also with the key",
+                       "Forwarding headers follow the same rules", "carry no request headers",
+                       "field <code>auth</code>", "long-lived access token", "To change the key",
+                       'id="ha-suggest"'):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, html)
+        self.assertNotIn("the only protection", html)
+        self.assertNotIn("with the option\n      <code>access_log</code> on", html)
+
+    def test_on_without_mtls_warns(self):
+        html = self.render(self.runtime(mtls=False))
+        self.assertIn("<strong>mTLS is off:</strong> the key is the only protection", html)
+        self.assertIn('role="alert"', html)
+        self.assertNotIn("Forwarding headers follow", html)
+        self.assertIn("with the option\n      <code>access_log</code> on", html)
+
+    def test_no_key_anywhere(self):
+        """The card's facts come from runtime.json, which has no key; even a
+        stray "key" field there is never shown."""
+        runtime = self.runtime()
+        runtime["header_auth"]["key"] = "fakekey.NOT-A-SECRET.should-never-show"
+        html = self.render(runtime)
+        self.assertNotIn("should-never-show", html)
+        self.assertNotIn("should-never-show", repr(headerauth.card_context(runtime)))
+
+    def test_dashboard_includes_the_card_and_the_browser_helper(self):
+        index = (TEMPLATES / "index.html").read_text()
+        self.assertIn('{% include "_headerauth.html" %}', index)
+        self.assertLess(index.index('"_lan.html"'), index.index('"_headerauth.html"'))
+        script = index[index.index("{% block scripts %}"):]
+        self.assertIn("crypto.getRandomValues", script)
+        self.assertIn("new Uint8Array(32)", script)
+        self.assertIn('.replace(/=+$/, "")', script)  # base64url without padding: 43 characters
+        self.assertIn("window.isSecureContext && navigator.clipboard", script)
+        # Nothing is sent: the helper makes no request.
+        helper = script[script.index("Suggest a key"):]
+        self.assertNotIn("fetch(", helper)
+        self.assertNotIn("XMLHttpRequest", helper)
+        self.assertNotIn("onclick", (TEMPLATES / "_headerauth.html").read_text())
+
+
+@unittest.skipIf(jinja2 is None, "Jinja2 not installed (run inside the add-on image)")
+class CustomCardTests(unittest.TestCase):
+    """The "Custom Caddy configuration" card (2.3.0): hidden without files,
+    loaded (files, folder, restart), rejected (danger, Caddy's message, what
+    to do), ignored entries."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.env = jinja2.Environment(loader=jinja2.FileSystemLoader(str(TEMPLATES)), autoescape=True)
+
+    def render(self, state):
+        return self.env.get_template("_custom.html").render({"cc": customconf.card_context(state)})
+
+    def test_hidden_without_files(self):
+        self.assertEqual(self.render({"state": "none", "files": [], "ignored": []}).strip(), "")
+
+    def test_loaded(self):
+        html = self.render({"state": "loaded", "folder": "app_configs/2644ca2c_caddy_mtls/caddy",
+                            "files": [{"name": "site.caddy", "bytes": 120}, {"name": "sites.caddy", "bytes": 40}]})
+        for needle in ('id="custom-config"', 'data-state="loaded"', "status--success", ">In use<",
+                       "<code>caddy/site.caddy</code> (120 bytes)", "Restart the add-on to apply changes",
+                       "<code>app_configs/2644ca2c_caddy_mtls/caddy/</code>",
+                       "<code>addon_configs/2644ca2c_caddy_mtls/caddy/</code> in apps that still use the old name",
+                       "Advanced SSH &amp; Web Terminal"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, html)
+
+    def test_rejected(self):
+        html = self.render({"state": "rejected", "folder": "app_configs/local_caddy_mtls/caddy",
+                            "files": [{"name": "site.caddy", "bytes": 12}], "error_file": "site.caddy",
+                            "error": "adapting config: File to import not found: x, at caddy/site.caddy:2 <b>"})
+        for needle in ('data-state="rejected"', "status--danger", ">Not in use<", 'role="alert"',
+                       "Your custom files are NOT in use.", "at caddy/site.caddy:2 &lt;b&gt;",
+                       "correct\n    <code>site.caddy</code>", "restart the app",
+                       "Do not rely on a\n    snippet for a restriction"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, html)
+
+    def test_dropped_at_run_time(self):
+        """B-2: a reload dropped them (customconf.drop)."""
+        message = ("Caddy could not reload with your custom files while applying a change (open "
+                   "/config/caddy/o.key: no such file or directory). To apply the change the add-on dropped them; "
+                   "they are read again at the next start.")
+        html = self.render({"state": "rejected", "folder": "app_configs/local_caddy_mtls/caddy",
+                            "files": [{"name": "sites.caddy", "bytes": 80}], "error_file": None, "error": message,
+                            "dropped": "reload", "dropped_at": 1795789792.5})
+        for needle in ('data-state="rejected"', "status--danger", 'role="alert"',
+                       "Your custom files are NOT in use any more.", "the change took effect", message,
+                       "correct the file a\n    snippet refers to", "restart the app"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, html)
+        self.assertNotIn("integrity", html)
+
+    def test_ignored_only(self):
+        html = self.render({"state": "none", "files": [], "folder": None,
+                            "ignored": [{"name": "lan.caddy", "reason": "larger than 256 KiB"}]})
+        self.assertIn('data-state="none"', html)
+        self.assertIn("<code>caddy/lan.caddy</code>: larger than 256 KiB", html)
+        self.assertIn("caddy/ in the add-on&#39;s configuration folder", html)
+
+    def test_dashboard_includes_it(self):
+        index = (TEMPLATES / "index.html").read_text()
+        self.assertLess(index.index('"_headerauth.html"'), index.index('"_custom.html"'))
+
+
+class UpstreamTextsTests(unittest.TestCase):
+    """1.8: with header authentication, the texts that name who gets
+    through the public port name the key too (the decision is unchanged)."""
+
+    def test_consequences_name_the_key(self):
+        plain = upstream.Settings("home.example.org", "homeassistant", 8123, True, "auto")
+        keyed = upstream.Settings("home.example.org", "homeassistant", 8123, True, "auto", header_auth=True)
+        text = " ".join(upstream.strip_consequences(plain, "172.30.33.3"))
+        self.assertIn("from every device with a client certificate.", text)
+        self.assertNotIn("header key", text)
+        text = " ".join(upstream.strip_consequences(keyed, "172.30.33.3"))
+        self.assertIn("from every device with a client certificate or the header key.", text)
+        self.assertIn("every device with a client certificate or the header key logs in without a password", text)
+        self.assertEqual(upstream.decide("auto", True, "refused"), "strip")
+
+    def test_settings_from_runtime(self):
+        base = {"domain": "home.example.org", "upstream_host": "homeassistant", "upstream_port": 8123,
+                "mtls_enabled": True, "forwarded_headers": "auto"}
+        self.assertFalse(upstream.Settings.from_runtime(base).header_auth)
+        self.assertTrue(upstream.Settings.from_runtime(base | {"header_auth": {"enabled": True}}).header_auth)
+        self.assertFalse(upstream.Settings.from_runtime(base | {"header_auth": {"enabled": "yes"}}).header_auth)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 # https://developers.home-assistant.io/docs/add-ons/configuration/
 
 name: "Caddy mTLS Proxy"
-version: "2.2.0"
+version: "2.3.0"
 slug: "caddy_mtls"
 description: >-
   Caddy reverse proxy with mutual TLS (mTLS) client certificate authentication
@@ -39,7 +39,7 @@ ports:
 
 ports_description:
   "80/tcp": "HTTP (Let's Encrypt HTTP-01, CRL, redirect to HTTPS). Router: forward external TCP 80 to this port."
-  "443/tcp": "HTTPS with mTLS client certificates. Router: forward external TCP 443 to this port."
+  "443/tcp": "HTTPS: client certificate, or the header key if one is set. Router: forward external TCP 443 here."
   "4443/tcp": "Local-network HTTPS without client certificate (private addresses only). Never forward on the router."
 
 # Ingress configuration for the certificate management web UI (FastAPI app
@@ -83,6 +83,8 @@ options:
   log_level: "info"
   access_log: false
   forwarded_headers: "auto"
+  header_auth_name: "X-Custom-PSK"
+  header_auth_key: ""
   cert_expiry_warn_days:
     - 30
     - 14
@@ -115,6 +117,12 @@ schema:
   # accepts it, else (with mTLS) remove the forwarding headers; always /
   # never: pass on / remove regardless (since 2.2.0).
   forwarded_headers: list(auto|always|never)
+  # Header authentication (since 2.3.0): with a key, a request that carries
+  # the header header_auth_name with exactly the key is accepted without a
+  # client certificate. init-caddy checks both again (length 32-256 and the
+  # character set of the key, reserved header names).
+  header_auth_name: "match(^[A-Za-z][A-Za-z0-9-]{0,63}$)?"
+  header_auth_key: password?
   cert_expiry_warn_days:
     - int(1,365)
   cert_check_interval_hours: int(1,168)

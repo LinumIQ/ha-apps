@@ -46,6 +46,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import BaseHTTPMiddleware
 
+import caddyctl
+import customconf
+import headerauth
 import public_cert
 import upstream
 
@@ -61,7 +64,7 @@ logging.basicConfig(
 
 CERT_DIR = Path(os.environ.get("CERT_DIR", "/data/certs"))
 STATE_FILE = Path(os.environ.get("STATE_FILE", "/data/state.json"))
-CADDY_ADMIN = os.environ.get("CADDY_ADMIN", "localhost:2019")
+CADDY_ADMIN = os.environ.get("CADDY_ADMIN", "127.0.0.1:2019")
 CADDY_BIN = os.environ.get("CADDY_BIN", "/usr/bin/caddy")
 CADDYFILE = Path(os.environ.get("CADDYFILE", "/etc/caddy/Caddyfile"))
 HELPER_SCRIPT = Path("/etc/s6-overlay/scripts/lib/cert-helpers.sh")
@@ -123,11 +126,19 @@ def _read_state() -> dict[str, Any]:
         return {"version": 1, "ca": None, "server": None, "clients": []}
 
 
-def _caddy_reload() -> tuple[bool, str]:
-    """Reload Caddy via the admin API.
+def _caddy_reload() -> caddyctl.ReloadResult:
+    """Reload Caddy via the admin API (caddyctl.reload_detailed).
 
-    Uses the `caddy` CLI which knows how to convert the Caddyfile to JSON
-    and POST it to /load on the admin endpoint.
+    The `caddy` CLI converts the Caddyfile to JSON and POSTs it to /load on
+    the admin endpoint. Before that, caddyctl regenerates the list of active
+    client certificates from the ``active/`` folder (the header
+    authentication gate, 2.3.0); if that fails, Caddy is reloaded all the
+    same (with the previous list: revocation must not depend on it) and the
+    result is "not ok" with a message that says so. See caddyctl.py for what
+    a reload re-reads (the custom snippets only as the copies checked at the
+    start; files they refer to are read again, and if Caddy cannot reload
+    with them any more the custom files are dropped for this run so that the
+    change takes effect: ``result.dropped``).
 
     ``--force`` is required: client changes never change the Caddyfile (the
     leaf verifier only names the ``active/`` folder, whose files Caddy reads
@@ -135,27 +146,24 @@ def _caddy_reload() -> tuple[bool, str]:
     is unchanged") - without it, added clients were refused and revoked ones
     still accepted until the add-on restarted.
     """
-    if not CADDYFILE.exists():
-        return False, f"Caddyfile not found at {CADDYFILE}"
-    proc = subprocess.run(
-        [
-            CADDY_BIN,
-            "reload",
-            "--force",
-            "--config",
-            str(CADDYFILE),
-            "--adapter",
-            "caddyfile",
-            "--address",
-            CADDY_ADMIN,
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        return False, proc.stderr or proc.stdout or "caddy reload failed"
-    return True, "reloaded"
+    return caddyctl.reload_detailed(caddy_bin=CADDY_BIN, caddyfile=CADDYFILE, admin=CADDY_ADMIN)
+
+
+def _applied(request: Request, ok: str, result: caddyctl.ReloadResult) -> RedirectResponse:
+    """The redirect after a change Caddy applied: the ok banner, and beside
+    it as an error banner that the custom files were dropped to apply it
+    (caddyctl, 2.3.0)."""
+    return _redirect_home(request, ok=ok, error=result.dropped or None)
+
+
+def _reload_problem(message: str) -> str:
+    """The end of a "..., but ..." flash message after a reload that was not
+    ok: what caddyctl reports when only the list of active certificates
+    failed (Caddy did reload), else that reloading failed."""
+    if message.startswith("the list of active client certificates"):
+        text = message if len(message) <= 600 else message[:597] + "..."
+        return f"{text}. Check the add-on logs."
+    return "reloading Caddy failed. Check the add-on logs."
 
 
 def _validate_client_name(name: str) -> str:
@@ -301,6 +309,15 @@ def _upstream_context() -> dict[str, Any]:
     return {"hc": upstream.card_context(settings, upstream.load_state(settings) if settings else None)}
 
 
+def _runtime_json() -> dict[str, Any] | None:
+    """runtime.json as it is (the facts of this start; never a secret)."""
+    try:
+        data = json.loads(public_cert.RUNTIME_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 # Sync (def) routes run in the thread pool: they read files and call openssl.
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request) -> Any:
@@ -309,6 +326,7 @@ def index(request: Request) -> Any:
     crl_exists = (CERT_DIR / "mTLS-CA.crl").exists()
     flash_error = request.query_params.get("error") or None
     flash_ok = request.query_params.get("ok") or None
+    runtime = public_cert.read_runtime()
     return templates.TemplateResponse(
         request,
         "index.html",
@@ -320,8 +338,16 @@ def index(request: Request) -> Any:
             "flash_ok": flash_ok,
             **_public_cert_context(),
             **_upstream_context(),
-            # The "Local network" card (the facts of this start).
-            "lan_rt": public_cert.read_runtime(),
+            # The facts of this start: the "Local network" card, the
+            # add-on's configuration folder (the certificate copies).
+            "lan_rt": runtime,
+            "rt": runtime,
+            # The "Header authentication" card (name, key length - never
+            # the key).
+            "ha": headerauth.card_context(_runtime_json()),
+            # The "Custom Caddy configuration" card (only when files
+            # counted or were ignored).
+            "cc": customconf.card_context(customconf.read_state()),
         },
     )
 
@@ -500,14 +526,13 @@ async def add_client(request: Request, name: str = Form(...)):
             f"Failed to create client '{name}'. See add-on logs for details."
         )
 
-    ok_reload, msg = _caddy_reload()
-    if not ok_reload:
-        LOG.error("caddy reload after add_client failed: %s", msg)
+    result = _caddy_reload()
+    if not result.ok:
+        LOG.error("caddy reload after add_client failed: %s", result.message)
         raise FlashError(
-            f"Client '{name}' was created, but reloading Caddy failed. "
-            "Check the add-on logs."
+            f"Client '{name}' was created, but {_reload_problem(result.banner)}"
         )
-    return _redirect_home(request, ok=f"Client '{name}' created.")
+    return _applied(request, f"Client '{name}' created.", result)
 
 
 @app.post("/api/clients/{name}/revoke")
@@ -538,14 +563,13 @@ async def revoke_client(request: Request, name: str, reason: str = Form("unspeci
             f"Failed to revoke client '{name}'. See add-on logs for details."
         )
 
-    ok_reload, msg = _caddy_reload()
-    if not ok_reload:
-        LOG.error("caddy reload after revoke_client failed: %s", msg)
+    result = _caddy_reload()
+    if not result.ok:
+        LOG.error("caddy reload after revoke_client failed: %s", result.message)
         raise FlashError(
-            f"Client '{name}' was revoked, but reloading Caddy failed. "
-            "Check the add-on logs."
+            f"Client '{name}' was revoked, but {_reload_problem(result.banner)}"
         )
-    return _redirect_home(request, ok=f"Client '{name}' revoked.")
+    return _applied(request, f"Client '{name}' revoked.", result)
 
 
 @app.post("/api/clients/{name}/regenerate")
@@ -588,14 +612,13 @@ async def regenerate_client(request: Request, name: str):
             f"Failed to regenerate client '{name}'. See add-on logs for details."
         )
 
-    ok_reload, msg = _caddy_reload()
-    if not ok_reload:
-        LOG.error("caddy reload after regenerate_client failed: %s", msg)
+    result = _caddy_reload()
+    if not result.ok:
+        LOG.error("caddy reload after regenerate_client failed: %s", result.message)
         raise FlashError(
-            f"Client '{name}' was regenerated, but reloading Caddy failed. "
-            "Check the add-on logs."
+            f"Client '{name}' was regenerated, but {_reload_problem(result.banner)}"
         )
-    return _redirect_home(request, ok=f"Client '{name}' regenerated.")
+    return _applied(request, f"Client '{name}' regenerated.", result)
 
 
 _CHECK_RESULT = {
@@ -720,11 +743,11 @@ async def regenerate_ca(request: Request, confirm: str = Form(...)):
             "Failed to regenerate the CA. See add-on logs for details."
         )
 
-    ok_reload, msg = _caddy_reload()
-    if not ok_reload:
-        LOG.error("caddy reload after regenerate_ca failed: %s", msg)
+    result = _caddy_reload()
+    if not result.ok:
+        LOG.error("caddy reload after regenerate_ca failed: %s", result.message)
         raise FlashError(
-            "CA was regenerated, but reloading Caddy failed. Check the add-on logs."
+            f"CA was regenerated, but {_reload_problem(result.banner)}"
         )
-    return _redirect_home(request, ok="CA regenerated.")
+    return _applied(request, "CA regenerated.", result)
 

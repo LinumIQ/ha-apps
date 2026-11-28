@@ -259,6 +259,9 @@ jobs:
           caddy-mtls/rootfs/usr/lib/cert-mgr/public_cert.py
           caddy-mtls/rootfs/usr/lib/cert-mgr/upstream.py
           caddy-mtls/rootfs/usr/lib/cert-mgr/lan.py
+          caddy-mtls/rootfs/usr/lib/cert-mgr/headerauth.py
+          caddy-mtls/rootfs/usr/lib/cert-mgr/caddyctl.py
+          caddy-mtls/rootfs/usr/lib/cert-mgr/customconf.py
           caddy-mtls/tests/fake-upstream.py
           caddy-mtls/tests/real-core-ws.py
 
@@ -270,6 +273,11 @@ jobs:
       # Assistant on 127.0.0.1, decision table, snippet, the monitor's
       # cadence and noise rules with a mocked clock, the notification), the
       # local-network port (lan.py: private ranges, default gateways).
+      # 2.3.0: header authentication (headerauth.py: option rules, key file,
+      # scrubbing; caddyctl.py: the fingerprint list, the reload that
+      # regenerates it) and the custom Caddyfile snippets (customconf.py,
+      # incl. the integrity check against configurations Caddy 2.11.9 built:
+      # tests/unit/fixtures/customconf/).
       - name: Unit tests
         run: python -m unittest discover -s caddy-mtls/tests/unit -v
 

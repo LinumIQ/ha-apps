@@ -1,0 +1,712 @@
+"""Unit tests for cert-mgr/customconf.py (Caddyfile snippets for experts,
+2.3.0): which files count, the copies, the import rule, Caddy's messages,
+the state and the card - and the integrity check against configurations
+that Caddy 2.11.9 really built (fixtures/customconf/*.json: `caddy adapt` of
+the add-on's own rendering with and without custom files, collected by
+`SMOKE_FIXTURES_DIR=<dir> SMOKE_ONLY=custom tests/smoke.sh <image>`; the
+cases are smoke.sh's custom_files), also changed on purpose here to prove
+each rule.
+
+Standard library only. Runs against the repository's module, or the
+installed one with CERT_MGR_DIR - see test_monitor.py.
+"""
+from __future__ import annotations
+
+import io
+import json
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import unittest
+import unittest.mock
+from contextlib import redirect_stdout
+from pathlib import Path
+
+CERT_MGR = Path(
+    os.environ.get("CERT_MGR_DIR")
+    or Path(__file__).resolve().parents[2] / "rootfs" / "usr" / "lib" / "cert-mgr"
+)
+sys.path.insert(0, str(CERT_MGR))
+
+import customconf  # noqa: E402
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "customconf"
+OPENSSL = shutil.which("openssl")
+
+
+def make_cert_pem(san: str | None, cn: str = "smoke (fake)") -> bytes:
+    """A throwaway self-signed certificate (PEM) with one DNS subject
+    alternative name (or none)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        args = [OPENSSL, "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+                "-subj", f"/CN={cn}", "-days", "2", "-keyout", f"{tmp}/k.pem", "-out", f"{tmp}/c.pem"]
+        if san:
+            args += ["-addext", f"subjectAltName=DNS:{san}"]
+        subprocess.run(args, check=True, capture_output=True)
+        return Path(tmp, "c.pem").read_bytes()
+
+
+class CollectTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.src = self.tmp / "config" / "caddy"
+        self.src.mkdir(parents=True)
+        self.dst = self.tmp / "etc" / "custom"
+
+    def put(self, name: str, data: bytes | str) -> Path:
+        path = self.src / name
+        path.write_bytes(data.encode() if isinstance(data, str) else data)
+        return path
+
+    def test_nothing(self) -> None:
+        result = customconf.collect(self.src, self.dst)
+        self.assertEqual(result, {"files": [], "ignored": [], "error": "", "error_file": None})
+        self.assertEqual(list(self.dst.iterdir()), [])
+        self.assertEqual(stat.S_IMODE(self.dst.stat().st_mode), 0o700)
+
+    def test_counting_files_are_copied_byte_for_byte(self) -> None:
+        site = 'header X-Site "yes"\r\nrespond /hello "hello" 200\r\n'  # CRLF
+        self.put("site.caddy", site)
+        self.put("sites.caddy", b"\xef\xbb\xbfother.example.com {\n\timport mtls\n}\n")  # a BOM
+        self.put("global.caddy", "servers {\n\tprotocols h1 h2\n}\n")
+        self.put("notes.txt", "ignored silently")
+        self.put("README.txt", "ours")
+        result = customconf.collect(self.src, self.dst)
+        self.assertEqual(result["error"], "")
+        self.assertEqual([f["name"] for f in result["files"]], ["global.caddy", "site.caddy", "sites.caddy"])
+        self.assertEqual(result["files"][1]["bytes"], len(site.encode()))
+        self.assertEqual(result["ignored"], [])
+        self.assertEqual((self.dst / "site.caddy").read_bytes(), site.encode())
+        self.assertEqual((self.dst / "sites.caddy").read_bytes()[:3], b"\xef\xbb\xbf")
+        for path in self.dst.iterdir():
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(sorted(p.name for p in self.dst.iterdir()), ["global.caddy", "site.caddy", "sites.caddy"])
+
+    def test_ignored_entries(self) -> None:
+        target = self.put("elsewhere.txt", "respond x\n")
+        (self.src / "site.caddy").symlink_to(target)
+        self.put("lan.caddy", "x" * (customconf.MAX_BYTES + 1))
+        self.put("global.caddy", "  \n\t\n")
+        (self.src / "sites.caddy").mkdir()
+        result = customconf.collect(self.src, self.dst)
+        reasons = {i["name"]: i["reason"] for i in result["ignored"]}
+        self.assertIn("symbolic link", reasons["site.caddy"])
+        self.assertIn("larger than 256 KiB", reasons["lan.caddy"])
+        self.assertEqual(reasons["global.caddy"], "empty")
+        self.assertEqual(reasons["sites.caddy"], "not a regular file")
+        self.assertEqual(result["files"], [])
+        self.assertEqual(list(self.dst.iterdir()), [])
+
+    def test_a_fifo_is_never_opened(self) -> None:
+        os.mkfifo(self.src / "site.caddy")  # opening it would block the start
+        self.put("lan.caddy", "respond /x 200\n")
+        result = customconf.collect(self.src, self.dst)
+        self.assertEqual(result["ignored"], [{"name": "site.caddy", "reason": "not a regular file"}])
+        self.assertEqual([f["name"] for f in result["files"]], ["lan.caddy"])
+
+    def test_exactly_256_kib_counts(self) -> None:
+        self.put("site.caddy", "#" * (customconf.MAX_BYTES - 1) + "\n")
+        self.assertEqual(len(customconf.collect(self.src, self.dst)["files"]), 1)
+
+    def test_imports_of_files_reject_everything(self) -> None:
+        self.put("site.caddy", "respond /ok 200\n")
+        for line in ("import /etc/caddy/Caddyfile", "  import ../certs/x", 'import "other.caddy"',
+                     "`import` /x", '"import" /x', "@m {\n\timport /tmp/m\n}", "import *.caddy",
+                     "import", "respond x { import /y }"):
+            with self.subTest(line=line):
+                self.put("sites.caddy", f"other.example.com {{\n{line}\n}}\n")
+                result = customconf.collect(self.src, self.dst)
+                self.assertEqual(result["error_file"], "sites.caddy")
+                self.assertIn("caddy/sites.caddy:", result["error"])
+                self.assertIn("may only import a snippet by its name", result["error"])
+                self.assertEqual(list(self.dst.iterdir()), [], "nothing is copied")
+
+    def test_snippet_imports_and_comments_are_fine(self) -> None:
+        self.put("sites.caddy", "other.example.com {\n\timport mtls\n\timport my_snippet arg1\n"
+                                "\t# import /etc/passwd\n\trespond \"x\" # import /y\n}\n")
+        result = customconf.collect(self.src, self.dst)
+        self.assertEqual(result["error"], "")
+        self.assertEqual([f["name"] for f in result["files"]], ["sites.caddy"])
+
+    def test_not_utf8(self) -> None:
+        self.put("site.caddy", b"respond /x \xff\xfe 200\n")
+        result = customconf.collect(self.src, self.dst)
+        self.assertEqual(result["error"], "caddy/site.caddy is not UTF-8 text")
+
+    def test_previous_copies_are_removed(self) -> None:
+        self.put("site.caddy", "respond /x 200\n")
+        customconf.collect(self.src, self.dst)
+        (self.src / "site.caddy").unlink()
+        customconf.collect(self.src, self.dst)
+        self.assertEqual(list(self.dst.iterdir()), [])
+
+    def test_cli_collect_readme_and_state(self) -> None:
+        self.put("site.caddy", "respond /x 200\n")
+        state_file = self.tmp / "run" / "custom.json"
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = customconf._main(["collect", "--config-dir", str(self.src), "--copy-dir", str(self.dst),
+                                   "--state", str(state_file), "--slug", "local_caddy_mtls", "--lan", "on"])
+        self.assertEqual(rc, 0)
+        state = json.loads(state_file.read_text())
+        self.assertEqual((state["state"], state["folder"]), ("loaded", "app_configs/local_caddy_mtls/caddy"))
+        readme = (self.src / "README.txt").read_text()
+        for needle in ("global.caddy", "site.caddy", "lan.caddy", "sites.caddy", "import mtls",
+                       "applied when the add-on STARTS", "NONE of", customconf.DOCS_URL):
+            self.assertIn(needle, readme)
+        # rejected: the copies go, the state says why.
+        with redirect_stdout(io.StringIO()):
+            customconf._main(["reject", "--copy-dir", str(self.dst), "--state", str(state_file),
+                              "--message", "rule 2 (sites.caddy): x", "--file", "sites.caddy"])
+        state = json.loads(state_file.read_text())
+        self.assertEqual((state["state"], state["error"], state["error_file"]),
+                         ("rejected", "rule 2 (sites.caddy): x", "sites.caddy"))
+        self.assertFalse(self.dst.exists())
+
+    def test_cli_without_a_config_folder(self) -> None:
+        """Outside Supervisor (no /config): nothing is written there."""
+        state_file = self.tmp / "custom.json"
+        missing = self.tmp / "nope" / "caddy"
+        with redirect_stdout(io.StringIO()):
+            customconf._main(["collect", "--config-dir", str(missing), "--copy-dir", str(self.dst),
+                              "--state", str(state_file), "--lan", "off"])
+        self.assertFalse(missing.parent.exists())
+        self.assertEqual(json.loads(state_file.read_text())["state"], "none")
+
+
+    def test_lan_caddy_counts_only_while_the_port_is_on(self) -> None:
+        """B-5: not imported (the site does not exist), so neither copied
+        nor validated - never "in use"."""
+        self.put("site.caddy", "respond /x 200\n")
+        self.put("lan.caddy", "this is { broken\n")
+        for lan, reason in (("off", "the local-network port is off"),
+                            ("unknown", "the local-network port's state is unknown (it stays off)")):
+            with self.subTest(lan=lan):
+                result = customconf.collect(self.src, self.dst, lan)
+                self.assertEqual([f["name"] for f in result["files"]], ["site.caddy"])
+                self.assertEqual(result["ignored"], [{"name": "lan.caddy", "reason": reason}])
+                self.assertEqual(sorted(os.listdir(self.dst)), ["site.caddy"])
+        result = customconf.collect(self.src, self.dst, "on")
+        self.assertEqual([f["name"] for f in result["files"]], ["site.caddy", "lan.caddy"])
+        self.assertEqual(result["ignored"], [])
+        # Only lan.caddy, port off: nothing counts (state none at the CLI).
+        (self.src / "site.caddy").unlink()
+        state_file = self.tmp / "custom.json"
+        with redirect_stdout(io.StringIO()):
+            customconf._main(["collect", "--config-dir", str(self.src), "--copy-dir", str(self.dst),
+                              "--state", str(state_file), "--lan", "off"])
+        state = json.loads(state_file.read_text())
+        self.assertEqual((state["state"], state["files"]), ("none", []))
+        self.assertTrue(customconf.card_context(state)["show"])  # the ignored entry is shown
+
+
+class DropTest(unittest.TestCase):
+    """B-2: dropping the custom files at run time (customconf.drop), the
+    reload lock, Caddy's message."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.caddyfile = self.tmp / "Caddyfile"
+        self.fallback = self.tmp / "Caddyfile.own"
+        self.copies = self.tmp / "custom"
+        self.state = self.tmp / "custom.json"
+        self.copies.mkdir()
+        (self.copies / "sites.caddy").write_text("x\n")
+        self.caddyfile.write_text("with imports\n")
+        self.fallback.write_text("own\n")
+        customconf.write_state({"state": "loaded", "files": [{"name": "sites.caddy", "bytes": 2}], "ignored": [],
+                                "error": "", "error_file": None, "folder": None}, self.state)
+
+    def drop(self, **kwargs: object) -> str:
+        return customconf.drop("open /config/caddy/o.key: no such file or directory", caddyfile=self.caddyfile,
+                               fallback=self.fallback, copy_dir=self.copies, state_path=self.state, **kwargs)
+
+    def test_drop_at_a_reload(self) -> None:
+        message = self.drop()
+        self.assertEqual(message, "Caddy could not reload with your custom files while applying a change (open "
+                                  "/config/caddy/o.key: no such file or directory). To apply the change the add-on "
+                                  "dropped them; they are read again at the next start.")
+        self.assertEqual(self.caddyfile.read_text(), "own\n")
+        self.assertFalse(self.fallback.exists())
+        self.assertFalse(self.copies.exists())
+        state = customconf.read_state(self.state)
+        self.assertEqual((state["state"], state["error"], state["error_file"], state["dropped"]),
+                         ("rejected", message, None, "reload"))
+        self.assertGreater(state["dropped_at"], 0)
+        self.assertEqual(customconf.card_context(state)["state"], "rejected")
+
+    def test_drop_when_caddy_was_started_again(self) -> None:
+        message = self.drop(when="restart")
+        self.assertTrue(message.startswith("Caddy could not load the configuration with your custom files when it "
+                                           "was started again (open /config/caddy/o.key"))
+        self.assertTrue(message.endswith("they are read again at the next start of the add-on."))
+        self.assertEqual(customconf.read_state(self.state)["dropped"], "restart")
+
+    def test_cli_drop_scrubs_takes_the_lock_and_needs_the_fallback(self) -> None:
+        key = "fakekey.NOT-A-SECRET.0123456789abcdef0123"
+        key_file = self.tmp / "header-auth.key"
+        key_file.write_text(key)
+        output = self.tmp / "validate.out"
+        output.write_text('{"level":"info","msg":"using config from file"}\n'
+                          f"Error: loading certificates: open {self.copies}/sites.caddy: no such file ({key})\n")
+        lock = self.tmp / "run" / "reload.lock"
+        args = ["drop", "--output", str(output), "--caddyfile", str(self.caddyfile), "--fallback", str(self.fallback),
+                "--copy-dir", str(self.copies), "--state", str(self.state), "--lock", str(lock)]
+        import headerauth  # noqa: PLC0415 - next to customconf
+        out = io.StringIO()
+        with redirect_stdout(out), unittest.mock.patch.object(headerauth, "KEY_FILE", key_file):
+            rc = customconf._main(args)
+        self.assertEqual(rc, 0)
+        self.assertTrue(lock.exists())
+        text = out.getvalue()
+        self.assertIn("(loading certificates: open caddy/sites.caddy: no such file (<redacted>))", text)
+        self.assertNotIn(key, self.state.read_text())
+        self.assertEqual(self.caddyfile.read_text(), "own\n")
+        # Again: no fallback file any more - nothing to drop.
+        with redirect_stdout(io.StringIO()), unittest.mock.patch("sys.stderr", io.StringIO()):
+            self.assertEqual(customconf._main(args), 1)
+
+    def test_caddy_message(self) -> None:
+        reload_out = ('2026/11/28 00:01:02.345\tINFO\tusing config from file\n'
+                      'Error: sending configuration to instance: caddy responded with error: HTTP 400: '
+                      '{"error":"loading config: loading new config: loading tls app module: provision tls: '
+                      'loading certificates: open /config/caddy/o.key: no such file or directory"}\n')
+        self.assertEqual(customconf.caddy_message(reload_out),
+                         "loading config: loading new config: loading tls app module: provision tls: loading "
+                         "certificates: open /config/caddy/o.key: no such file or directory")
+        json_out = '{"level":"error","msg":"loading certificates","error":"open /etc/caddy/custom/lan.caddy: x"}\n'
+        self.assertEqual(customconf.caddy_message(json_out), "loading certificates: open caddy/lan.caddy: x")
+        self.assertEqual(customconf.caddy_message(""), "no message")
+        long = customconf.caddy_message("Error: " + "y" * 2000)
+        self.assertEqual(len(long), customconf.CADDY_MESSAGE_MAX)
+        self.assertTrue(long.endswith("..."))
+
+    def test_final_error(self) -> None:
+        """B3-2: the CLI's final error message, or None without one."""
+        self.assertEqual(customconf.final_error('{"level":"error","msg":"a"}\nError: b\n{"level":"info","msg":"c"}\n'),
+                         "b")
+        self.assertEqual(customconf.final_error('Error: b\n{"level":"error","msg":"a","error":"e"}\n'), "a: e")
+        self.assertIsNone(customconf.final_error('{"level":"info","msg":"c"}\nplain\n'))
+        self.assertEqual(customconf.caddy_message('{"level":"info","msg":"c"}\nplain\n'), "plain")
+
+    def test_caddy_message_of_a_console_log_line(self) -> None:
+        """B2-3: the reviewer's line (Caddy's console log format, the level
+        coloured): no time stamp, no level, no colour codes."""
+        line = ("2026/11/28 01:08:48.373\t\x1b[31mERROR\x1b[0m\tloading http app module: provision http: "
+                "loading certificates: open /config/caddy/o.key: no such file or directory\n")
+        self.assertEqual(customconf.caddy_message("2026/11/28 01:08:48.370\tINFO\tusing config from file\n" + line),
+                         "loading http app module: provision http: loading certificates: open /config/caddy/o.key: "
+                         "no such file or directory")
+        with_fields = ('2026/11/28 01:08:48.373\tERROR\ttls\tloading failed\t{"error": "open /x: denied"}\n')
+        self.assertEqual(customconf.caddy_message(with_fields), "loading failed: open /x: denied")
+        self.assertEqual(customconf.log_entry("plain text"), None)
+
+    def test_reload_lock_excludes_another_holder(self) -> None:
+        import fcntl
+        lock = self.tmp / "run" / "reload.lock"
+        with customconf.reload_lock(lock):
+            fd = os.open(lock, os.O_RDWR)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+        fd = os.open(lock, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # released
+        finally:
+            os.close(fd)
+        self.assertEqual(stat.S_IMODE(os.stat(lock).st_mode), 0o600)
+
+
+class MessageTest(unittest.TestCase):
+    def test_console_format_at_the_start(self) -> None:
+        """B2-3: the same message in Caddy's console format (colours)."""
+        out = ("2026/11/28 01:08:48.373\t\x1b[31mERROR\x1b[0m\tadapting config using caddyfile: File to import "
+               "not found: foo, at /etc/caddy/custom/site.caddy:1\n")
+        self.assertEqual(customconf.describe_error(out),
+                         ("adapting config using caddyfile: File to import not found: foo, at caddy/site.caddy:1",
+                          "site.caddy"))
+
+    def test_a_relative_path(self) -> None:
+        """B2-4: Caddy could not open a relative path - say that paths must
+        be absolute instead of the generic hint."""
+        out = ('{"level":"error","msg":"loading http app module: provision http: loading certificates: open '
+               'config/caddy/o.crt: no such file or directory"}\n')
+        text, file = customconf.describe_error(out)
+        self.assertIsNone(file)
+        self.assertTrue(text.startswith("a snippet refers to config/caddy/o.crt, a relative path: give files by their "
+                                        "absolute path"), text)
+        self.assertNotIn("unbalanced braces", text)
+        # An absolute path that is missing keeps the generic text.
+        out = out.replace("config/caddy/o.crt", "/config/caddy/o.crt")
+        self.assertIn("unbalanced braces", customconf.describe_error(out)[0])
+
+    def test_named_file(self) -> None:
+        out = ('{"level":"info","msg":"using config from file"}\n'
+               '{"level":"error","ts":1.5,"msg":"adapting config using caddyfile: File to import not found: foo, '
+               "at /etc/caddy/custom/site.caddy:1 import chain ['/etc/caddy/Caddyfile:96 (import)']\"}\n")
+        text, file = customconf.describe_error(out)
+        self.assertEqual(file, "site.caddy")
+        self.assertEqual(text, "adapting config using caddyfile: File to import not found: foo, at caddy/site.caddy:1")
+        self.assertNotIn("/etc/caddy", text)
+
+    def test_only_the_generated_file(self) -> None:
+        out = ('{"level":"error","msg":"adapting config using caddyfile: parsing caddyfile tokens for '
+               "'route': tls directive returned something other than an HTTP route or subroute: "
+               '&caddytls.InternalIssuer{} (only handler directives can be used in routes), at /etc/caddy/Caddyfile:96"}\n')
+        text, file = customconf.describe_error(out)
+        self.assertIsNone(file)
+        self.assertIn("one of your files", text)
+        self.assertIn("unbalanced braces", text)
+        self.assertNotIn("Caddyfile:96", text)
+        self.assertIn("tls directive returned something other", text)
+
+    def test_cli_error_line_and_cap(self) -> None:
+        text, _ = customconf.describe_error("noise\nError: " + "x" * 5000 + "\n")
+        self.assertLessEqual(len(text), customconf.ERROR_MAX)
+        self.assertTrue(text.endswith("..."))
+
+
+class CardTest(unittest.TestCase):
+    def test_context(self) -> None:
+        self.assertFalse(customconf.card_context(customconf.read_state(Path("/nonexistent")))["show"])
+        ctx = customconf.card_context({"state": "none", "files": [], "folder": "app_configs/x/caddy",
+                                       "ignored": [{"name": "site.caddy", "reason": "a symbolic link"}]})
+        self.assertTrue(ctx["show"])
+        self.assertEqual(ctx["folder_legacy"], "addon_configs/x/caddy")  # C-1
+        self.assertIsNone(customconf.legacy_folder(None))
+        ctx = customconf.card_context({"state": "rejected", "files": [{"name": "site.caddy", "bytes": 3}],
+                                       "error": "e" * 9000, "error_file": "../x", "folder": None})
+        self.assertEqual((ctx["state"], ctx["error_file"], len(ctx["error"])), ("rejected", None, customconf.ERROR_MAX))
+
+
+class HostTest(unittest.TestCase):
+    def test_overlap(self) -> None:
+        for pattern, domain, expected in (
+            ("home.example.com", "home.example.com", True),
+            ("HOME.example.com.", "home.example.com", True),
+            ("*.example.com", "home.example.com", True),
+            ("other.example.com", "home.example.com", False),
+            ("*.home.example.com", "home.example.com", False),
+            ("printer.example.com", "*.example.com", True),
+            ("{env.HOST}", "home.example.com", True),
+            ("*", "home.example.com", False),
+        ):
+            with self.subTest(pattern=pattern, domain=domain):
+                self.assertEqual(customconf._labels_overlap(pattern, domain), expected)
+
+    def test_route_may_match(self) -> None:
+        d = "home.example.com"
+        self.assertTrue(customconf.route_may_match({"handle": []}, d))
+        self.assertTrue(customconf.route_may_match({"match": [{"path": ["/x"]}]}, d))
+        self.assertTrue(customconf.route_may_match({"match": [{"host": ["other.example.com"]}, {"path": ["/x"]}]}, d))
+        self.assertFalse(customconf.route_may_match({"match": [{"host": ["other.example.com"], "path": ["/x"]}]}, d))
+        self.assertTrue(customconf.route_may_match({"match": [{"host": [d], "path": ["/bypass/*"]}]}, d))
+
+
+@unittest.skipUnless((FIXTURES / "meta.json").is_file(), "fixtures not generated")
+class IntegrityTest(unittest.TestCase):
+    """The integrity check on configurations Caddy 2.11.9 built from the
+    add-on's own rendering (see make.sh)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.meta = json.loads((FIXTURES / "meta.json").read_text())
+
+    def load(self, name: str) -> dict:
+        return json.loads((FIXTURES / f"{name}.json").read_text())
+
+    def run_check(self, case: str, read_file=None) -> list[str]:
+        info = self.meta[case]
+        return customconf.check(self.load(case), self.load(f"{case}.reference"), domain=self.meta["domain"],
+                                upstream=info["upstream"], files=info["files"],
+                                header_auth=info["header_auth"], read_file=read_file)
+
+    def test_cases(self) -> None:
+        for case, info in sorted(self.meta.items()):
+            if not isinstance(info, dict):
+                continue
+            with self.subTest(case=case):
+                # Certificate files a case's snippet loads: made here with
+                # the case's subject alternative name (B-4).
+                certs = {path: make_cert_pem(san) for path, san in (info.get("certs") or {}).items()}
+                if certs and not OPENSSL:
+                    self.skipTest("openssl")
+                read_file = certs.__getitem__ if certs else None
+                if info["expect"] == "ok":
+                    rules = self.run_check(case, read_file)
+                    self.assertEqual(len(rules), 4, rules)
+                else:
+                    with self.assertRaises(customconf.Violation) as ctx:
+                        self.run_check(case, read_file)
+                    self.assertEqual(ctx.exception.rule, info["expect"], ctx.exception.message)
+                    self.assertIn(info.get("message", ""), ctx.exception.message)
+
+    def mutated(self, case: str, change, read_file=None) -> list[str]:
+        """The check of <case> after ``change(adapted)`` (a deliberate edit of
+        what Caddy built, for a rule the smoke test cannot reach easily)."""
+        info = self.meta[case]
+        adapted = self.load(case)
+        change(adapted)
+        return customconf.check(adapted, self.load(f"{case}.reference"), domain=self.meta["domain"],
+                                upstream=info["upstream"], files=info["files"], header_auth=info["header_auth"],
+                                read_file=read_file)
+
+    def server(self, config: dict, listen: str) -> dict:
+        return next(s for s in config["apps"]["http"]["servers"].values() if s["listen"] == [listen])
+
+    def assert_rule(self, rule: int, case: str, change) -> None:
+        with self.assertRaises(customconf.Violation) as ctx:
+            self.mutated(case, change)
+        self.assertEqual(ctx.exception.rule, rule, ctx.exception.message)
+
+    def test_rule_4_server_fields(self) -> None:
+        self.assert_rule(4, "ok", lambda c: self.server(c, ":443").update(
+            listener_wrappers=[{"wrapper": "proxy_protocol"}, {"wrapper": "tls"}]))
+        self.assert_rule(4, "ok", lambda c: self.server(c, ":4443").update(trusted_proxies={"source": "static",
+                                                                                          "ranges": ["0.0.0.0/0"]}))
+        self.assert_rule(4, "ok", lambda c: c.update(admin={"disabled": True}))
+        self.assert_rule(4, "ok", lambda c: c["apps"]["http"].update(grace_period=1000000000))
+        # A performance option is free.
+        self.assertEqual(len(self.mutated("ok", lambda c: self.server(c, ":443").update(idle_timeout=60000000000))), 4)
+
+    def test_rule_4_logs(self) -> None:
+        def unfiltered(c):
+            c["logging"]["logs"]["mine"] = {"writer": {"output": "stdout"}, "encoder": {"format": "console"}}
+        self.assert_rule(4, "ok", unfiltered)  # while a key is set
+        self.assertEqual(len(self.mutated("ok-strict", unfiltered)), 4)  # without a key: allowed
+
+        def filtered(c):
+            c["logging"]["logs"]["mine"] = {"writer": {"output": "stdout"}, "encoder": {
+                "format": "filter", "wrap": {"format": "console"},
+                "fields": {"request>headers": {"filter": "delete"}}}}
+        self.assertEqual(len(self.mutated("ok", filtered)), 4)
+
+        def default_changed(c):
+            c["logging"]["logs"]["default"]["level"] = "ERROR"
+        self.assert_rule(4, "ok", default_changed)
+
+    def test_rule_4_a_log_that_includes_the_access_logs(self) -> None:
+        """B-6: the adapter adds what an added log includes to the default
+        log's exclude - accepted for exactly those names; with a key set the
+        added log must still drop request headers."""
+        def including(filtered: bool, include: str = "http.log.access", exclude: str = "http.log.access"):
+            def change(c):
+                encoder = ({"format": "filter", "wrap": {"format": "json"},
+                            "fields": {"request>headers": {"filter": "delete"}}} if filtered else {"format": "json"})
+                c["logging"]["logs"]["mine"] = {"writer": {"output": "stdout"}, "encoder": encoder,
+                                                "include": [include]}
+                c["logging"]["logs"]["default"]["exclude"] = sorted(c["logging"]["logs"]["default"]["exclude"]
+                                                                    + [exclude])
+            return change
+        self.assertEqual(len(self.mutated("ok", including(True))), 4)
+        self.assertEqual(len(self.mutated("ok", including(True, "http.log.access.log0", "http.log.access.log0"))), 4)
+        self.assert_rule(4, "ok", including(False))  # a key is set: headers must go
+        self.assertEqual(len(self.mutated("ok-strict", including(False))), 4)
+        # An exclude that no added log includes: the add-on's log changed.
+        self.assert_rule(4, "ok", including(True, "http.log.access", "http.handlers.reverse_proxy"))
+
+    def test_rule_4_no_server_of_your_own(self) -> None:
+        """B-1: a site of yours on another port or with bind gets a server
+        of its own: it could take the admin endpoint (2019), the web
+        interface (8099) or the add-on's site on one address."""
+        for listen in ([":2019"], [":8099"], ["127.0.0.1:443"], [":8444"]):
+            with self.subTest(listen=listen):
+                def add(c, listen=listen):
+                    c["apps"]["http"]["servers"]["mine"] = {"listen": listen, "routes": [
+                        {"match": [{"host": ["other.localhost"]}], "handle": [{"handler": "static_response"}]}]}
+                with self.assertRaises(customconf.Violation) as ctx:
+                    self.mutated("ok", add)
+                self.assertEqual(ctx.exception.rule, 4)
+                self.assertIn(f"listens on {listen[0]}", ctx.exception.message)
+                self.assertIn("only the add-on's own ports 80, 443", ctx.exception.message)
+
+    def test_rule_2_more_ways_to_answer_the_domain(self) -> None:
+        catch_all = {"handle": [{"handler": "static_response", "body": "x"}]}
+        self.assert_rule(2, "ok", lambda c: self.server(c, ":443")["routes"].append(catch_all))
+        self.assert_rule(2, "ok", lambda c: self.server(c, ":443").setdefault("errors", {}).update(routes=[catch_all]))
+        # (A server of its own for the domain is refused as a server of
+        # its own already: rule 4, test_rule_4_no_server_of_your_own.)
+        self.assert_rule(4, "ok", lambda c: c["apps"]["http"]["servers"].update(
+            extra={"listen": [":8444"], "routes": [{"match": [{"host": ["caddy-mtls-smoke.localhost"]}],
+                                                    "handle": [{"handler": "reverse_proxy"}]}]}))
+        # Another host name on the same listener is fine.
+        self.assertEqual(len(self.mutated("ok", lambda c: self.server(c, ":443")["routes"].append(
+            {"match": [{"host": ["printer.example.com"]}], "handle": [{"handler": "static_response"}]}))), 4)
+
+    def test_rule_3_tls(self) -> None:
+        self.assert_rule(3, "ok", lambda c: self.server(c, ":443").update(automatic_https={
+            "skip_certificates": ["caddy-mtls-smoke.localhost"]}))
+        self.assert_rule(3, "ok", lambda c: self.server(c, ":443")["tls_connection_policies"].insert(0, {}))
+        self.assert_rule(3, "ok-strict", lambda c: self.server(c, ":443").update(strict_sni_host=False))
+
+    def test_rule_3_messages_name_the_cause(self) -> None:
+        """B-6: global options that change the domain's certificate or TLS
+        settings stay refused, with a message that says so."""
+        def key_type(c):
+            policy = next(p for p in c["apps"]["tls"]["automation"]["policies"]
+                          if "caddy-mtls-smoke.localhost" in (p.get("subjects") or []))
+            policy["key_type"] = "rsa2048"
+        with self.assertRaises(customconf.Violation) as ctx:
+            self.mutated("ok", key_type)
+        self.assertEqual(ctx.exception.rule, 3)
+        self.assertIn("(key_type)", ctx.exception.message)
+        self.assertIn("the certificate and TLS settings of the add-on's own domain cannot be changed by a snippet",
+                      ctx.exception.message)
+
+        def default_sni(c):
+            for policy in self.server(c, ":443")["tls_connection_policies"]:
+                policy["default_sni"] = "other.example.com"
+        with self.assertRaises(customconf.Violation) as ctx:
+            self.mutated("ok", default_sni)
+        self.assertEqual(ctx.exception.rule, 3)
+        self.assertIn("(default_sni)", ctx.exception.message)
+        self.assertIn("cannot be changed by a snippet", ctx.exception.message)
+
+    def test_rule_2_a_wildcard_site_over_the_domain(self) -> None:
+        def wildcard(c):
+            self.server(c, ":443")["routes"].append(
+                {"match": [{"host": ["*.localhost"]}], "handle": [{"handler": "static_response"}], "terminal": True})
+        with self.assertRaises(customconf.Violation) as ctx:
+            self.mutated("ok", wildcard)
+        self.assertEqual(ctx.exception.rule, 2)
+        self.assertIn("a site of yours for *.localhost also covers the add-on's own host name "
+                      "caddy-mtls-smoke.localhost: a wildcard site that includes the add-on's name is not supported",
+                      ctx.exception.message)
+
+    @unittest.skipUnless(OPENSSL, "openssl")
+    def test_rule_3_certificates_a_site_loads(self) -> None:
+        """B-4: a certificate that covers the domain (SAN or CN, wildcards
+        included) would replace the add-on's own."""
+        pems = {"/config/caddy/w.crt": make_cert_pem("*.localhost"),
+                "/config/caddy/o.crt": make_cert_pem("other.example.com"),
+                "/config/caddy/cn.crt": make_cert_pem(None, cn="caddy-mtls-smoke.localhost"),
+                "/config/caddy/bad.crt": b"not a certificate\n"}
+
+        def read_file(path: str) -> bytes:
+            if path not in pems:
+                raise FileNotFoundError(2, "No such file or directory")
+            return pems[path]
+
+        def loading(loader: str, value):
+            def change(c):
+                c["apps"].setdefault("tls", {})["certificates"] = {loader: value}
+            return change
+
+        def files(path):
+            return loading("load_files", [{"certificate": path, "key": path[:-3] + "key", "tags": ["cert0"]}])
+        self.assertEqual(len(self.mutated("ok", files("/config/caddy/o.crt"), read_file)), 4)
+        for path, needle in (("/config/caddy/w.crt", "covers the add-on's own domain caddy-mtls-smoke.localhost "
+                                                     "(as *.localhost)"),
+                             ("/config/caddy/cn.crt", "(as caddy-mtls-smoke.localhost)"),
+                             ("/config/caddy/gone.crt", "cannot be read (No such file or directory)"),
+                             ("/config/caddy/bad.crt", "cannot be checked: openssl cannot parse it")):
+            with self.subTest(path=path):
+                with self.assertRaises(customconf.Violation) as ctx:
+                    self.mutated("ok", files(path), read_file)
+                self.assertEqual(ctx.exception.rule, 3)
+                self.assertIn(f"the certificate file {path}, which a site of yours loads", ctx.exception.message)
+                self.assertIn(needle, ctx.exception.message)
+                self.assertEqual(ctx.exception.file, "sites.caddy")
+        with self.assertRaises(customconf.Violation) as ctx:
+            self.mutated("ok", loading("load_pem", [{"certificate": pems["/config/caddy/w.crt"].decode(),
+                                                     "key": "x"}]), read_file)
+        self.assertIn("an inline certificate (load_pem), which a site of yours loads, covers", ctx.exception.message)
+        for loader in ("load_folders", "load_storage", "something_new"):
+            with self.subTest(loader=loader):
+                with self.assertRaises(customconf.Violation) as ctx:
+                    self.mutated("ok", loading(loader, ["/config/caddy"]), read_file)
+                self.assertIn(f"loads certificates with {loader}, which the add-on cannot check",
+                              ctx.exception.message)
+        self.assertEqual(len(self.mutated("ok", loading("automate", ["printer.example.com"]), read_file)), 4)
+        self.assert_rule(3, "ok", loading("automate", ["*.localhost"]))
+        # B2-4: relative paths (resolved in a directory of the add-on's own).
+        for entry, kind in (({"certificate": "config/caddy/o.crt", "key": "/config/caddy/o.key"}, "certificate"),
+                            ({"certificate": "/config/caddy/o.crt", "key": "o.key"}, "key")):
+            with self.subTest(entry=entry):
+                with self.assertRaises(customconf.Violation) as ctx:
+                    self.mutated("ok", loading("load_files", [entry]), read_file)
+                self.assertIn(f"the {kind} file {entry[kind]}, which a site of yours loads, is given by a relative "
+                              "path: give files by their absolute path", ctx.exception.message)
+
+    def test_rule_3_reads_regular_files_only(self) -> None:
+        """B2-2: the check's own reader never blocks on a named pipe and
+        reads regular files only."""
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        fifo = tmp / "f.crt"
+        os.mkfifo(fifo)
+        for path in (fifo, tmp):
+            with self.subTest(path=path.name):
+                with self.assertRaises(customconf.NotRegularFile):
+                    customconf._read_bytes(str(path))
+        regular = tmp / "r.crt"
+        regular.write_bytes(b"pem")
+        self.assertEqual(customconf._read_bytes(str(regular)), b"pem")
+        with self.assertRaises(customconf.Violation) as ctx:
+            self.mutated("ok", lambda c: c["apps"].setdefault("tls", {}).update(certificates={"load_files": [
+                {"certificate": str(fifo), "key": str(tmp / "f.key")}]}))
+        self.assertEqual(ctx.exception.message,
+                         f"the certificate file {fifo}, which a site of yours loads, is not a regular file")
+
+    def test_rule_1_groups_are_compared_up_to_renaming(self) -> None:
+        def rename(c, old, new):
+            text = json.dumps(c).replace(f'"{old}"', f'"{new}"')
+            c.clear()
+            c.update(json.loads(text))
+        groups = sorted({g for g in _values(self.load("ok"), "group")})
+        self.assertTrue(groups)
+        self.assertEqual(len(self.mutated("ok", lambda c: rename(c, groups[0], "group99"))), 4)
+
+        def split(c):
+            routes = [r for r in _objects(self.server(c, ":80")) if r.get("group")]
+            routes[-1]["group"] = "group98"  # two routes that excluded each other no longer do
+        self.assert_rule(1, "ok", split)
+
+    def test_rule_1_the_gate(self) -> None:
+        def weaker_gate(c):
+            for obj in _objects(self.server(c, ":443")):
+                if isinstance(obj.get("handle"), list) and obj["handle"] and \
+                        obj["handle"][0].get("handler") == "static_response" and obj["handle"][0].get("status_code") == 403:
+                    obj["match"] = [{"path": ["/nothing"]}]
+                    return
+            raise AssertionError("no gate found")
+        self.assert_rule(1, "ok", weaker_gate)
+
+    def test_a_reference_passes_against_itself(self) -> None:
+        for case in ("ok", "ok-strict"):
+            with self.subTest(case=case):
+                info = self.meta[case]
+                config = self.load(f"{case}.reference")
+                # (Both name the reference's own file: no renaming.)
+                self.assertEqual(len(customconf.check(config, config, domain=self.meta["domain"],
+                                                      upstream=info["upstream"], files=[],
+                                                      header_auth=info["header_auth"],
+                                                      config_path="/etc/caddy/Caddyfile.own")), 4)
+
+
+def _objects(value):
+    """Every dict inside ``value`` (depth first)."""
+    if isinstance(value, dict):
+        yield value
+        for v in value.values():
+            yield from _objects(v)
+    elif isinstance(value, list):
+        for v in value:
+            yield from _objects(v)
+
+
+def _values(value, key):
+    for obj in _objects(value):
+        if key in obj:
+            yield obj[key]
+
+
+if __name__ == "__main__":
+    unittest.main()

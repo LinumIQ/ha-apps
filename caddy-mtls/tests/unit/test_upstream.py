@@ -182,6 +182,11 @@ class TempFiles(unittest.TestCase):
             patcher = mock.patch.object(upstream, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
+        # caddyctl's reload lock and fallback file (2.3.0).
+        for name, value in (("RELOAD_LOCK", self.dir / "reload.lock"), ("FALLBACK_FILE", self.dir / "Caddyfile.own")):
+            patcher = mock.patch.object(upstream.caddyctl.customconf, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.reloads: list[str] = []
         self.reload_ok = True
 
@@ -863,10 +868,13 @@ class ApplyTest(TempFiles):
                   "Error: adapting config using caddyfile: /etc/caddy/Caddyfile:42 - unexpected EOF\n")
         done = mock.Mock(returncode=1, stderr=stderr, stdout="")
         with mock.patch.object(upstream.subprocess, "run", return_value=done), \
+                mock.patch.object(upstream.caddyctl, "write_fingerprints") as regenerate, \
                 mock.patch.object(upstream, "CADDYFILE", upstream.STATE_FILE):
             upstream.STATE_FILE.write_text("{}")
             ok, message = upstream.caddy_reload()
         self.assertFalse(ok)
+        # 2.3.0: the fingerprint list was regenerated before the reload.
+        regenerate.assert_called_once_with()
         self.assertEqual(message, "Error: adapting config using caddyfile: /etc/caddy/Caddyfile:42 - unexpected EOF")
         # Caddy 2.11.9 prints the error as a JSON log line with a timestamp.
         caddy_2_11 = ('{"level":"info","ts":1795789792.1,"msg":"using config from file"}\n'
@@ -875,6 +883,23 @@ class ApplyTest(TempFiles):
         self.assertEqual(upstream._cli_error(caddy_2_11),
                          "adapting config using caddyfile: syntax error: unexpected token '{', "
                          "expecting '}', at /etc/caddy/Caddyfile:80")
+
+    def test_a_list_failure_counts_as_applied_for_the_mode(self) -> None:
+        """C-2: Caddy reloads despite a fingerprint list that could not be
+        written - so the forwarding mode in the snippet DID apply: "ok" for
+        _apply (no write-back of the old mode); caddyctl logs the list."""
+        done = mock.Mock(returncode=0, stderr="", stdout="")
+
+        def fail() -> None:
+            raise upstream.caddyctl.FingerprintError("cannot write x: read-only")
+        with mock.patch.object(upstream.subprocess, "run", return_value=done) as run, \
+                mock.patch.object(upstream.caddyctl, "write_fingerprints", side_effect=fail), \
+                mock.patch.object(upstream, "CADDYFILE", upstream.STATE_FILE), \
+                self.assertLogs("caddyctl", level="ERROR"):
+            upstream.STATE_FILE.write_text("{}")
+            ok, message = upstream.caddy_reload()
+        self.assertEqual((ok, message), (True, "reloaded"))
+        run.assert_called_once()
 
     def test_start_reports_the_facts(self) -> None:
         facts = upstream.start(self.settings(self.ha.port))
