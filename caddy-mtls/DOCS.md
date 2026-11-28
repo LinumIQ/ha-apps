@@ -558,9 +558,9 @@ restart the add-on; until then the four files are not read again, also not
 when the add-on reloads Caddy for a revoked client. Files they **refer to**
 (a site's `tls` certificate and key, a `trust_pool` file, CA files of a
 `transport`, ...) are a different matter: Caddy reads those at every reload,
-so a change of such a file takes effect at the next reload. If Caddy cannot
-load the configuration with the snippets any more while the add-on applies a
-change - say the key file of a `tls` line was removed - the add-on drops the
+so a change of such a file takes effect at the next reload. If Caddy refuses
+the configuration with the snippets while the add-on applies a change - say
+the key file of a `tls` line was removed - the add-on drops the
 snippets and reloads with its own configuration, so that the change (for
 example a revocation) takes effect: the panel says so next to the change,
 the card **Custom Caddy configuration** turns red with Caddy's message and a
@@ -582,7 +582,10 @@ unchanged, `strict_sni_host` stays on, and - while a header key is set - a
 log you add drops request headers as well. If either check fails, **none**
 of the four files is used: the add-on starts with its own configuration, the
 log shows a warning block with the reason, the card **Custom Caddy
-configuration** turns red and a Home Assistant notification appears.
+configuration** turns red and a Home Assistant notification appears. A check
+that does not finish within 60 seconds - Caddy waits for a file a snippet
+refers to, such as a named pipe or a file on a network folder that does not
+answer - counts as a rejection.
 **Do not rely on a snippet for a restriction without checking the card after
 the restart.**
 
@@ -601,10 +604,18 @@ What is refused (all four files are then dropped):
   `grace_period` and the add-on's logs (a log of your own is fine, also one
   that includes the access logs; while a header key is set it must drop
   request headers: `format filter { ...; request>headers delete }`);
-- a certificate a site of yours loads (`tls <certificate> <key>`) that
-  covers the add-on's domain, and certificate loaders the add-on cannot check
-  (anything but certificate files);
+- a certificate of a site of yours that covers the add-on's domain (`tls
+  <certificate> <key>`), a certificate file given by a relative path or that
+  is not a regular file, and certificates loaded from a folder or from
+  Caddy's storage, which the add-on cannot check;
 - imports of files, and files that are not UTF-8 text.
+
+Give every file a snippet refers to by its **absolute path** (for example
+`/config/caddy/printer.crt` - the add-on's configuration folder is `/config`
+in here - or a file in Home Assistant's `/ssl` folder): a relative path
+is resolved in a directory of the add-on's own that holds none of your
+files. For the same reason give `file_server` a `root` - without one it
+serves that directory, which holds the add-on's own start script.
 
 A snippet runs with Caddy's rights: whatever Caddy can read - the add-on's
 files, its environment with the DNS credentials - a snippet can put into a

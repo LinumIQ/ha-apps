@@ -37,7 +37,8 @@ Files that a snippet refers to (a site's ``tls`` certificate and key, a
 them at every (re)load. If one of them breaks after the start, a reload with
 the snippets fails - and a revocation would not take effect. So the add-on's
 own rendering is kept as FALLBACK_FILE while the snippets are in use, and a
-reload that fails with them is retried with it (caddyctl.reload_detailed);
+reload Caddy refuses with them is retried with it (caddyctl.reload_detailed;
+not one that timed out or did not reach Caddy);
 when that works, ``drop`` makes it permanent for the run: the Caddyfile
 becomes the fallback, the copies go, the state is ``rejected`` with a
 run-time marker (``dropped_at``). The files are read again at the next start.
@@ -102,15 +103,22 @@ Put any of these files into this folder; all are optional:
                 only on the add-on's ports 80, 443 and (while it is on) 4443,
                 without "bind"
 
+Give every file a snippet refers to by its absolute path (this folder is
+/config/caddy inside the add-on): a relative path is resolved in a
+directory of the add-on's own that holds none of your files. Give
+file_server a "root" - without one it serves that directory.
+
 The files are applied when the add-on STARTS (from copies): restart it after
 a change. Files they refer to (a "tls" certificate and key, a CA file, ...)
 are read by Caddy at every reload, so a change of such a file takes effect at
 the next reload. If Caddy rejects one of them, or it changes the add-on's own
 sites, NONE of them is used and the add-on runs with its own configuration
-only. If Caddy cannot reload with them any more while the add-on applies a
-change (e.g. a revoked client), the add-on drops them until the next start,
-so that the change takes effect. The add-on's web interface (card "Custom
-Caddy configuration") and its log show the result and Caddy's message.
+only - also when the check does not finish within 60 seconds (a file a
+snippet refers to that cannot be read to its end). If Caddy refuses them at
+a reload while the add-on applies a change (e.g. a revoked client), the
+add-on drops them until the next start, so that the change takes effect.
+The add-on's web interface (card "Custom Caddy configuration") and its log
+show the result and Caddy's message.
 
 Documentation: {DOCS_URL}
 

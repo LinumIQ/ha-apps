@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.3.0] - 2026-11-27
+## [2.3.0] - 2026-11-28
 
 ### Added
 
@@ -41,12 +41,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that its own sites stayed as it wrote them. If either rejects them, none
   is used and the add-on starts with its own configuration: a warning block
   in the log, a red card **Custom Caddy configuration** and a Home
-  Assistant notification. Files the snippets refer to (a `tls` certificate
-  and key, ...) are read by Caddy at every reload; if Caddy cannot reload
-  with the snippets any more while the add-on applies a change such as a
-  revocation, the add-on drops them until the next start and reloads with
-  its own configuration, so that the change takes effect (the panel, the
-  card and a notification say so).
+  Assistant notification; a check that does not finish within 60 seconds
+  (a referenced file that cannot be read to its end) counts as a rejection.
+  Files the snippets refer to (a `tls` certificate and key, ...) are read
+  by Caddy at every reload; if Caddy refuses the configuration with the
+  snippets while the add-on applies a change such as a revocation, the
+  add-on drops them until the next start and reloads with its own
+  configuration, so that the change takes effect (the panel, the card and a
+  notification say so).
 
 ### Changed
 
