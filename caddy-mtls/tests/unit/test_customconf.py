@@ -135,7 +135,7 @@ class CollectTest(unittest.TestCase):
         out = io.StringIO()
         with redirect_stdout(out):
             rc = customconf._main(["collect", "--config-dir", str(self.src), "--copy-dir", str(self.dst),
-                                   "--state", str(state_file), "--slug", "local_caddy_mtls"])
+                                   "--state", str(state_file), "--slug", "local_caddy_mtls", "--lan", "on"])
         self.assertEqual(rc, 0)
         state = json.loads(state_file.read_text())
         self.assertEqual((state["state"], state["folder"]), ("loaded", "app_configs/local_caddy_mtls/caddy"))
@@ -158,9 +158,35 @@ class CollectTest(unittest.TestCase):
         missing = self.tmp / "nope" / "caddy"
         with redirect_stdout(io.StringIO()):
             customconf._main(["collect", "--config-dir", str(missing), "--copy-dir", str(self.dst),
-                              "--state", str(state_file)])
+                              "--state", str(state_file), "--lan", "off"])
         self.assertFalse(missing.parent.exists())
         self.assertEqual(json.loads(state_file.read_text())["state"], "none")
+
+
+    def test_lan_caddy_counts_only_while_the_port_is_on(self) -> None:
+        """B-5: not imported (the site does not exist), so neither copied
+        nor validated - never "in use"."""
+        self.put("site.caddy", "respond /x 200\n")
+        self.put("lan.caddy", "this is { broken\n")
+        for lan, reason in (("off", "the local-network port is off"),
+                            ("unknown", "the local-network port's state is unknown (it stays off)")):
+            with self.subTest(lan=lan):
+                result = customconf.collect(self.src, self.dst, lan)
+                self.assertEqual([f["name"] for f in result["files"]], ["site.caddy"])
+                self.assertEqual(result["ignored"], [{"name": "lan.caddy", "reason": reason}])
+                self.assertEqual(sorted(os.listdir(self.dst)), ["site.caddy"])
+        result = customconf.collect(self.src, self.dst, "on")
+        self.assertEqual([f["name"] for f in result["files"]], ["site.caddy", "lan.caddy"])
+        self.assertEqual(result["ignored"], [])
+        # Only lan.caddy, port off: nothing counts (state none at the CLI).
+        (self.src / "site.caddy").unlink()
+        state_file = self.tmp / "custom.json"
+        with redirect_stdout(io.StringIO()):
+            customconf._main(["collect", "--config-dir", str(self.src), "--copy-dir", str(self.dst),
+                              "--state", str(state_file), "--lan", "off"])
+        state = json.loads(state_file.read_text())
+        self.assertEqual((state["state"], state["files"]), ("none", []))
+        self.assertTrue(customconf.card_context(state)["show"])  # the ignored entry is shown
 
 
 class MessageTest(unittest.TestCase):

@@ -17,11 +17,12 @@ here, app_configs/<slug>/caddy/ on the host):
 ``customconf.py collect`` (init-caddy, at every start) writes README.txt into
 the folder, decides which files count (a regular file - lstat before any
 open, nothing else is ever opened -, at most MAX_BYTES, not empty after
-trimming white space), rejects files that import other files (the copies
-exist so that a run-time reload never reads a live user file), and COPIES the
-counting files to /etc/caddy/custom/ (0700/0600): the Caddyfile imports the
-copies. Caddy 2.11.9 reads CRLF line endings and a UTF-8 byte-order mark as
-they are (verified), so the copies are byte for byte.
+trimming white space; lan.caddy only while the local-network port is on),
+rejects files that import other files (the copies exist so that a run-time
+reload never reads a live user file), and COPIES the counting files to
+/etc/caddy/custom/ (0700/0600): the Caddyfile imports the copies. Caddy
+2.11.9 reads CRLF line endings and a UTF-8 byte-order mark as they are
+(verified), so the copies are byte for byte.
 
 init-caddy then renders the Caddyfile with the copies, validates it, and -
 because a valid file can still change the add-on's own blocks - runs
@@ -57,6 +58,7 @@ CONFIG_DIR = Path(os.environ.get("CADDY_MTLS_CUSTOM_SRC", "/config/caddy"))
 COPY_DIR = Path(os.environ.get("CADDY_MTLS_CUSTOM_DIR", "/etc/caddy/custom"))
 STATE_FILE = Path(os.environ.get("CADDY_MTLS_CUSTOM_STATE", "/run/caddy-mtls/custom.json"))
 ERROR_MAX = 2000
+LAN_STATES = ("on", "off", "unknown")
 DOCS_URL = "https://github.com/LinumIQ/ha-apps/blob/main/caddy-mtls/DOCS.md#custom-caddyfile-snippets-since-230"
 
 README = f"""Caddy mTLS Proxy - Caddyfile snippets for experts (since 2.3.0)
@@ -145,9 +147,11 @@ def import_error(name: str, data: bytes) -> str | None:
     return None
 
 
-def collect(config_dir: Path, copy_dir: Path) -> dict[str, Any]:
-    """Look at the four files, copy the counting ones. Returns {files,
-    ignored, error, error_file} (error: the files must not be used)."""
+def collect(config_dir: Path, copy_dir: Path, lan: str = "on") -> dict[str, Any]:
+    """Look at the four files, copy the counting ones. ``lan``: the
+    local-network port's state (lan.caddy counts only while it is on).
+    Returns {files, ignored, error, error_file} (error: the files must not
+    be used)."""
     files: list[dict[str, Any]] = []
     ignored: list[dict[str, str]] = []
     if copy_dir.exists():
@@ -163,6 +167,12 @@ def collect(config_dir: Path, copy_dir: Path) -> dict[str, Any]:
             continue
         except OSError as err:
             ignored.append({"name": name, "reason": f"cannot be read ({err.strerror or err})"})
+            continue
+        if name == "lan.caddy" and lan != "on":
+            # Not imported anywhere (the local-network site does not exist),
+            # so not validated either: never "in use".
+            ignored.append({"name": name, "reason": "the local-network port is off" if lan == "off"
+                            else "the local-network port's state is unknown (it stays off)"})
             continue
         if stat.S_ISLNK(st.st_mode):
             ignored.append({"name": name, "reason": "a symbolic link (only regular files are used)"})
@@ -742,6 +752,7 @@ def _main(argv: list[str]) -> int:
     col.add_argument("--copy-dir", type=Path, default=COPY_DIR)
     col.add_argument("--state", type=Path, default=STATE_FILE)
     col.add_argument("--slug", default="")
+    col.add_argument("--lan", choices=LAN_STATES, required=True, help="the local-network port's state")
     chk = sub.add_parser("check", help="integrity check of the adapted configuration")
     chk.add_argument("--adapted", type=Path, required=True)
     chk.add_argument("--reference", type=Path, required=True)
@@ -763,7 +774,7 @@ def _main(argv: list[str]) -> int:
                                  "folder": folder_name(args.slug), "checked_at": time.time()}
         if args.config_dir.parent.is_dir():
             write_readme(args.config_dir)
-            result = collect(args.config_dir, args.copy_dir)
+            result = collect(args.config_dir, args.copy_dir, args.lan)
             state.update(result)
             if result["error"]:
                 state["state"] = "rejected"

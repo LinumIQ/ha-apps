@@ -415,33 +415,6 @@ read_config_slug() {
 }
 read_config_slug || true
 
-###############################################################################
-# Custom Caddyfile snippets for experts (since 2.3.0): customconf.py writes
-# README.txt into ${CUSTOM_SRC}, decides which of global.caddy, site.caddy,
-# lan.caddy and sites.caddy count (regular files only - nothing else is
-# opened -, at most 256 KiB, not blank; no imports of other files), copies
-# them to ${CUSTOM_DIR} and records the state in ${CUSTOM_STATE}. Whether
-# they are used is decided after rendering (caddy validate + the integrity
-# check); a rejection drops all four and the add-on starts without them.
-###############################################################################
-CUSTOM_JSON=""
-if ! CUSTOM_JSON="$("${PANEL_PYTHON}" "${CUSTOMCONF_PY}" collect --config-dir "${CUSTOM_SRC}" \
-        --copy-dir "${CUSTOM_DIR}" --state "${CUSTOM_STATE}" --slug "${CONFIG_SLUG}")" \
-        || ! jq -e '.state' >/dev/null 2>&1 <<<"${CUSTOM_JSON}"; then
-    bashio::log.warning "Could not read the custom Caddyfile snippets (customconf.py): starting without them."
-    rm -rf "${CUSTOM_DIR}"
-    CUSTOM_JSON='{"state": "none", "files": [], "ignored": []}'
-fi
-CUSTOM_FILES=()
-if [[ "$(jq -r '.state' <<<"${CUSTOM_JSON}")" == loaded ]]; then
-    mapfile -t CUSTOM_FILES < <(jq -r '.files[].name' <<<"${CUSTOM_JSON}")
-fi
-while IFS=$'\t' read -r name reason; do
-    [[ -n "${name}" ]] && bashio::log.warning "Custom Caddyfile snippets: caddy/${name} is ignored: ${reason}."
-done < <(jq -r '.ignored[]? | [.name, .reason] | @tsv' <<<"${CUSTOM_JSON}")
-# custom_counts <file>: the file is one of the counting custom files.
-custom_counts() { [[ " ${CUSTOM_FILES[*]} " == *" $1 "* ]]; }
-
 # The local-network site answers private source addresses only (lan.py) and
 # refuses the container's default gateways although they are private:
 # Docker's userland proxy forwards IPv6 connections to a container without
@@ -463,6 +436,34 @@ if [[ "${LAN_STATE}" == on ]]; then
         done <<<"${LAN_GATEWAYS}"
     fi
 fi
+
+###############################################################################
+# Custom Caddyfile snippets for experts (since 2.3.0): customconf.py writes
+# README.txt into ${CUSTOM_SRC}, decides which of global.caddy, site.caddy,
+# lan.caddy and sites.caddy count (regular files only - nothing else is
+# opened -, at most 256 KiB, not blank; no imports of other files; lan.caddy
+# only while the local-network port is on, so after the block above), copies
+# them to ${CUSTOM_DIR} and records the state in ${CUSTOM_STATE}. Whether
+# they are used is decided after rendering (caddy validate + the integrity
+# check); a rejection drops all four and the add-on starts without them.
+###############################################################################
+CUSTOM_JSON=""
+if ! CUSTOM_JSON="$("${PANEL_PYTHON}" "${CUSTOMCONF_PY}" collect --config-dir "${CUSTOM_SRC}" \
+        --copy-dir "${CUSTOM_DIR}" --state "${CUSTOM_STATE}" --slug "${CONFIG_SLUG}" --lan "${LAN_STATE}")" \
+        || ! jq -e '.state' >/dev/null 2>&1 <<<"${CUSTOM_JSON}"; then
+    bashio::log.warning "Could not read the custom Caddyfile snippets (customconf.py): starting without them."
+    rm -rf "${CUSTOM_DIR}"
+    CUSTOM_JSON='{"state": "none", "files": [], "ignored": []}'
+fi
+CUSTOM_FILES=()
+if [[ "$(jq -r '.state' <<<"${CUSTOM_JSON}")" == loaded ]]; then
+    mapfile -t CUSTOM_FILES < <(jq -r '.files[].name' <<<"${CUSTOM_JSON}")
+fi
+while IFS=$'\t' read -r name reason; do
+    [[ -n "${name}" ]] && bashio::log.warning "Custom Caddyfile snippets: caddy/${name} is ignored: ${reason}."
+done < <(jq -r '.ignored[]? | [.name, .reason] | @tsv' <<<"${CUSTOM_JSON}")
+# custom_counts <file>: the file is one of the counting custom files.
+custom_counts() { [[ " ${CUSTOM_FILES[*]} " == *" $1 "* ]]; }
 
 ###############################################################################
 # Forwarding headers (option forwarded_headers, since 2.2.0). Home Assistant
