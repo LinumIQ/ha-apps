@@ -40,16 +40,18 @@ import base64
 import binascii
 import contextlib
 import hashlib
+import json
 import logging
 import os
 import re
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+import customconf
 import headerauth
 
 LOG = logging.getLogger("caddyctl")
@@ -60,6 +62,19 @@ CADDY_BIN = os.environ.get("CADDY_BIN", "/usr/bin/caddy")
 CADDYFILE = Path(os.environ.get("CADDYFILE", "/etc/caddy/Caddyfile"))
 CADDY_ADMIN = os.environ.get("CADDY_ADMIN", "127.0.0.1:2019")
 OPENSSL_BIN = os.environ.get("OPENSSL_BIN", "openssl")
+OPTIONS_FILE = headerauth.OPTIONS_FILE
+
+#: The whole environment of every caddy invocation that reads the Caddyfile
+#: (2.3.0): a snippet's {$VAR} is expanded by the process that adapts it, so
+#: init-caddy (validate, adapt), the caddy service (run) and every reload
+#: here must adapt in the same environment - what Caddy needs (its data and
+#: configuration locations come from HOME / XDG_*), plus the DNS provider
+#: variables as the caddy service exports them, and nothing else (no
+#: Supervisor token, no CADDY_MTLS_* internals). The same names as
+#: CADDY_ENV_NAMES in lib/dns-provider.sh (test_caddyctl compares both).
+CADDY_ENV_NAMES = ("PATH", "HOME", "TZ", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+                   "DNS_API_TOKEN", "DNS_AWS_ACCESS_KEY_ID", "DNS_AWS_SECRET_ACCESS_KEY")
+DNS_ENV_NAMES = ("DNS_API_TOKEN", "DNS_AWS_ACCESS_KEY_ID", "DNS_AWS_SECRET_ACCESS_KEY")
 
 #: {http.request.tls.client.fingerprint} of a connection without a client
 #: certificate (Caddy hashes an empty certificate: replacer.go).
@@ -195,18 +210,57 @@ def write_fingerprints(folder: Path | None = None, path: Path | None = None) -> 
 
 
 # ---------------------------------------------------------------------------
+# Caddy's environment
+# ---------------------------------------------------------------------------
+
+def dns_env(provider: str, token: str) -> dict[str, str]:
+    """The variables lib/dns-provider.sh's dns_provider_export exports for
+    the options acme_dns_provider / dns_api_token (the same rules; nothing
+    for a token that does not fit - init-caddy refuses to start then)."""
+    if provider in ("cloudflare", "hetzner") and token:
+        return {"DNS_API_TOKEN": token}
+    if provider == "route53":
+        key_id, colon, secret = token.partition(":")
+        if colon and key_id and secret:
+            return {"DNS_AWS_ACCESS_KEY_ID": key_id, "DNS_AWS_SECRET_ACCESS_KEY": secret}
+    return {}
+
+
+def caddy_env(environ: Mapping[str, str] | None = None, options_file: Path | None = None) -> dict[str, str]:
+    """The environment for a caddy invocation that reads the Caddyfile:
+    CADDY_ENV_NAMES' own variables from ``environ`` (default os.environ),
+    the DNS provider variables from the add-on's options (the panel's own
+    environment has none of them)."""
+    environ = os.environ if environ is None else environ
+    env = {name: environ[name] for name in CADDY_ENV_NAMES if name not in DNS_ENV_NAMES and name in environ}
+    try:
+        options = json.loads((OPTIONS_FILE if options_file is None else options_file).read_text())
+    except (OSError, ValueError):
+        options = {}
+    if isinstance(options, dict):
+        env.update(dns_env(str(options.get("acme_dns_provider") or "none"), str(options.get("dns_api_token") or "")))
+    return env
+
+
+# ---------------------------------------------------------------------------
 # Reload
 # ---------------------------------------------------------------------------
 
-# Every run-time reload of the add-on goes through ``reload``. It re-reads
-# only files the add-on wrote itself at the start or rewrites at run time:
-# the generated Caddyfile, the forwarding snippet, this fingerprint list and
-# the COPIES of the custom Caddyfile snippets in /etc/caddy/custom/ (never
-# the user's files in /config/caddy/). init-caddy checked those copies at the
-# start (caddy validate plus the integrity check of customconf.py), and
-# nothing changes them afterwards - so the check at the start covers every
-# reload. A change here that makes a reload read anything else must check it
-# again.
+# Every run-time reload of the add-on goes through ``reload_detailed``. The
+# Caddyfile it reloads imports only files the add-on wrote itself: the
+# forwarding snippet, the fingerprint list and the COPIES of the custom
+# Caddyfile snippets in /etc/caddy/custom/ (never the user's files in
+# /config/caddy/), which init-caddy checked at the start (caddy validate
+# plus customconf.py's integrity check) and nothing changes afterwards. But
+# files a snippet REFERS to (a site's tls certificate and key, a trust_pool
+# file, CA files of a transport, ...) are read by Caddy at every reload, and
+# can break after the start. So while custom files are in use, init-caddy
+# keeps the add-on's own rendering (customconf.FALLBACK_FILE): a reload that
+# fails is retried with it, and if that works the custom files are dropped
+# for the rest of the run (customconf.drop) - the change being applied (a
+# revocation) takes effect. All of it under one lock (customconf.reload_lock)
+# shared by the panel and the monitor. A change that makes a reload read
+# anything else must keep that guarantee.
 
 Runner = Callable[..., subprocess.CompletedProcess]
 
@@ -221,6 +275,9 @@ class ReloadResult:
     list_error: str = ""
     #: Caddy's output (scrubbed of the header key) when it did not reload.
     caddy_error: str = ""
+    #: The custom files were dropped to make the reload work: the message
+    #: for the user ("" when not).
+    dropped: str = ""
 
     @property
     def ok(self) -> bool:
@@ -230,7 +287,7 @@ class ReloadResult:
     def message(self) -> str:
         """What happened, for the log, the panel and the state file."""
         if self.ok:
-            return "reloaded"
+            return self.dropped or "reloaded"
         if not self.list_error:
             return self.caddy_error
         what = f"the list of active client certificates could not be written ({self.list_error})"
@@ -243,38 +300,64 @@ class ReloadResult:
 
 def reload_detailed(*, caddy_bin: str | None = None, caddyfile: Path | None = None, admin: str | None = None,
                     timeout: float = 60, run: Runner | None = None,
-                    regenerate: Callable[[], object] | None = None) -> ReloadResult:
-    """Regenerate the fingerprint list, then ``caddy reload --force`` (Caddy
-    skips an unchanged config otherwise: a client change touches only the
-    active folder and the list) - also when the list could not be written:
-    the reload must not depend on it (revocation), and the previous list can
-    only refuse too much. A list failure is logged here as an ERROR line."""
+                    regenerate: Callable[[], object] | None = None, fallback: Path | None = None,
+                    lock: Path | None = None, env: Mapping[str, str] | None = None) -> ReloadResult:
+    """Under the reload lock: regenerate the fingerprint list, then ``caddy
+    reload --force`` (Caddy skips an unchanged config otherwise: a client
+    change touches only the active folder and the list) - also when the list
+    could not be written: the reload must not depend on it (revocation), and
+    the previous list can only refuse too much. If the reload fails and the
+    fallback file exists (custom files in use), reload with it; when that
+    works, the custom files are dropped for this run (customconf.drop) and
+    the reload counts as done. Every caddy call gets ``env`` (default
+    caddy_env()). A list failure, a drop and a failed fallback are logged
+    here."""
     caddy_bin = CADDY_BIN if caddy_bin is None else caddy_bin
     caddyfile = CADDYFILE if caddyfile is None else caddyfile
     admin = CADDY_ADMIN if admin is None else admin
     run = subprocess.run if run is None else run
     regenerate = write_fingerprints if regenerate is None else regenerate
-    if not caddyfile.exists():
-        return ReloadResult(False, caddy_error=f"Caddyfile not found at {caddyfile}")
-    list_error = ""
-    try:
-        regenerate()
-    except FingerprintError as err:
-        list_error = str(err)
-    try:
-        proc = run(
-            [caddy_bin, "reload", "--force", "--config", str(caddyfile),
-             "--adapter", "caddyfile", "--address", admin],
-            capture_output=True, text=True, check=False, timeout=timeout,
-        )
-    except (OSError, subprocess.SubprocessError) as err:
-        result = ReloadResult(False, list_error, headerauth.scrub(str(err)))
-    else:
+    fallback = customconf.FALLBACK_FILE if fallback is None else fallback
+    env = caddy_env() if env is None else env
+
+    def caddy_reload(config: Path) -> tuple[bool, str]:
+        try:
+            proc = run(
+                [caddy_bin, "reload", "--force", "--config", str(config),
+                 "--adapter", "caddyfile", "--address", admin],
+                capture_output=True, text=True, check=False, timeout=timeout, env=dict(env),
+            )
+        except (OSError, subprocess.SubprocessError) as err:
+            return False, headerauth.scrub(str(err))
         if proc.returncode != 0:
-            result = ReloadResult(False, list_error,
-                                  headerauth.scrub(proc.stderr or proc.stdout or "caddy reload failed"))
-        else:
-            result = ReloadResult(True, list_error)
+            return False, headerauth.scrub(proc.stderr or proc.stdout or "caddy reload failed")
+        return True, ""
+
+    with customconf.reload_lock(lock):
+        if not caddyfile.exists():
+            return ReloadResult(False, caddy_error=f"Caddyfile not found at {caddyfile}")
+        list_error = ""
+        try:
+            regenerate()
+        except FingerprintError as err:
+            list_error = str(err)
+        reloaded, caddy_error = caddy_reload(caddyfile)
+        dropped = ""
+        if not reloaded and fallback.exists():
+            cause = customconf.caddy_message(caddy_error)
+            fallback_ok, fallback_error = caddy_reload(fallback)
+            if fallback_ok:
+                dropped = customconf.drop(cause, when="reload", caddyfile=caddyfile, fallback=fallback)
+                reloaded, caddy_error = True, ""
+                LOG.warning("%s", dropped)
+                if fallback.exists():
+                    LOG.error("The Caddyfile could not be replaced by the add-on's own configuration; Caddy runs "
+                              "it all the same, and the next reload falls back again.")
+            else:
+                LOG.error("Caddy could not reload with the custom Caddyfile snippets (%s), nor with the add-on's own "
+                          "configuration without them (%s): nothing was dropped.",
+                          cause, customconf.caddy_message(fallback_error))
+        result = ReloadResult(reloaded, list_error, caddy_error, dropped)
     if list_error:
         LOG.error("%s", result.message)
     return result
@@ -283,7 +366,8 @@ def reload_detailed(*, caddy_bin: str | None = None, caddyfile: Path | None = No
 def reload(**kwargs: object) -> tuple[bool, str]:
     """``reload_detailed`` as (ok, message): ok only when Caddy reloaded AND
     the fingerprint list was written (the panel reports anything else; see
-    ReloadResult.message for what happened)."""
+    ReloadResult.message for what happened - with ok, "reloaded" or the
+    message that the custom files were dropped)."""
     result = reload_detailed(**kwargs)  # type: ignore[arg-type]
     return result.ok, result.message
 

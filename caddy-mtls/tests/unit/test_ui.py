@@ -524,6 +524,21 @@ class CustomCardTests(unittest.TestCase):
             with self.subTest(needle=needle):
                 self.assertIn(needle, html)
 
+    def test_dropped_at_run_time(self):
+        """B-2: a reload dropped them (customconf.drop)."""
+        message = ("Caddy could not reload with your custom files while applying a change (open "
+                   "/config/caddy/o.key: no such file or directory). To apply the change the add-on dropped them; "
+                   "they are read again at the next start.")
+        html = self.render({"state": "rejected", "folder": "app_configs/local_caddy_mtls/caddy",
+                            "files": [{"name": "sites.caddy", "bytes": 80}], "error_file": None, "error": message,
+                            "dropped": "reload", "dropped_at": 1795789792.5})
+        for needle in ('data-state="rejected"', "status--danger", 'role="alert"',
+                       "Your custom files are NOT in use any more.", "the change took effect", message,
+                       "correct the file a\n    snippet refers to", "restart the app"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, html)
+        self.assertNotIn("integrity", html)
+
     def test_ignored_only(self):
         html = self.render({"state": "none", "files": [], "folder": None,
                             "ignored": [{"name": "lan.caddy", "reason": "larger than 256 KiB"}]})

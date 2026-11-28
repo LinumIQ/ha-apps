@@ -1,7 +1,8 @@
 {#- "Custom Caddy configuration" card (since 2.3.0), shown only when custom
     files counted or entries were ignored. cc: customconf.card_context (the
-    state of this start: loaded | rejected | none, the files, the ignored
-    entries, Caddy's message, the host folder). -#}
+    state: loaded | rejected | none - rejected at the start, or dropped at
+    run time -, the files, the ignored entries, Caddy's message, the host
+    folder). -#}
 {%- if cc.show -%}
 {%- set labels = {"loaded": "In use", "rejected": "Not in use", "none": "None in use"} -%}
 {%- set badges = {"loaded": "success", "rejected": "danger", "none": "warn"} -%}
@@ -17,7 +18,18 @@
     <span class="status status--{{ badges[cc.state] }}">{{ labels[cc.state] }}</span>
   </div>
 
-  {% if cc.state == "rejected" %}
+  {% if cc.state == "rejected" and cc.dropped %}
+  <div class="cc__error" role="alert">
+    <strong>Your custom files are NOT in use any more.</strong> Caddy could
+    not load them again while the add-on applied a change, so the add-on
+    dropped all of them until the next start and runs with its own
+    configuration only - the change took effect.
+    <code class="cc__error-text">{{ cc.error }}</code>
+  </div>
+  <p class="cc__note"><strong>What to do:</strong> correct the file a
+    snippet refers to (a certificate or key, ...) or the snippet in
+    <code>{{ folder }}/</code> and restart the app.</p>
+  {% elif cc.state == "rejected" %}
   <div class="cc__error" role="alert">
     <strong>Your custom files are NOT in use.</strong> Caddy or the add-on's
     integrity check rejected them, so the add-on runs with its own
@@ -32,7 +44,8 @@
   <p class="cc__lead">
     Applied when the add-on started, after Caddy and the add-on's integrity
     check accepted them. <strong>Restart the add-on to apply changes</strong>
-    to these files.
+    to these files. Files they refer to (a certificate, ...) are read again
+    at every reload.
   </p>
   {% else %}
   <p class="cc__lead">No custom file is in use.</p>

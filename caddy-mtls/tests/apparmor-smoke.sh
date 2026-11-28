@@ -28,8 +28,10 @@
 # at the start and before each reload) and the gate run under the profile;
 # custom Caddyfile snippets (2.3.0) are in use: customconf.py reads
 # /config/caddy (README.txt written), copies the files, Caddy adapts the
-# configuration twice for the integrity check.
-# Fails on any AppArmor denial for the profile.
+# configuration twice for the integrity check; after the restart a reload
+# whose snippet's key file was removed falls back to the add-on's own
+# configuration and drops the snippets (rename, removal, reload lock).
+# Fails on any AppArmor denial for the profile. Needs openssl on the host.
 #
 # No external network traffic: the container runs with --network none and
 # ACME_CA_URL points at a closed local port. A profile that was not loaded
@@ -297,6 +299,15 @@ jq '.client_names += ["dave"] | .client_cert_password = "aa-smoke-password-2" | 
     "${WORK}/data/options.json" >"${WORK}/options.json"
 mv "${WORK}/options.json" "${WORK}/data/options.json"
 cp "${WORK}/data/options.json" "${WORK}/tmp/.bashio/addons.self.options.config.cache"
+# And a site whose certificate files a snippet refers to (2.3.0): after its
+# key is removed, a reload falls back to the add-on's own configuration and
+# drops the snippets (the rename, the removal and the reload lock under the
+# profile).
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj "/CN=aa other (fake)" \
+    -addext "subjectAltName=DNS:other.caddy-mtls-aa.localhost" \
+    -keyout "${WORK}/config/caddy/o.key" -out "${WORK}/config/caddy/o.crt" >/dev/null 2>&1
+printf 'other.caddy-mtls-aa.localhost {\n\ttls /config/caddy/o.crt /config/caddy/o.key\n\trespond "aa other" 200\n}\n' \
+    >"${WORK}/config/caddy/sites.caddy"
 chmod -R go+rX "${WORK}"
 "${DOCKER}" create --name "${CTR2}" --security-opt "apparmor=${PROFILE}" --network none \
     -e ACME_CA_URL=http://127.0.0.1:9/directory -e TZ=Europe/Vienna "${IMAGE}" >/dev/null
@@ -330,6 +341,15 @@ check "restart: the gate: the key passes (502: no upstream), alice and carol pas
 check "restart: site.caddy in use: only after the gate (403 without credentials, the custom answer with the key)" eval '
     test "$(cexec curl -sk --max-time 10 -o /dev/null -w "%{http_code}" --resolve caddy-mtls-aa.localhost:443:127.0.0.1 https://caddy-mtls-aa.localhost/aa-custom)" == 403 &&
     test "$(cexec curl -sk --max-time 10 --resolve caddy-mtls-aa.localhost:443:127.0.0.1 -H @/tmp/h-key https://caddy-mtls-aa.localhost/aa-custom)" == "aa custom"'
+check "restart: sites.caddy in use, the fallback kept (/etc/caddy/Caddyfile.own)" eval '
+    test "$(cexec jq -r .state /run/caddy-mtls/custom.json)" == loaded && cexec test -s /etc/caddy/Caddyfile.own &&
+    test "$(cexec curl -sk --max-time 10 --resolve other.caddy-mtls-aa.localhost:443:127.0.0.1 https://other.caddy-mtls-aa.localhost/)" == "aa other"'
+cexec rm /config/caddy/o.key
+code="$(http_code POST /api/clients/carol/revoke -H "X-Ingress-Path: ${INGRESS_PREFIX}" --data-urlencode reason=superseded)"
+check "restart: o.key removed, carol revoked (got ${code}): the reload fell back and dropped the snippets under ${PROFILE}" eval '
+    test "${code}" == 303 && test "$(cexec jq -r .state /run/caddy-mtls/custom.json)" == rejected &&
+    test "$(cexec jq -r .dropped /run/caddy-mtls/custom.json)" == reload && ! cexec test -e /etc/caddy/Caddyfile.own &&
+    test "$(gate --cert /data/certs/mTLS-client-carol.crt --key /data/certs/mTLS-client-carol.key)" == 000'
 check "restart: the key is not in the log" eval '! "${DOCKER}" logs "${CTR}" 2>&1 | grep -F -f "${WORK}/key" >/dev/null'
 check "restart: no 'permission denied' in the log" logs_lack "ermission denied"
 check "restart: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_container

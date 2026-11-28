@@ -57,14 +57,20 @@ readonly HEADER_KEY_FILE="/etc/caddy/header-auth.key"
 readonly FINGERPRINT_FILE="/etc/caddy/client-fingerprints.caddy"
 # Custom Caddyfile snippets (since 2.3.0): the user's files in /config/caddy,
 # their checked copies (the Caddyfile imports these, never the user's files)
-# and the state for the panel and the monitor.
+# and the state for the panel and the monitor; while they are in use, the
+# add-on's own rendering without them (what a reload falls back to when
+# Caddy cannot load them any more - caddyctl.py) and the marker that tells
+# the caddy service that this start validated the Caddyfile.
 readonly CUSTOMCONF_PY="/usr/lib/cert-mgr/customconf.py"
 readonly CUSTOM_SRC="/config/caddy"
 readonly CUSTOM_DIR="/etc/caddy/custom"
 readonly CUSTOM_STATE="${RUNTIME_DIR}/custom.json"
+readonly CADDYFILE_OWN="/etc/caddy/Caddyfile.own"
+readonly CADDYFILE_CHECKED="${RUNTIME_DIR}/caddyfile-validated"
 STARTED_AT="$(date +%s)"
 
 mkdir -p "${CERT_DIR}" "${CADDY_DATA}" "${CADDY_DATA}/log" "${RUNTIME_DIR}"
+rm -f "${CADDYFILE_OWN}" "${CADDYFILE_CHECKED}"
 chmod 700 "${CERT_DIR}" "${CADDY_DATA}/log"
 chmod 755 "${RUNTIME_DIR}"
 
@@ -890,7 +896,7 @@ CADDYFILE
     # Caddy's own formatting (tabs), so that `caddy validate` / `caddy run`
     # do not warn "Caddyfile input is not formatted" at every start (only
     # this file: the imported copies stay as the user wrote them).
-    if ! /usr/bin/caddy fmt --overwrite "${file}" >/dev/null 2>&1; then
+    if ! caddy_cmd fmt --overwrite "${file}" >/dev/null 2>&1; then
         bashio::log.warning "caddy fmt could not format ${file}; validating it as it is."
     fi
 }
@@ -898,9 +904,10 @@ CADDYFILE
 # caddy_validate <file>: `caddy validate` with its output in the add-on log,
 # scrubbed of the DNS credentials (e.g. the Cloudflare module quotes a token
 # it considers malformed in its error message) and - as a second line: the
-# configuration never contains it - of the header key.
+# configuration never contains it - of the header key. Every caddy call here
+# runs in Caddy's own environment (caddy_cmd, lib/dns-provider.sh).
 caddy_validate() {
-    /usr/bin/caddy validate --config "$1" --adapter caddyfile 2>&1 \
+    caddy_cmd validate --config "$1" --adapter caddyfile 2>&1 \
         | dns_provider_redact "${DNS_API_TOKEN}" \
         | "${PANEL_PYTHON}" "${HEADERAUTH_PY}" scrub --key-file "${HEADER_KEY_FILE}"
 }
@@ -914,9 +921,11 @@ custom_reject() {
 }
 
 # With custom files: render with them, validate, then the integrity check -
-# the configuration Caddy builds from it (caddy adapt) against the same
-# rendering without them (customconf.py check). Either failing drops all of
-# them: render again without, validate as always.
+# the configuration Caddy builds from it (caddy adapt) against the add-on's
+# own rendering without them (customconf.py check), which must validate as
+# well: it stays as ${CADDYFILE_OWN} while they are in use (the fallback of
+# a run-time reload). Any of it failing drops all of them: render again
+# without, validate as always.
 if (( ${#CUSTOM_FILES[@]} > 0 )); then
     render_caddyfile "${CADDYFILE}" yes
     bashio::log.info "Validating generated Caddyfile with the custom snippets (${CUSTOM_FILES[*]/#/caddy/})..."
@@ -927,23 +936,29 @@ if (( ${#CUSTOM_FILES[@]} > 0 )); then
     if (( VALIDATE_RC != 0 )); then
         custom_reject --validate-output "${VALIDATE_OUT}" >/dev/null
     else
-        render_caddyfile "${CADDYFILE}.reference" no
+        render_caddyfile "${CADDYFILE_OWN}" no
         ADAPTED="${RUNTIME_DIR}/custom-adapted.json"
         REFERENCE="${RUNTIME_DIR}/custom-reference.json"
-        if /usr/bin/caddy adapt --config "${CADDYFILE}" --adapter caddyfile >"${ADAPTED}" 2>/dev/null \
-            && /usr/bin/caddy adapt --config "${CADDYFILE}.reference" --adapter caddyfile >"${REFERENCE}" 2>/dev/null; then
+        if caddy_cmd adapt --config "${CADDYFILE}" --adapter caddyfile >"${ADAPTED}" 2>/dev/null \
+            && caddy_cmd adapt --config "${CADDYFILE_OWN}" --adapter caddyfile >"${REFERENCE}" 2>/dev/null; then
             CHECK_JSON=""
             if ! CHECK_JSON="$("${PANEL_PYTHON}" "${CUSTOMCONF_PY}" check --adapted "${ADAPTED}" --reference "${REFERENCE}" \
                     --domain "${DOMAIN}" --upstream "${UPSTREAM_HOST}:${UPSTREAM_PORT}" --header-auth "${HEADER_AUTH}" \
                     --state "${CUSTOM_STATE}")"; then
                 custom_reject --message "The add-on's integrity check refused them: $(jq -r '.message // "unknown"' <<<"${CHECK_JSON}" 2>/dev/null)" \
                     --file "$(jq -r '.file // ""' <<<"${CHECK_JSON}" 2>/dev/null)" >/dev/null
+            else
+                bashio::log.info "Validating the add-on's own Caddyfile (the fallback while the custom snippets are in use)..."
+                if ! caddy_validate "${CADDYFILE_OWN}" >"${VALIDATE_OUT}"; then
+                    cat "${VALIDATE_OUT}"
+                    custom_reject --message "The add-on's own configuration without them, which a reload falls back to if Caddy cannot load them any more, does not validate." >/dev/null
+                fi
             fi
         else
             custom_reject --message "Caddy could not adapt the configuration for the integrity check." >/dev/null
         fi
         chmod 600 "${ADAPTED}" "${REFERENCE}" 2>/dev/null || true
-        rm -f "${CADDYFILE}.reference"
+        (( ${#CUSTOM_FILES[@]} > 0 )) || rm -f "${CADDYFILE_OWN}"
     fi
     rm -f "${VALIDATE_OUT}"
 fi
@@ -956,6 +971,8 @@ if (( ${#CUSTOM_FILES[@]} == 0 )); then
         bashio::exit.nok "Generated Caddyfile failed validation"
     fi
 fi
+# The caddy service skips its own check of the Caddyfile at this first start.
+: >"${CADDYFILE_CHECKED}"
 
 ###############################################################################
 # Mirror certs to /config for user access via the Samba/SSH/file editor apps
@@ -1054,6 +1071,9 @@ custom_notice() {
                 bashio::log.info "               caddy/${name} (${bytes} bytes)"
             done < <(jq -r '.files[] | [.name, .bytes] | @tsv' "${CUSTOM_STATE}")
             bashio::log.info "               Changes to these files take effect when the add-on restarts."
+            bashio::log.info "               (Files they refer to are read by Caddy at every reload; if Caddy"
+            bashio::log.info "               cannot load them any more, the add-on drops the snippets until the"
+            bashio::log.info "               next start, so that the change it applies takes effect.)"
             ;;
         rejected)
             bashio::log.warning "------------------------------------------------------------"

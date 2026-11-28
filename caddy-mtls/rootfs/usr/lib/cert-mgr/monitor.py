@@ -32,9 +32,10 @@ raised; another one when the add-on starts hiding the visitor addresses at
 run time because the upstream stopped trusting it; each is dismissed when
 that is over.
 
-When the custom Caddyfile snippets were rejected at this start (2.3.0,
-customconf.py), a persistent notification says so (retried until sent); at a
-start where they are not rejected a leftover of an earlier run is dismissed.
+When the custom Caddyfile snippets are rejected (2.3.0, customconf.py: at
+the start, or dropped at run time because Caddy could not reload with them),
+a persistent notification says so (retried until sent); at a start where
+they are not rejected a leftover of an earlier run is dismissed.
 
 Failure to reach the Supervisor never crashes the loop - we log and try
 again on the next iteration.
@@ -102,8 +103,9 @@ UPSTREAM_FAST_INTERVAL = float(os.environ.get("CADDY_MTLS_UPSTREAM_FAST_SECONDS"
 UPSTREAM_FAST_WINDOW = 600.0
 UPSTREAM_NOTIFICATION_ID = "caddy_mtls_upstream_refuses"
 UPSTREAM_HIDDEN_NOTIFICATION_ID = "caddy_mtls_upstream_addresses_hidden"
-# Custom Caddyfile snippets rejected at this start (2.3.0); retried this often
-# until the Supervisor took the notification (or its dismissal).
+# Custom Caddyfile snippets rejected (2.3.0); retried this often until the
+# Supervisor took the notification (or its dismissal). The state is read at
+# every pass of the loop (it can change at run time).
 CUSTOM_NOTIFICATION_ID = "caddy_mtls_custom_config"
 CUSTOM_RETRY_SECONDS = float(os.environ.get("CADDY_MTLS_CUSTOM_RETRY_SECONDS", "60"))
 
@@ -695,9 +697,15 @@ def custom_notification(state: dict[str, Any]) -> tuple[str, str]:
     legacy = customconf.legacy_folder(state.get("folder"))
     where = f"`{folder}/`" + (f" (`{legacy}/` in apps that still use the old name)" if legacy else "")
     error = str(state.get("error") or "no message")[:customconf.ERROR_MAX]
+    if state.get("dropped_at"):
+        first = (f"Caddy could not load your custom Caddyfile snippets in {where} any more while the app applied "
+                 "a change, so the app dropped them until its next start and runs with its own configuration "
+                 "only - the change took effect.")
+    else:
+        first = (f"Caddy or the add-on's integrity check rejected your custom Caddyfile snippets in {where}, "
+                 "so the app runs with its own configuration only - one rejected file drops all of them.")
     lines = [
-        f"Caddy or the add-on's integrity check rejected your custom Caddyfile snippets in {where}, "
-        "so the app runs with its own configuration only - one rejected file drops all of them.",
+        first,
         "",
         "Message:",
         "",
@@ -705,32 +713,55 @@ def custom_notification(state: dict[str, Any]) -> tuple[str, str]:
         error,
         "```",
         "",
-        "Correct the file and restart the app. The app's web interface (Caddy mTLS, card "
-        '"Custom Caddy configuration") shows the details.',
+        ("Correct the file (or the file it refers to) and restart the app." if state.get("dropped_at")
+         else "Correct the file and restart the app.")
+        + ' The app\'s web interface (Caddy mTLS, card "Custom Caddy configuration") shows the details.',
     ]
     return "Caddy mTLS: your custom Caddyfile snippets are not in use", "\n".join(lines)
 
 
 class CustomConfigWatch:
-    """The notification about rejected custom snippets. The state changes
-    only at a start, so this runs until the Supervisor took the one call
-    this start needs: raise it while the state is rejected, otherwise
-    dismiss a leftover of an earlier run."""
+    """The notification about rejected custom snippets. The state is read
+    at every call: rejected at the start, or later when a reload dropped the
+    snippets (customconf.drop). One call to the Supervisor per state (the
+    state, its error and the run-time marker), retried every
+    CUSTOM_RETRY_SECONDS until it took it: raise it while rejected,
+    otherwise dismiss a leftover of an earlier run."""
 
     def __init__(self) -> None:
-        self.done = False
+        #: The state the Supervisor has taken the call for, the state seen
+        #: last, and when to try again after a failed call.
+        self.handled: tuple[Any, ...] | None = None
+        self._seen: tuple[Any, ...] | None = None
+        self._next_try = 0.0
 
-    def check(self) -> None:
-        if self.done:
-            return
+    @property
+    def done(self) -> bool:
+        """Nothing owed for the state seen last."""
+        return self.handled is not None and self.handled == self._seen
+
+    def check(self, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
         state = customconf.read_state()
-        if state.get("state") == "rejected":
+        rejected = state.get("state") == "rejected"
+        key = (True, str(state.get("error") or ""), state.get("dropped_at")) if rejected else (False,)
+        if key != self._seen:
+            self._seen = key
+            self._next_try = 0.0
+        if key == self.handled or now < self._next_try:
+            return
+        if rejected:
             title, message = custom_notification(state)
-            self.done = _send_notification(title, message, CUSTOM_NOTIFICATION_ID)
-            if self.done:
-                LOG.warning("Custom Caddyfile snippets not in use (rejected at the start): notification raised.")
+            sent = _send_notification(title, message, CUSTOM_NOTIFICATION_ID)
+            if sent:
+                LOG.warning("Custom Caddyfile snippets not in use (%s): notification raised.",
+                            "dropped at run time" if state.get("dropped_at") else "rejected at the start")
         else:
-            self.done = _dismiss_notification(CUSTOM_NOTIFICATION_ID)
+            sent = _dismiss_notification(CUSTOM_NOTIFICATION_ID)
+        if sent:
+            self.handled = key
+        else:
+            self._next_try = now + CUSTOM_RETRY_SECONDS
 
 
 def main() -> None:
@@ -752,7 +783,7 @@ def main() -> None:
     max_backoff = 300
     initial_done = False
     retry_logged = False
-    next_expiry = next_public = next_upstream = next_custom = started
+    next_expiry = next_public = next_upstream = started
     while True:
         now = time.monotonic()
         if now >= next_expiry:
@@ -790,13 +821,13 @@ def main() -> None:
             except Exception as exc:  # noqa: BLE001 - never crash the loop
                 LOG.exception("upstream check failed: %s", exc)
                 next_upstream = now + UPSTREAM_CONTROL_INTERVAL
-        if not custom_watch.done and now >= next_custom:
-            try:
-                custom_watch.check()
-            except Exception as exc:  # noqa: BLE001 - never crash the loop
-                LOG.exception("custom configuration check failed: %s", exc)
-            next_custom = now + CUSTOM_RETRY_SECONDS
-        wake = min(next_expiry, next_public, next_upstream, *(() if custom_watch.done else (next_custom,)))
+        # Every pass (the upstream watch wakes the loop every few seconds):
+        # a reload by the panel can drop the custom files at any time.
+        try:
+            custom_watch.check(now)
+        except Exception as exc:  # noqa: BLE001 - never crash the loop
+            LOG.exception("custom configuration check failed: %s", exc)
+        wake = min(next_expiry, next_public, next_upstream, now + CUSTOM_RETRY_SECONDS)
         time.sleep(max(0.5, wake - time.monotonic()))
 
 

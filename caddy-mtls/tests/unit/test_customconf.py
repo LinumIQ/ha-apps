@@ -20,6 +20,7 @@ import stat
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -187,6 +188,106 @@ class CollectTest(unittest.TestCase):
         state = json.loads(state_file.read_text())
         self.assertEqual((state["state"], state["files"]), ("none", []))
         self.assertTrue(customconf.card_context(state)["show"])  # the ignored entry is shown
+
+
+class DropTest(unittest.TestCase):
+    """B-2: dropping the custom files at run time (customconf.drop), the
+    reload lock, Caddy's message."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.caddyfile = self.tmp / "Caddyfile"
+        self.fallback = self.tmp / "Caddyfile.own"
+        self.copies = self.tmp / "custom"
+        self.state = self.tmp / "custom.json"
+        self.copies.mkdir()
+        (self.copies / "sites.caddy").write_text("x\n")
+        self.caddyfile.write_text("with imports\n")
+        self.fallback.write_text("own\n")
+        customconf.write_state({"state": "loaded", "files": [{"name": "sites.caddy", "bytes": 2}], "ignored": [],
+                                "error": "", "error_file": None, "folder": None}, self.state)
+
+    def drop(self, **kwargs: object) -> str:
+        return customconf.drop("open /config/caddy/o.key: no such file or directory", caddyfile=self.caddyfile,
+                               fallback=self.fallback, copy_dir=self.copies, state_path=self.state, **kwargs)
+
+    def test_drop_at_a_reload(self) -> None:
+        message = self.drop()
+        self.assertEqual(message, "Caddy could not reload with your custom files while applying a change (open "
+                                  "/config/caddy/o.key: no such file or directory). To apply the change the add-on "
+                                  "dropped them; they are read again at the next start.")
+        self.assertEqual(self.caddyfile.read_text(), "own\n")
+        self.assertFalse(self.fallback.exists())
+        self.assertFalse(self.copies.exists())
+        state = customconf.read_state(self.state)
+        self.assertEqual((state["state"], state["error"], state["error_file"], state["dropped"]),
+                         ("rejected", message, None, "reload"))
+        self.assertGreater(state["dropped_at"], 0)
+        self.assertEqual(customconf.card_context(state)["state"], "rejected")
+
+    def test_drop_when_caddy_was_started_again(self) -> None:
+        message = self.drop(when="restart")
+        self.assertTrue(message.startswith("Caddy could not load the configuration with your custom files when it "
+                                           "was started again (open /config/caddy/o.key"))
+        self.assertTrue(message.endswith("they are read again at the next start of the add-on."))
+        self.assertEqual(customconf.read_state(self.state)["dropped"], "restart")
+
+    def test_cli_drop_scrubs_takes_the_lock_and_needs_the_fallback(self) -> None:
+        key = "fakekey.NOT-A-SECRET.0123456789abcdef0123"
+        key_file = self.tmp / "header-auth.key"
+        key_file.write_text(key)
+        output = self.tmp / "validate.out"
+        output.write_text('{"level":"info","msg":"using config from file"}\n'
+                          f"Error: loading certificates: open {self.copies}/sites.caddy: no such file ({key})\n")
+        lock = self.tmp / "run" / "reload.lock"
+        args = ["drop", "--output", str(output), "--caddyfile", str(self.caddyfile), "--fallback", str(self.fallback),
+                "--copy-dir", str(self.copies), "--state", str(self.state), "--lock", str(lock)]
+        import headerauth  # noqa: PLC0415 - next to customconf
+        out = io.StringIO()
+        with redirect_stdout(out), unittest.mock.patch.object(headerauth, "KEY_FILE", key_file):
+            rc = customconf._main(args)
+        self.assertEqual(rc, 0)
+        self.assertTrue(lock.exists())
+        text = out.getvalue()
+        self.assertIn("(loading certificates: open caddy/sites.caddy: no such file (<redacted>))", text)
+        self.assertNotIn(key, self.state.read_text())
+        self.assertEqual(self.caddyfile.read_text(), "own\n")
+        # Again: no fallback file any more - nothing to drop.
+        with redirect_stdout(io.StringIO()), unittest.mock.patch("sys.stderr", io.StringIO()):
+            self.assertEqual(customconf._main(args), 1)
+
+    def test_caddy_message(self) -> None:
+        reload_out = ('2026/11/28 00:01:02.345\tINFO\tusing config from file\n'
+                      'Error: sending configuration to instance: caddy responded with error: HTTP 400: '
+                      '{"error":"loading config: loading new config: loading tls app module: provision tls: '
+                      'loading certificates: open /config/caddy/o.key: no such file or directory"}\n')
+        self.assertEqual(customconf.caddy_message(reload_out),
+                         "loading config: loading new config: loading tls app module: provision tls: loading "
+                         "certificates: open /config/caddy/o.key: no such file or directory")
+        json_out = '{"level":"error","msg":"loading certificates","error":"open /etc/caddy/custom/lan.caddy: x"}\n'
+        self.assertEqual(customconf.caddy_message(json_out), "loading certificates: open caddy/lan.caddy: x")
+        self.assertEqual(customconf.caddy_message(""), "no message")
+        long = customconf.caddy_message("Error: " + "y" * 2000)
+        self.assertEqual(len(long), customconf.CADDY_MESSAGE_MAX)
+        self.assertTrue(long.endswith("..."))
+
+    def test_reload_lock_excludes_another_holder(self) -> None:
+        import fcntl
+        lock = self.tmp / "run" / "reload.lock"
+        with customconf.reload_lock(lock):
+            fd = os.open(lock, os.O_RDWR)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+        fd = os.open(lock, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # released
+        finally:
+            os.close(fd)
+        self.assertEqual(stat.S_IMODE(os.stat(lock).st_mode), 0o600)
 
 
 class MessageTest(unittest.TestCase):
@@ -394,7 +495,7 @@ class IntegrityTest(unittest.TestCase):
                 self.assertEqual(len(customconf.check(config, config, domain=self.meta["domain"],
                                                       upstream=info["upstream"], files=[],
                                                       header_auth=info["header_auth"],
-                                                      config_path="/etc/caddy/Caddyfile.reference")), 4)
+                                                      config_path="/etc/caddy/Caddyfile.own")), 4)
 
 
 def _objects(value):

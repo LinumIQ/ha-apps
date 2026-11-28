@@ -59,9 +59,11 @@ profile caddy_mtls flags=(attach_disconnected,mediate_deleted) {
   /etc/caddy/client-fingerprints.caddy rw,
   /etc/caddy/.client-fingerprints.caddy.* rw,
   /etc/caddy/Caddyfile rw,
-  # Custom Caddyfile snippets (2.3.0): the reference rendering of the
-  # integrity check, the checked copies (customconf.py) that Caddy imports.
-  /etc/caddy/Caddyfile.reference rw,
+  # Custom Caddyfile snippets (2.3.0): the add-on's own rendering (the
+  # integrity check's reference, and the fallback a reload switches to by
+  # renaming it to the Caddyfile), the checked copies (customconf.py) that
+  # Caddy imports. The reload lock is in /run/caddy-mtls/ (above).
+  /etc/caddy/Caddyfile.own rw,
   /etc/caddy/custom/ rw,
   /etc/caddy/custom/* rw,
 

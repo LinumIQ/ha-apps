@@ -126,8 +126,8 @@ def _read_state() -> dict[str, Any]:
         return {"version": 1, "ca": None, "server": None, "clients": []}
 
 
-def _caddy_reload() -> tuple[bool, str]:
-    """Reload Caddy via the admin API (caddyctl.reload).
+def _caddy_reload() -> caddyctl.ReloadResult:
+    """Reload Caddy via the admin API (caddyctl.reload_detailed).
 
     The `caddy` CLI converts the Caddyfile to JSON and POSTs it to /load on
     the admin endpoint. Before that, caddyctl regenerates the list of active
@@ -136,7 +136,9 @@ def _caddy_reload() -> tuple[bool, str]:
     same (with the previous list: revocation must not depend on it) and the
     result is "not ok" with a message that says so. See caddyctl.py for what
     a reload re-reads (the custom snippets only as the copies checked at the
-    start).
+    start; files they refer to are read again, and if Caddy cannot reload
+    with them any more the custom files are dropped for this run so that the
+    change takes effect: ``result.dropped``).
 
     ``--force`` is required: client changes never change the Caddyfile (the
     leaf verifier only names the ``active/`` folder, whose files Caddy reads
@@ -144,7 +146,14 @@ def _caddy_reload() -> tuple[bool, str]:
     is unchanged") - without it, added clients were refused and revoked ones
     still accepted until the add-on restarted.
     """
-    return caddyctl.reload(caddy_bin=CADDY_BIN, caddyfile=CADDYFILE, admin=CADDY_ADMIN)
+    return caddyctl.reload_detailed(caddy_bin=CADDY_BIN, caddyfile=CADDYFILE, admin=CADDY_ADMIN)
+
+
+def _applied(request: Request, ok: str, result: caddyctl.ReloadResult) -> RedirectResponse:
+    """The redirect after a change Caddy applied: the ok banner, and beside
+    it as an error banner that the custom files were dropped to apply it
+    (caddyctl, 2.3.0)."""
+    return _redirect_home(request, ok=ok, error=result.dropped or None)
 
 
 def _reload_problem(message: str) -> str:
@@ -517,13 +526,13 @@ async def add_client(request: Request, name: str = Form(...)):
             f"Failed to create client '{name}'. See add-on logs for details."
         )
 
-    ok_reload, msg = _caddy_reload()
-    if not ok_reload:
-        LOG.error("caddy reload after add_client failed: %s", msg)
+    result = _caddy_reload()
+    if not result.ok:
+        LOG.error("caddy reload after add_client failed: %s", result.message)
         raise FlashError(
-            f"Client '{name}' was created, but {_reload_problem(msg)}"
+            f"Client '{name}' was created, but {_reload_problem(result.message)}"
         )
-    return _redirect_home(request, ok=f"Client '{name}' created.")
+    return _applied(request, f"Client '{name}' created.", result)
 
 
 @app.post("/api/clients/{name}/revoke")
@@ -554,13 +563,13 @@ async def revoke_client(request: Request, name: str, reason: str = Form("unspeci
             f"Failed to revoke client '{name}'. See add-on logs for details."
         )
 
-    ok_reload, msg = _caddy_reload()
-    if not ok_reload:
-        LOG.error("caddy reload after revoke_client failed: %s", msg)
+    result = _caddy_reload()
+    if not result.ok:
+        LOG.error("caddy reload after revoke_client failed: %s", result.message)
         raise FlashError(
-            f"Client '{name}' was revoked, but {_reload_problem(msg)}"
+            f"Client '{name}' was revoked, but {_reload_problem(result.message)}"
         )
-    return _redirect_home(request, ok=f"Client '{name}' revoked.")
+    return _applied(request, f"Client '{name}' revoked.", result)
 
 
 @app.post("/api/clients/{name}/regenerate")
@@ -603,13 +612,13 @@ async def regenerate_client(request: Request, name: str):
             f"Failed to regenerate client '{name}'. See add-on logs for details."
         )
 
-    ok_reload, msg = _caddy_reload()
-    if not ok_reload:
-        LOG.error("caddy reload after regenerate_client failed: %s", msg)
+    result = _caddy_reload()
+    if not result.ok:
+        LOG.error("caddy reload after regenerate_client failed: %s", result.message)
         raise FlashError(
-            f"Client '{name}' was regenerated, but {_reload_problem(msg)}"
+            f"Client '{name}' was regenerated, but {_reload_problem(result.message)}"
         )
-    return _redirect_home(request, ok=f"Client '{name}' regenerated.")
+    return _applied(request, f"Client '{name}' regenerated.", result)
 
 
 _CHECK_RESULT = {
@@ -734,11 +743,11 @@ async def regenerate_ca(request: Request, confirm: str = Form(...)):
             "Failed to regenerate the CA. See add-on logs for details."
         )
 
-    ok_reload, msg = _caddy_reload()
-    if not ok_reload:
-        LOG.error("caddy reload after regenerate_ca failed: %s", msg)
+    result = _caddy_reload()
+    if not result.ok:
+        LOG.error("caddy reload after regenerate_ca failed: %s", result.message)
         raise FlashError(
-            f"CA was regenerated, but {_reload_problem(msg)}"
+            f"CA was regenerated, but {_reload_problem(result.message)}"
         )
-    return _redirect_home(request, ok="CA regenerated.")
+    return _applied(request, "CA regenerated.", result)
 

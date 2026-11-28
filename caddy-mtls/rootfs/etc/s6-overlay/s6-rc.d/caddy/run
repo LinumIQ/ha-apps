@@ -8,6 +8,7 @@
 # Caddyfile only references them through {env.*} placeholders, which Caddy
 # resolves in this process - on the initial load and on every `caddy reload`
 # by cert-mgr. The init-caddy oneshot's own exports do not reach this service.
+# Caddy runs with nothing else in its environment (caddy_env_only, 2.3.0).
 # ==============================================================================
 
 # bashio's trace output prints the arguments of its functions - among them
@@ -30,8 +31,40 @@ if [[ "${ACME_DNS_PROVIDER}" != "none" ]]; then
     unset DNS_TOKEN
 fi
 
+readonly CADDYFILE="/etc/caddy/Caddyfile"
+
+# Custom Caddyfile snippets (2.3.0): files they refer to (a site's tls
+# certificate and key, ...) are read by Caddy at every load. If s6 starts
+# Caddy again within this run (it exited with 0 by itself) and the Caddyfile
+# no longer loads, switch to the add-on's own configuration - the step a
+# failed reload takes (customconf.py drop: the Caddyfile becomes
+# /etc/caddy/Caddyfile.own, the snippets are dropped until the next start of
+# the add-on) - instead of stopping the add-on. Only while the snippets are
+# in use (the fallback file exists), and not at the add-on's start:
+# init-caddy has just validated the Caddyfile (its marker is consumed here).
+readonly CADDYFILE_OWN="/etc/caddy/Caddyfile.own"
+readonly CADDYFILE_CHECKED="/run/caddy-mtls/caddyfile-validated"
+if ! rm "${CADDYFILE_CHECKED}" 2>/dev/null && [[ -f "${CADDYFILE_OWN}" ]]; then
+    VALIDATE_OUT="$(mktemp)"
+    VALIDATE_RC=0
+    caddy_cmd validate --config "${CADDYFILE}" --adapter caddyfile >"${VALIDATE_OUT}.raw" 2>&1 || VALIDATE_RC=$?
+    dns_provider_redact <"${VALIDATE_OUT}.raw" >"${VALIDATE_OUT}" || true
+    rm -f "${VALIDATE_OUT}.raw"
+    if (( VALIDATE_RC != 0 )); then
+        if caddy_cmd validate --config "${CADDYFILE_OWN}" --adapter caddyfile >/dev/null 2>&1; then
+            { /usr/lib/cert-mgr/.venv/bin/python3 /usr/lib/cert-mgr/customconf.py drop --when restart \
+                --output "${VALIDATE_OUT}" 2>&1 || true; } \
+                | while IFS= read -r line; do bashio::log.warning "${line}"; done
+        else
+            bashio::log.error "Caddy cannot load the Caddyfile, nor the add-on's own configuration without the custom snippets."
+        fi
+    fi
+    rm -f "${VALIDATE_OUT}"
+fi
+
 bashio::log.info "Starting Caddy server..."
 # Caddy needs no access to the Supervisor; a custom Caddyfile snippet (2.3.0)
-# could read its environment through {env.*} placeholders.
-unset SUPERVISOR_TOKEN HASSIO_TOKEN
-exec /usr/bin/caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+# could read its environment through {$VAR} or {env.*} placeholders. (bash's
+# exec exports SHLVL again; env drops it.)
+caddy_env_only
+exec env -u SHLVL /usr/bin/caddy run --config "${CADDYFILE}" --adapter caddyfile

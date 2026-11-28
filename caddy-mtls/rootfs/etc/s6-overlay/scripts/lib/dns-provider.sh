@@ -73,6 +73,39 @@ dns_provider_directive() {
 }
 
 ###############################################################################
+# Caddy's environment (2.3.0). A {$VAR} in a custom Caddyfile snippet is
+# expanded by the process that adapts the Caddyfile, so every caddy
+# invocation that reads it - init-caddy (fmt, validate, adapt), the caddy
+# service (validate, run) and cert-mgr's reloads (caddyctl.py) - runs with
+# the same small environment: what Caddy needs (PATH; HOME and the XDG
+# variables decide its data and autosave locations) and the DNS provider
+# variables dns_provider_export sets, nothing else (no Supervisor token, no
+# internals). The same names as CADDY_ENV_NAMES in caddyctl.py (its unit
+# test compares both).
+###############################################################################
+CADDY_ENV_NAMES=(PATH HOME TZ XDG_CONFIG_HOME XDG_DATA_HOME
+    DNS_API_TOKEN DNS_AWS_ACCESS_KEY_ID DNS_AWS_SECRET_ACCESS_KEY)
+
+# caddy_env_only: stop exporting every variable that is not in
+# CADDY_ENV_NAMES (in the calling shell: use it in a subshell, or right
+# before exec). No values on any command line.
+caddy_env_only() {
+    local name
+    while IFS= read -r name; do
+        # shellcheck disable=SC2163 # the variable named by ${name}
+        [[ " ${CADDY_ENV_NAMES[*]} " == *" ${name} "* ]] || export -n "${name}"
+    done < <(compgen -e)
+}
+
+# caddy_cmd <caddy arguments...>: /usr/bin/caddy in that environment.
+caddy_cmd() {
+    (
+        caddy_env_only
+        exec /usr/bin/caddy "$@"
+    )
+}
+
+###############################################################################
 # Copy stdin to stdout with every DNS credential replaced by <redacted>: the
 # raw option value (argument), and the exported variables.
 # Arguments:

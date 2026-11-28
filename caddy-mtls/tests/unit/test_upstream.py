@@ -182,6 +182,11 @@ class TempFiles(unittest.TestCase):
             patcher = mock.patch.object(upstream, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
+        # caddyctl's reload lock and fallback file (2.3.0).
+        for name, value in (("RELOAD_LOCK", self.dir / "reload.lock"), ("FALLBACK_FILE", self.dir / "Caddyfile.own")):
+            patcher = mock.patch.object(upstream.caddyctl.customconf, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.reloads: list[str] = []
         self.reload_ok = True
 

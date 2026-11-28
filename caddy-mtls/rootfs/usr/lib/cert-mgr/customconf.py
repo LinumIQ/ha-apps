@@ -27,10 +27,20 @@ reload never reads a live user file), and COPIES the counting files to
 init-caddy then renders the Caddyfile with the copies, validates it, and -
 because a valid file can still change the add-on's own blocks - runs
 ``customconf.py check``: the configuration Caddy builds (``caddy adapt``)
-compared with a reference rendered WITHOUT any custom file (``check``,
-rules 1-4 in its docstring). Any failure: the state is ``rejected``, all four
-files are dropped together (``reject``) and the add-on starts with its own
-configuration only.
+compared with the add-on's own rendering WITHOUT any custom file
+(FALLBACK_FILE, ``check``, rules 1-4 in its docstring). Any failure: the
+state is ``rejected``, all four files are dropped together (``reject``) and
+the add-on starts with its own configuration only.
+
+Files that a snippet refers to (a site's ``tls`` certificate and key, a
+``trust_pool file``, CA files of a transport, ...) are not copied: Caddy reads
+them at every (re)load. If one of them breaks after the start, a reload with
+the snippets fails - and a revocation would not take effect. So the add-on's
+own rendering is kept as FALLBACK_FILE while the snippets are in use, and a
+reload that fails with them is retried with it (caddyctl.reload_detailed);
+when that works, ``drop`` makes it permanent for the run: the Caddyfile
+becomes the fallback, the copies go, the state is ``rejected`` with a
+run-time marker (``dropped_at``). The files are read again at the next start.
 
 The state for the panel's card and the monitor's notification is
 STATE_FILE (``none`` | ``loaded`` | ``rejected``, the files that counted,
@@ -41,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
 import json
 import os
 import re
@@ -49,6 +60,7 @@ import stat
 import sys
 import tempfile
 import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -57,7 +69,18 @@ MAX_BYTES = 256 * 1024
 CONFIG_DIR = Path(os.environ.get("CADDY_MTLS_CUSTOM_SRC", "/config/caddy"))
 COPY_DIR = Path(os.environ.get("CADDY_MTLS_CUSTOM_DIR", "/etc/caddy/custom"))
 STATE_FILE = Path(os.environ.get("CADDY_MTLS_CUSTOM_STATE", "/run/caddy-mtls/custom.json"))
+CADDYFILE = Path(os.environ.get("CADDYFILE", "/etc/caddy/Caddyfile"))
+#: The add-on's own rendering (no custom import), kept while the custom
+#: files are in use: the integrity check's reference, and what a reload
+#: falls back to.
+FALLBACK_FILE = Path(os.environ.get("CADDY_MTLS_FALLBACK_FILE", "/etc/caddy/Caddyfile.own"))
+#: One lock around every reload sequence of the add-on (the panel, the
+#: monitor, the caddy service's start): flock.
+RELOAD_LOCK = Path(os.environ.get("CADDY_MTLS_RELOAD_LOCK", "/run/caddy-mtls/reload.lock"))
+OPENSSL_BIN = os.environ.get("OPENSSL_BIN", "openssl")
 ERROR_MAX = 2000
+#: Caddy's message inside a run-time drop message.
+CADDY_MESSAGE_MAX = 600
 LAN_STATES = ("on", "off", "unknown")
 DOCS_URL = "https://github.com/LinumIQ/ha-apps/blob/main/caddy-mtls/DOCS.md#custom-caddyfile-snippets-since-230"
 
@@ -74,13 +97,19 @@ Put any of these files into this folder; all are optional:
   lan.caddy     directives for the local-network site (port 4443, only while
                 it is on) - after its private-address check, before the proxy
   sites.caddy   further sites and named snippets; "import mtls" gives a site
-                the add-on's strict client certificate check (with mTLS on)
+                the add-on's strict client certificate check (with mTLS on);
+                only on the add-on's ports 80, 443 and (while it is on) 4443,
+                without "bind"
 
-The files are applied when the add-on STARTS: restart it after a change.
-If Caddy rejects one of them, or it changes the add-on's own sites, NONE of
-them is used and the add-on runs with its own configuration only. The
-add-on's web interface (card "Custom Caddy configuration") and its log show
-the result and Caddy's message.
+The files are applied when the add-on STARTS (from copies): restart it after
+a change. Files they refer to (a "tls" certificate and key, a CA file, ...)
+are read by Caddy at every reload, so a change of such a file takes effect at
+the next reload. If Caddy rejects one of them, or it changes the add-on's own
+sites, NONE of them is used and the add-on runs with its own configuration
+only. If Caddy cannot reload with them any more while the add-on applies a
+change (e.g. a revoked client), the add-on drops them until the next start,
+so that the change takes effect. The add-on's web interface (card "Custom
+Caddy configuration") and its log show the result and Caddy's message.
 
 Documentation: {DOCS_URL}
 
@@ -242,7 +271,8 @@ def write_readme(config_dir: Path) -> None:
 # State
 # ---------------------------------------------------------------------------
 
-def write_state(state: dict[str, Any], path: Path = STATE_FILE) -> None:
+def write_state(state: dict[str, Any], path: Path | None = None) -> None:
+    path = STATE_FILE if path is None else path
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
     try:
@@ -300,8 +330,95 @@ def card_context(state: dict[str, Any]) -> dict[str, Any]:
         "error_file": state.get("error_file") if state.get("error_file") in FILES else None,
         "folder": folder,
         "folder_legacy": legacy_folder(folder),
+        "dropped": st == "rejected" and bool(state.get("dropped_at")),
         "docs_url": DOCS_URL,
     }
+
+
+# ---------------------------------------------------------------------------
+# Run time: the reload lock, and dropping the custom files
+# ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def reload_lock(path: Path | None = None) -> Iterator[None]:
+    """Hold the add-on's reload lock (exclusive flock on RELOAD_LOCK; waits
+    for another holder). Not re-entrant: take it once per process."""
+    path = RELOAD_LOCK if path is None else path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+_HTTP_ERROR_BODY = re.compile(r"HTTP \d{3}: (\{.*\})\s*$")
+
+
+def caddy_message(output: str, copy_dir: Path = COPY_DIR) -> str:
+    """The cause in the output of a failed ``caddy reload`` / ``caddy
+    validate``, for a message to the user: its last "Error:" line or error
+    log line (the admin endpoint's {"error": ...} unwrapped), the copies
+    named as the user's files, at most CADDY_MESSAGE_MAX characters. Scrub
+    the header key before (headerauth.scrub)."""
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    message = ""
+    for line in reversed(lines):
+        if line.startswith("Error:"):
+            message = line[len("Error:"):].strip()
+            break
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and entry.get("level") == "error" and entry.get("msg"):
+            message = str(entry["msg"]) + (f": {entry['error']}" if entry.get("error") else "")
+            break
+    if not message:
+        message = lines[-1] if lines else "no message"
+    body = _HTTP_ERROR_BODY.search(message)
+    if body:
+        with contextlib.suppress(ValueError, AttributeError):
+            message = str(json.loads(body.group(1))["error"]) or message
+    copy = re.escape(str(copy_dir).rstrip("/"))
+    message = re.sub(copy + r"/((?:global|site|lan|sites)\.caddy)", r"caddy/\1", message)
+    if len(message) > CADDY_MESSAGE_MAX:
+        message = message[:CADDY_MESSAGE_MAX - 3] + "..."
+    return message
+
+
+def drop(cause: str, *, when: str = "reload", caddyfile: Path | None = None, fallback: Path | None = None,
+         copy_dir: Path | None = None, state_path: Path | None = None) -> str:
+    """Caddy runs the add-on's own configuration (FALLBACK_FILE) because it
+    could not load the custom files any more (``cause``: caddy_message of
+    Caddy's output): make that permanent for this run - the Caddyfile
+    becomes the fallback (rename: atomic, and the fallback file is gone with
+    it), the copies are removed, the state is ``rejected`` with the message
+    and ``dropped_at`` (the run-time marker). ``when``: ``reload`` (a reload
+    by the panel or the monitor) or ``restart`` (the caddy service started
+    again). Returns the message. Call it with the reload lock held."""
+    caddyfile = CADDYFILE if caddyfile is None else caddyfile
+    fallback = FALLBACK_FILE if fallback is None else fallback
+    copy_dir = COPY_DIR if copy_dir is None else copy_dir
+    if when == "restart":
+        message = (f"Caddy could not load the configuration with your custom files when it was started again "
+                   f"({cause}). So that it runs, the add-on dropped them; they are read again at the next start "
+                   "of the add-on.")
+    else:
+        message = (f"Caddy could not reload with your custom files while applying a change ({cause}). To apply "
+                   "the change the add-on dropped them; they are read again at the next start.")
+    # If the rename fails (the fallback file then still exists - callers log
+    # that), Caddy runs the fallback all the same and the next reload falls
+    # back again: the Caddyfile still imports the copies, which are gone.
+    with contextlib.suppress(OSError):
+        os.replace(fallback, caddyfile)
+    shutil.rmtree(copy_dir, ignore_errors=True)
+    state = read_state(state_path)
+    state.update({"state": "rejected", "error": message[:ERROR_MAX], "error_file": None,
+                  "dropped_at": time.time(), "dropped": when})
+    write_state(state, state_path)
+    return message
 
 
 # ---------------------------------------------------------------------------
@@ -553,7 +670,8 @@ def _rename_path(value: Any, old: str, new: str) -> Any:
 
 def check(adapted: dict[str, Any], reference: dict[str, Any], *, domain: str, upstream: str,
           files: list[str], header_auth: bool, config_path: str = "/etc/caddy/Caddyfile",
-          reference_path: str = "/etc/caddy/Caddyfile.reference") -> list[str]:
+          reference_path: str = "/etc/caddy/Caddyfile.own",
+          read_file: Callable[[str], bytes] | None = None) -> list[str]:
     """Compare what Caddy built with the custom files (``adapted``) with the
     rendering without them (``reference``). Returns the rules that hold
     (for the log); raises Violation for the first that does not.
@@ -767,6 +885,15 @@ def _main(argv: list[str]) -> int:
     group.add_argument("--validate-output", type=Path, help="Caddy's (scrubbed) validate output")
     group.add_argument("--message", help="the reason")
     rej.add_argument("--file", default=None)
+    drp = sub.add_parser("drop", help="Caddy runs the add-on's own configuration: drop the custom files for this "
+                                      "run (takes the reload lock)")
+    drp.add_argument("--output", type=Path, required=True, help="Caddy's output (why it could not load them)")
+    drp.add_argument("--when", choices=("reload", "restart"), default="restart")
+    drp.add_argument("--caddyfile", type=Path, default=CADDYFILE)
+    drp.add_argument("--fallback", type=Path, default=FALLBACK_FILE)
+    drp.add_argument("--copy-dir", type=Path, default=COPY_DIR)
+    drp.add_argument("--state", type=Path, default=STATE_FILE)
+    drp.add_argument("--lock", type=Path, default=RELOAD_LOCK)
     args = parser.parse_args(argv)
 
     if args.command == "collect":
@@ -806,6 +933,18 @@ def _main(argv: list[str]) -> int:
             return 3
         print(json.dumps({"ok": True, "rules": rules}))
         return 0
+
+    if args.command == "drop":
+        import headerauth  # the panel's module, next to this one
+        cause = caddy_message(headerauth.scrub(args.output.read_text(errors="replace")), args.copy_dir)
+        with reload_lock(args.lock):
+            if not args.fallback.exists():
+                print("no fallback configuration: nothing dropped", file=sys.stderr)
+                return 1
+            message = drop(cause, when=args.when, caddyfile=args.caddyfile, fallback=args.fallback,
+                           copy_dir=args.copy_dir, state_path=args.state)
+        print(message)
+        return 0 if not args.fallback.exists() else 1
 
     # reject
     state = read_state(args.state)
