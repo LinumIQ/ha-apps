@@ -286,6 +286,14 @@ class DropTest(unittest.TestCase):
         self.assertEqual(len(long), customconf.CADDY_MESSAGE_MAX)
         self.assertTrue(long.endswith("..."))
 
+    def test_final_error(self) -> None:
+        """B3-2: the CLI's final error message, or None without one."""
+        self.assertEqual(customconf.final_error('{"level":"error","msg":"a"}\nError: b\n{"level":"info","msg":"c"}\n'),
+                         "b")
+        self.assertEqual(customconf.final_error('Error: b\n{"level":"error","msg":"a","error":"e"}\n'), "a: e")
+        self.assertIsNone(customconf.final_error('{"level":"info","msg":"c"}\nplain\n'))
+        self.assertEqual(customconf.caddy_message('{"level":"info","msg":"c"}\nplain\n'), "plain")
+
     def test_caddy_message_of_a_console_log_line(self) -> None:
         """B2-3: the reviewer's line (Caddy's console log format, the level
         coloured): no time stamp, no level, no colour codes."""

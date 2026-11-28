@@ -391,6 +391,41 @@ class ReloadTest(unittest.TestCase):
                 self.assertTrue(result.dropped)
                 self.assertEqual(self.calls, ["regenerate", "Caddyfile", "Caddyfile.own"])
 
+    def test_only_the_start_of_the_final_error_counts(self) -> None:
+        """B3-2: the decision reads the CLI's final error message and
+        requires it to START with the "not reached" sign - Caddy's answer
+        quotes file paths a snippet chooses."""
+        phrase = "sending configuration to instance: performing request:"
+        named = (f'{{"level":"error","ts":1.5,"msg":"sending configuration to instance: caddy responded with error: '
+                 f'HTTP 400: {{\\"error\\":\\"loading config: loading new config: loading tls app module: '
+                 f'provision tls: loading certificates: open /config/caddy/{phrase} o.key: no such file or '
+                 f'directory\\"}}"}}\n')
+        self.assertIn(phrase, named)
+        self.assertTrue(caddyctl.caddy_judged(named))  # the reviewer's named file: a refusal
+        self.assertFalse(caddyctl.caddy_judged(self.NOT_REACHED))  # the real JSON error line
+        self.assertFalse(caddyctl.caddy_judged(
+            'Error: sending configuration to instance: performing request: Post "http://127.0.0.1:2019/load": '
+            "dial tcp 127.0.0.1:2019: connect: connection refused\n"))
+        # The LAST error line decides: an earlier line with the phrase does not.
+        self.assertTrue(caddyctl.caddy_judged(self.NOT_REACHED + "Error: sending configuration to instance: caddy "
+                                              'responded with error: HTTP 400: {"error":"x"}\n'))
+        # No recognisable error line at all: judged (falls back), as before.
+        self.assertTrue(caddyctl.caddy_judged(f"{phrase} Post: connection refused\n"))
+        self.assertTrue(caddyctl.caddy_judged(""))
+
+    def test_a_refusal_quoting_the_phrase_falls_back(self) -> None:
+        """B3-2 end to end: the revocation takes effect."""
+        phrase = "sending configuration to instance: performing request:"
+        output = ("Error: sending configuration to instance: caddy responded with error: HTTP 400: "
+                  f'{{"error":"loading certificates: open /config/caddy/{phrase} o.key: no such file or directory"}}\n')
+        self.custom_files_in_use()
+        with self.assertLogs("caddyctl", level="WARNING"):
+            result = caddyctl.reload_detailed(caddyfile=self.caddyfile, run=self.run_first_fails(output),
+                                              regenerate=self.regenerate)
+        self.assertTrue(result.ok)
+        self.assertTrue(result.dropped)
+        self.assertEqual(self.calls, ["regenerate", "Caddyfile", "Caddyfile.own"])
+
     def test_the_banner_shows_only_the_cause(self) -> None:
         """B2-6: the panel's banner after "list not written and reload
         failed" names Caddy's cause, not its raw log lines (the log keeps

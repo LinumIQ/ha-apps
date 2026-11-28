@@ -402,18 +402,28 @@ def log_entry(line: str) -> dict[str, str] | None:
     return out
 
 
-def _error_message(output: str) -> str:
-    """The last "Error:" line or error log line of a Caddy CLI output (with
-    its error field), else its last line - plain text either way ("" for no
-    output)."""
-    lines = [line.strip() for line in output.splitlines() if line.strip()]
-    for line in reversed(lines):
+def final_error(output: str) -> str | None:
+    """The final error message of a Caddy CLI output: its last "Error:"
+    line (without "Error:") or the message of its last error log line (JSON
+    or console format, with its error field) - plain text; None if the
+    output has no such line."""
+    for line in reversed([line.strip() for line in output.splitlines() if line.strip()]):
         plain = _ANSI.sub("", line).strip()
         if plain.startswith("Error:"):
             return plain[len("Error:"):].strip()
         entry = log_entry(line)
         if entry and entry["level"] in ("error", "fatal", "panic") and entry["msg"]:
             return entry["msg"] + (f": {entry['error']}" if entry.get("error") else "")
+    return None
+
+
+def _error_message(output: str) -> str:
+    """final_error, else the output's last line - plain text either way
+    ("" for no output)."""
+    error = final_error(output)
+    if error is not None:
+        return error
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
     if not lines:
         return ""
     last = log_entry(lines[-1])

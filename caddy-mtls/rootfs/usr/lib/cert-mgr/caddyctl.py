@@ -315,7 +315,10 @@ _NOT_REACHED = "sending configuration to instance: performing request:"
 def caddy_judged(output: str) -> bool:
     """Did ``caddy reload`` run to its end and get a verdict on the
     configuration (so that retrying with the add-on's own one can help)?
-    False only for the one sign that the running Caddy was never reached:
+    False only when the CLI's final error message (customconf.final_error:
+    its last "Error:" line or error log line) STARTS WITH the one sign that
+    the running Caddy was never reached - never by a search of the whole
+    output, which quotes file paths a snippet chooses (B3-2):
     Caddy 2.11.9's cmd/commandfuncs.go (cmdReload) wraps the error of
     AdminAPIRequest as "sending configuration to instance: %v", and
     cmd/main.go (AdminAPIRequest) wraps a failed HTTP request as
@@ -325,11 +328,13 @@ def caddy_judged(output: str) -> bool:
     connection refused`` (also reset, EOF). Caddy's answer to a refused
     configuration is "sending configuration to instance: caddy responded
     with error: HTTP 400: ...", the adapter's own errors ("adapting config
-    using caddyfile: ...") come before any request. Everything else - an
-    output this code does not know included - counts as judged: a
-    revocation matters more than a snippet. (A CLI that did not finish or
-    could not be started is decided by the caller.)"""
-    return _NOT_REACHED not in output
+    using caddyfile: ...") come before any request, so nothing in their
+    bodies can match. Everything else - an output this code does not know,
+    or one without an error line, included - counts as judged: a revocation
+    matters more than a snippet. (A CLI that did not finish or could not be
+    started is decided by the caller.)"""
+    error = customconf.final_error(output)
+    return not (error is not None and error.startswith(_NOT_REACHED))
 
 
 def reload_detailed(*, caddy_bin: str | None = None, caddyfile: Path | None = None, admin: str | None = None,

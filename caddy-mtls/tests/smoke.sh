@@ -2184,6 +2184,15 @@ EOF
             gen_cert "${dir}" w '*.localhost'
             printf 'other.caddy-mtls-smoke.localhost {\n\ttls /config/caddy/w.crt /config/caddy/w.key\n\trespond "other"\n}\n' >"${dir}/sites.caddy"
             ;;
+        # B3-2: a referenced file named after Caddy's "not reached" sign.
+        namedcert)
+            local n="sending configuration to instance: performing request:"
+            gen_cert "${dir}" o other.caddy-mtls-smoke.localhost
+            mv "${dir}/o.crt" "${dir}/${n} o.crt"
+            mv "${dir}/o.key" "${dir}/${n} o.key"
+            printf 'other.caddy-mtls-smoke.localhost {\n\ttls "/config/caddy/%s o.crt" "/config/caddy/%s o.key"\n\trespond "other" 200\n}\n' \
+                "${n}" "${n}" >"${dir}/sites.caddy"
+            ;;
         livecert|norename)
             gen_cert "${dir}" o other.caddy-mtls-smoke.localhost
             printf 'other.caddy-mtls-smoke.localhost {\n\ttls /config/caddy/o.crt /config/caddy/o.key\n\trespond "other" 200\n}\n' >"${dir}/sites.caddy"
@@ -2665,6 +2674,27 @@ livecert_case() {
 }
 livecert_case default
 livecert_case key
+
+# --- B3-2: Caddy's refusal quotes a path that contains the "not reached"
+# sign - still a refusal: the reload falls back, the revocation applies.
+log "custom-namedcert: booting (sites.caddy loads files named after Caddy's \"not reached\" message)"
+before=${FAIL_COUNT}
+custom_boot namedcert true
+if wait_for "${BOOT_TIMEOUT}" booted; then
+    pass "custom-namedcert: add-on booted"
+    check "custom-namedcert: loaded; alice admitted (502: no upstream here); the site served" eval '
+        test "$(custom_state .state)" == loaded && test "$(creq /x "${CERT_ALICE[@]}")" == 502 &&
+        [[ "$(other_site)" == "other 200" ]]'
+    cexec sh -c 'rm "/config/caddy/sending configuration to instance: performing request: o.key"'
+    check "custom-namedcert: key removed; revoke alice -> the reload falls back (dropped), alice refused" eval '
+        r="$(panel_post /api/clients/alice/revoke reason=superseded)" &&
+        [[ "${r}" == "303 "*"error=Caddy+could+not+reload+with+your+custom+files"*"&ok=Client+%27alice%27+revoked." ]] &&
+        test "$(creq /x "${CERT_ALICE[@]}")" == 000 && test "$(custom_state .dropped)" == reload'
+    check "custom-namedcert: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
+else
+    fail "custom-namedcert: add-on booted"
+fi
+show_log_on_failure "${before}"
 
 # --- B-2: Caddy started again by s6 (it exited with 0) after o.key broke -----
 log "custom-livecert-caddyrun: booting (sites.caddy loads o.crt and o.key)"
