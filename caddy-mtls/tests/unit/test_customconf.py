@@ -17,6 +17,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -33,6 +34,19 @@ sys.path.insert(0, str(CERT_MGR))
 import customconf  # noqa: E402
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "customconf"
+OPENSSL = shutil.which("openssl")
+
+
+def make_cert_pem(san: str | None, cn: str = "smoke (fake)") -> bytes:
+    """A throwaway self-signed certificate (PEM) with one DNS subject
+    alternative name (or none)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        args = [OPENSSL, "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+                "-subj", f"/CN={cn}", "-days", "2", "-keyout", f"{tmp}/k.pem", "-out", f"{tmp}/c.pem"]
+        if san:
+            args += ["-addext", f"subjectAltName=DNS:{san}"]
+        subprocess.run(args, check=True, capture_output=True)
+        return Path(tmp, "c.pem").read_bytes()
 
 
 class CollectTest(unittest.TestCase):
@@ -366,33 +380,41 @@ class IntegrityTest(unittest.TestCase):
     def load(self, name: str) -> dict:
         return json.loads((FIXTURES / f"{name}.json").read_text())
 
-    def run_check(self, case: str) -> list[str]:
+    def run_check(self, case: str, read_file=None) -> list[str]:
         info = self.meta[case]
         return customconf.check(self.load(case), self.load(f"{case}.reference"), domain=self.meta["domain"],
                                 upstream=info["upstream"], files=info["files"],
-                                header_auth=info["header_auth"])
+                                header_auth=info["header_auth"], read_file=read_file)
 
     def test_cases(self) -> None:
         for case, info in sorted(self.meta.items()):
             if not isinstance(info, dict):
                 continue
             with self.subTest(case=case):
+                # Certificate files a case's snippet loads: made here with
+                # the case's subject alternative name (B-4).
+                certs = {path: make_cert_pem(san) for path, san in (info.get("certs") or {}).items()}
+                if certs and not OPENSSL:
+                    self.skipTest("openssl")
+                read_file = certs.__getitem__ if certs else None
                 if info["expect"] == "ok":
-                    rules = self.run_check(case)
+                    rules = self.run_check(case, read_file)
                     self.assertEqual(len(rules), 4, rules)
                 else:
                     with self.assertRaises(customconf.Violation) as ctx:
-                        self.run_check(case)
+                        self.run_check(case, read_file)
                     self.assertEqual(ctx.exception.rule, info["expect"], ctx.exception.message)
+                    self.assertIn(info.get("message", ""), ctx.exception.message)
 
-    def mutated(self, case: str, change) -> list[str]:
+    def mutated(self, case: str, change, read_file=None) -> list[str]:
         """The check of <case> after ``change(adapted)`` (a deliberate edit of
         what Caddy built, for a rule the smoke test cannot reach easily)."""
         info = self.meta[case]
         adapted = self.load(case)
         change(adapted)
         return customconf.check(adapted, self.load(f"{case}.reference"), domain=self.meta["domain"],
-                                upstream=info["upstream"], files=info["files"], header_auth=info["header_auth"])
+                                upstream=info["upstream"], files=info["files"], header_auth=info["header_auth"],
+                                read_file=read_file)
 
     def server(self, config: dict, listen: str) -> dict:
         return next(s for s in config["apps"]["http"]["servers"].values() if s["listen"] == [listen])
@@ -428,6 +450,26 @@ class IntegrityTest(unittest.TestCase):
             c["logging"]["logs"]["default"]["level"] = "ERROR"
         self.assert_rule(4, "ok", default_changed)
 
+    def test_rule_4_a_log_that_includes_the_access_logs(self) -> None:
+        """B-6: the adapter adds what an added log includes to the default
+        log's exclude - accepted for exactly those names; with a key set the
+        added log must still drop request headers."""
+        def including(filtered: bool, include: str = "http.log.access", exclude: str = "http.log.access"):
+            def change(c):
+                encoder = ({"format": "filter", "wrap": {"format": "json"},
+                            "fields": {"request>headers": {"filter": "delete"}}} if filtered else {"format": "json"})
+                c["logging"]["logs"]["mine"] = {"writer": {"output": "stdout"}, "encoder": encoder,
+                                                "include": [include]}
+                c["logging"]["logs"]["default"]["exclude"] = sorted(c["logging"]["logs"]["default"]["exclude"]
+                                                                    + [exclude])
+            return change
+        self.assertEqual(len(self.mutated("ok", including(True))), 4)
+        self.assertEqual(len(self.mutated("ok", including(True, "http.log.access.log0", "http.log.access.log0"))), 4)
+        self.assert_rule(4, "ok", including(False))  # a key is set: headers must go
+        self.assertEqual(len(self.mutated("ok-strict", including(False))), 4)
+        # An exclude that no added log includes: the add-on's log changed.
+        self.assert_rule(4, "ok", including(True, "http.log.access", "http.handlers.reverse_proxy"))
+
     def test_rule_4_no_server_of_your_own(self) -> None:
         """B-1: a site of yours on another port or with bind gets a server
         of its own: it could take the admin endpoint (2019), the web
@@ -461,6 +503,87 @@ class IntegrityTest(unittest.TestCase):
             "skip_certificates": ["caddy-mtls-smoke.localhost"]}))
         self.assert_rule(3, "ok", lambda c: self.server(c, ":443")["tls_connection_policies"].insert(0, {}))
         self.assert_rule(3, "ok-strict", lambda c: self.server(c, ":443").update(strict_sni_host=False))
+
+    def test_rule_3_messages_name_the_cause(self) -> None:
+        """B-6: global options that change the domain's certificate or TLS
+        settings stay refused, with a message that says so."""
+        def key_type(c):
+            policy = next(p for p in c["apps"]["tls"]["automation"]["policies"]
+                          if "caddy-mtls-smoke.localhost" in (p.get("subjects") or []))
+            policy["key_type"] = "rsa2048"
+        with self.assertRaises(customconf.Violation) as ctx:
+            self.mutated("ok", key_type)
+        self.assertEqual(ctx.exception.rule, 3)
+        self.assertIn("(key_type)", ctx.exception.message)
+        self.assertIn("the certificate and TLS settings of the add-on's own domain cannot be changed by a snippet",
+                      ctx.exception.message)
+
+        def default_sni(c):
+            for policy in self.server(c, ":443")["tls_connection_policies"]:
+                policy["default_sni"] = "other.example.com"
+        with self.assertRaises(customconf.Violation) as ctx:
+            self.mutated("ok", default_sni)
+        self.assertEqual(ctx.exception.rule, 3)
+        self.assertIn("(default_sni)", ctx.exception.message)
+        self.assertIn("cannot be changed by a snippet", ctx.exception.message)
+
+    def test_rule_2_a_wildcard_site_over_the_domain(self) -> None:
+        def wildcard(c):
+            self.server(c, ":443")["routes"].append(
+                {"match": [{"host": ["*.localhost"]}], "handle": [{"handler": "static_response"}], "terminal": True})
+        with self.assertRaises(customconf.Violation) as ctx:
+            self.mutated("ok", wildcard)
+        self.assertEqual(ctx.exception.rule, 2)
+        self.assertIn("a site of yours for *.localhost also covers the add-on's own host name "
+                      "caddy-mtls-smoke.localhost: a wildcard site that includes the add-on's name is not supported",
+                      ctx.exception.message)
+
+    @unittest.skipUnless(OPENSSL, "openssl")
+    def test_rule_3_certificates_a_site_loads(self) -> None:
+        """B-4: a certificate that covers the domain (SAN or CN, wildcards
+        included) would replace the add-on's own."""
+        pems = {"/config/caddy/w.crt": make_cert_pem("*.localhost"),
+                "/config/caddy/o.crt": make_cert_pem("other.example.com"),
+                "/config/caddy/cn.crt": make_cert_pem(None, cn="caddy-mtls-smoke.localhost"),
+                "/config/caddy/bad.crt": b"not a certificate\n"}
+
+        def read_file(path: str) -> bytes:
+            if path not in pems:
+                raise FileNotFoundError(2, "No such file or directory")
+            return pems[path]
+
+        def loading(loader: str, value):
+            def change(c):
+                c["apps"].setdefault("tls", {})["certificates"] = {loader: value}
+            return change
+
+        def files(path):
+            return loading("load_files", [{"certificate": path, "key": path[:-3] + "key", "tags": ["cert0"]}])
+        self.assertEqual(len(self.mutated("ok", files("/config/caddy/o.crt"), read_file)), 4)
+        for path, needle in (("/config/caddy/w.crt", "covers the add-on's own domain caddy-mtls-smoke.localhost "
+                                                     "(as *.localhost)"),
+                             ("/config/caddy/cn.crt", "(as caddy-mtls-smoke.localhost)"),
+                             ("/config/caddy/gone.crt", "cannot be read (No such file or directory)"),
+                             ("/config/caddy/bad.crt", "cannot be checked: openssl cannot parse it")):
+            with self.subTest(path=path):
+                with self.assertRaises(customconf.Violation) as ctx:
+                    self.mutated("ok", files(path), read_file)
+                self.assertEqual(ctx.exception.rule, 3)
+                self.assertIn(f"the certificate file {path}, which a site of yours loads", ctx.exception.message)
+                self.assertIn(needle, ctx.exception.message)
+                self.assertEqual(ctx.exception.file, "sites.caddy")
+        with self.assertRaises(customconf.Violation) as ctx:
+            self.mutated("ok", loading("load_pem", [{"certificate": pems["/config/caddy/w.crt"].decode(),
+                                                     "key": "x"}]), read_file)
+        self.assertIn("an inline certificate (load_pem), which a site of yours loads, covers", ctx.exception.message)
+        for loader in ("load_folders", "load_storage", "something_new"):
+            with self.subTest(loader=loader):
+                with self.assertRaises(customconf.Violation) as ctx:
+                    self.mutated("ok", loading(loader, ["/config/caddy"]), read_file)
+                self.assertIn(f"loads certificates with {loader}, which the add-on cannot check",
+                              ctx.exception.message)
+        self.assertEqual(len(self.mutated("ok", loading("automate", ["printer.example.com"]), read_file)), 4)
+        self.assert_rule(3, "ok", loading("automate", ["*.localhost"]))
 
     def test_rule_1_groups_are_compared_up_to_renaming(self) -> None:
         def rename(c, old, new):

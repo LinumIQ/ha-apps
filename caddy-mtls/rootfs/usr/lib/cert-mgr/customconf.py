@@ -45,7 +45,7 @@ run-time marker (``dropped_at``). The files are read again at the next start.
 The state for the panel's card and the monitor's notification is
 STATE_FILE (``none`` | ``loaded`` | ``rejected``, the files that counted,
 ignored entries with the reason, the error, the host folder). Standard
-library only.
+library only (plus the openssl CLI for certificates a snippet loads).
 """
 from __future__ import annotations
 
@@ -57,6 +57,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -668,6 +669,115 @@ def _rename_path(value: Any, old: str, new: str) -> Any:
     return new if value == old else value
 
 
+def _route_hosts(route: dict[str, Any]) -> list[str]:
+    hosts: list[str] = []
+    for matchers in route.get("match") or []:
+        if isinstance(matchers, dict) and isinstance(matchers.get("host"), list):
+            hosts.extend(h for h in matchers["host"] if isinstance(h, str))
+    return hosts
+
+
+def _changed_keys(ref: Any, got: Any) -> str:
+    """Which settings differ, for a message: the keys of the first differing
+    pair of dicts (lists compared element by element)."""
+    if isinstance(ref, list) and isinstance(got, list):
+        if len(ref) != len(got):
+            return "a policy was added or removed"
+        for r, g in zip(ref, got):
+            if r != g:
+                return _changed_keys(r, g)
+        return "nothing"
+    if isinstance(ref, dict) and isinstance(got, dict):
+        keys = sorted(k for k in set(ref) | set(got) if ref.get(k) != got.get(k))
+        return ", ".join(keys) or "nothing"
+    return "the whole policy"
+
+
+#: The cause of a rule-3 change, for the messages (B-6).
+_TLS_HINT = ("the certificate and TLS settings of the add-on's own domain cannot be changed by a snippet (global "
+             "options such as key_type, ocsp_stapling, cert_issuer, acme_ca or default_sni change them)")
+
+
+def _read_bytes(path: str) -> bytes:
+    with open(path, "rb") as fh:
+        return fh.read(1024 * 1024)
+
+
+def cert_names(pem: bytes) -> list[str]:
+    """The names Caddy serves a certificate for (certmagic: the subject's
+    CN and the subject alternative names), from the first certificate of
+    ``pem`` (openssl). Raises ValueError if openssl cannot parse it."""
+    try:
+        proc = subprocess.run(
+            [OPENSSL_BIN, "x509", "-noout", "-subject", "-nameopt", "RFC2253", "-ext", "subjectAltName"],
+            input=pem, capture_output=True, check=False, timeout=10)
+    except (OSError, subprocess.SubprocessError) as err:
+        raise ValueError(f"openssl could not run ({type(err).__name__})") from None
+    if proc.returncode != 0:
+        raise ValueError("openssl cannot parse it as a certificate")
+    names: list[str] = []
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if line.startswith("subject="):
+            match = re.search(r"(?:^|,)CN=((?:[^,\\]|\\.)*)", line[len("subject="):])
+            if match:
+                names.append(re.sub(r"\\(.)", r"\1", match.group(1)))
+            continue
+        for part in line.split(","):
+            part = part.strip()
+            if part.startswith("DNS:"):
+                names.append(part[len("DNS:"):])
+            elif part.startswith("IP Address:"):
+                names.append(part[len("IP Address:"):])
+    return names
+
+
+def _check_certificates(adapted: dict[str, Any], reference: dict[str, Any], domain: str, file: str | None,
+                        read_file: Callable[[str], bytes]) -> None:
+    """Rule 3 (B-4): a certificate a site of yours loads must not cover the
+    domain - Caddy would serve it for the add-on's domain and stop managing
+    the add-on's own certificate."""
+    certs_ref = (((reference.get("apps") or {}).get("tls") or {}).get("certificates")) or {}
+    certs_got = (((adapted.get("apps") or {}).get("tls") or {}).get("certificates")) or {}
+    if not isinstance(certs_got, dict):
+        raise Violation(3, "the certificate loaders changed", file)
+    for loader, value in certs_got.items():
+        if isinstance(certs_ref, dict) and certs_ref.get(loader) == value:
+            continue
+        if loader in ("load_files", "load_pem"):
+            for entry in value if isinstance(value, list) else [value]:
+                entry = entry if isinstance(entry, dict) else {}
+                if loader == "load_files":
+                    what = f"the certificate file {entry.get('certificate')}"
+                    try:
+                        pem = read_file(str(entry.get("certificate")))
+                    except OSError as err:
+                        raise Violation(3, f"{what}, which a site of yours loads, cannot be read "
+                                           f"({err.strerror or type(err).__name__})", file) from None
+                else:
+                    what = "an inline certificate (load_pem)"
+                    pem = str(entry.get("certificate") or "").encode()
+                try:
+                    names = cert_names(pem)
+                except ValueError as err:
+                    raise Violation(3, f"{what}, which a site of yours loads, cannot be checked: {err}", file) \
+                        from None
+                covering = [n for n in names if _labels_overlap(n, domain)]
+                if covering:
+                    raise Violation(3, f"{what}, which a site of yours loads, covers the add-on's own domain "
+                                       f"{domain} (as {covering[0]}): Caddy would serve it for the add-on's "
+                                       "domain instead of the add-on's own certificate, and stop renewing that "
+                                       "one", file)
+        elif loader == "automate":
+            covering = [n for n in value or [] if isinstance(n, str) and _labels_overlap(n, domain)]
+            if not isinstance(value, list) or covering:
+                raise Violation(3, f"a site of yours has a certificate managed for {covering[0] if covering else '?'}"
+                                   f", which covers the add-on's own domain {domain}", file)
+        else:
+            raise Violation(3, f"a site of yours loads certificates with {loader}, which the add-on cannot check: "
+                               "only certificate files (tls <certificate> <key>) are supported in snippets", file)
+
+
 def check(adapted: dict[str, Any], reference: dict[str, Any], *, domain: str, upstream: str,
           files: list[str], header_auth: bool, config_path: str = "/etc/caddy/Caddyfile",
           reference_path: str = "/etc/caddy/Caddyfile.own",
@@ -688,11 +798,15 @@ def check(adapted: dict[str, Any], reference: dict[str, Any], *, domain: str, up
     3. TLS for the domain is intact: the connection policies that can apply
        to the domain's SNI and the certificate automation policy equal the
        reference's; strict_sni_host is not switched off where the reference
-       has client authentication.
+       has client authentication; no certificate a site of yours loads
+       covers the domain (``read_file`` reads a certificate file; loaders
+       that cannot be checked are refused).
     4. The machinery is intact: admin, storage, grace_period, the add-on's
        logs (a log you add must drop request headers too while a header key
        is set), the listeners of the add-on's servers and their other
-       security-relevant fields (listener wrappers, trusted proxies, ...).
+       security-relevant fields (listener wrappers, trusted proxies, ...);
+       no server of its own for a site of yours (only the add-on's
+       listeners, no ``bind``).
     """
     # Caddy names the file it read in places (file_server hides it): the
     # reference was rendered under another name.
@@ -701,6 +815,7 @@ def check(adapted: dict[str, Any], reference: dict[str, Any], *, domain: str, up
     site_file = "site.caddy" if "site.caddy" in files else None
     lan_file = "lan.caddy" if "lan.caddy" in files else None
     only = files[0] if len(files) == 1 else None
+    sites_file = "sites.caddy" if "sites.caddy" in files else only
 
     # 4 (top level).
     for key in ("admin", "storage"):
@@ -715,6 +830,10 @@ def check(adapted: dict[str, Any], reference: dict[str, Any], *, domain: str, up
     logs_ref = ((reference.get("logging") or {}).get("logs")) or {}
     logs_got = ((adapted.get("logging") or {}).get("logs")) or {}
     added = {f"http.log.access.{name}" for name in logs_got if name not in logs_ref}
+    # A log you add that includes loggers (e.g. include http.log.access): the
+    # adapter excludes those from the default log (B-6).
+    included = {i for name, log in logs_got.items() if name not in logs_ref and isinstance(log, dict)
+                for i in log.get("include") or [] if isinstance(i, str)}
     for name, log in logs_ref.items():
         got = logs_got.get(name)
         if not isinstance(got, dict) or not isinstance(log, dict):
@@ -726,7 +845,7 @@ def check(adapted: dict[str, Any], reference: dict[str, Any], *, domain: str, up
         extra = set(got.get("exclude") or []) - set(log.get("exclude") or [])
         if ({k: v for k, v in got.items() if k != "exclude"} != {k: v for k, v in log.items() if k != "exclude"}
                 or not set(log.get("exclude") or []) <= set(got.get("exclude") or [])
-                or not all(_SITE_LOGGER.fullmatch(e) and e in added for e in extra)):
+                or not all((_SITE_LOGGER.fullmatch(e) and e in added) or e in included for e in extra)):
             raise Violation(4, f"the add-on's log {name} changed", only)
     if header_auth:
         for name, log in logs_got.items():
@@ -773,10 +892,16 @@ def check(adapted: dict[str, Any], reference: dict[str, Any], *, domain: str, up
             ref_dom = [r for r in ref_routes if route_may_match(r, domain)]
             got_dom = [r for r in got_routes if route_may_match(r, domain)]
             if len(got_dom) != len(ref_dom):
+                ref_hosts = {h for r in ref_dom for h in _route_hosts(r)}
+                wild = sorted({h for r in got_dom for h in _route_hosts(r)
+                               if h not in ref_hosts and "*" in h and _labels_overlap(h, domain)})
+                if wild:
+                    raise Violation(2, f"a site of yours for {wild[0]} also covers the add-on's own host name "
+                                       f"{domain}: a wildcard site that includes the add-on's name is not supported",
+                                    sites_file)
                 raise Violation(2, f"another route can answer {domain} on {srv_ref.get('listen')} (a site for the "
                                    "add-on's own host name - also with a path or a port -, a site without a "
-                                   "host name, or braces that closed the add-on's site)",
-                                "sites.caddy" if "sites.caddy" in files else only)
+                                   "host name, or braces that closed the add-on's site)", sites_file)
             comparer = _Comparer(upstream, allow_run=bool(lan_file if lan else site_file), where=where,
                                  file=(lan_file if lan else site_file) or only, groups=groups)
             for r, g in zip(ref_dom, got_dom):
@@ -794,8 +919,8 @@ def check(adapted: dict[str, Any], reference: dict[str, Any], *, domain: str, up
         ref_pol = [domain_part(p) for p in srv_ref.get("tls_connection_policies") or [] if _policy_may_match(p, domain)]
         got_pol = [domain_part(p) for p in srv_got.get("tls_connection_policies") or [] if _policy_may_match(p, domain)]
         if ref_pol != got_pol:
-            raise Violation(3, f"{where}: the TLS settings for {domain} changed (client authentication, "
-                               "certificates)", "sites.caddy" if "sites.caddy" in files else only)
+            raise Violation(3, f"{where}: the TLS settings for {domain} changed ({_changed_keys(ref_pol, got_pol)}): "
+                               f"{_TLS_HINT}", "global.caddy" if "global.caddy" in files else only)
         has_client_auth = any(isinstance(p, dict) and p.get("client_authentication")
                               for p in srv_ref.get("tls_connection_policies") or [])
         if has_client_auth and srv_got.get("strict_sni_host") not in (None, True):
@@ -845,15 +970,18 @@ def check(adapted: dict[str, Any], reference: dict[str, Any], *, domain: str, up
                            "80, 443 and (while the local-network port is on) 4443, without bind - the add-on "
                            "publishes no other port, and ports such as 2019 (Caddy's admin interface) and 8099 "
                            "(this web interface) belong to the add-on",
-                        "sites.caddy" if "sites.caddy" in files else only)
+                        sites_file)
     rules.append("2: no other route can answer the domain")
     # The adapter merges host names with the same TLS settings into one
     # policy: its subjects may grow by a site you add, its settings may not.
     def settings(policy: Any) -> Any:
         return {k: v for k, v in policy.items() if k != "subjects"} if isinstance(policy, dict) else policy
-    if settings(_automation_policy(adapted, domain)) != settings(_automation_policy(reference, domain)):
-        raise Violation(3, f"the certificate settings for {domain} changed",
-                        "global.caddy" if "global.caddy" in files else only)
+    policy_ref = settings(_automation_policy(reference, domain))
+    policy_got = settings(_automation_policy(adapted, domain))
+    if policy_got != policy_ref:
+        raise Violation(3, f"the certificate settings for {domain} changed ({_changed_keys(policy_ref, policy_got)}): "
+                           f"{_TLS_HINT}", "global.caddy" if "global.caddy" in files else only)
+    _check_certificates(adapted, reference, domain, sites_file, read_file or _read_bytes)
     rules.append("3: TLS for the domain unchanged")
     return rules
 

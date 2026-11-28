@@ -102,5 +102,90 @@
   ],
   "upstream": "127.0.0.1:8123",
   "header_auth": true
+ },
+ "port-admin": {
+  "expect": 4,
+  "files": [
+   "sites.caddy"
+  ],
+  "upstream": "127.0.0.1:8123",
+  "header_auth": true,
+  "message": "a site of yours listens on :2019"
+ },
+ "port-panel": {
+  "expect": 4,
+  "files": [
+   "sites.caddy"
+  ],
+  "upstream": "127.0.0.1:8123",
+  "header_auth": true,
+  "message": "a site of yours listens on :8099"
+ },
+ "bind": {
+  "expect": 4,
+  "files": [
+   "sites.caddy"
+  ],
+  "upstream": "127.0.0.1:8123",
+  "header_auth": true,
+  "message": "without bind"
+ },
+ "wildcert": {
+  "expect": 3,
+  "files": [
+   "sites.caddy"
+  ],
+  "upstream": "127.0.0.1:8123",
+  "header_auth": true,
+  "certs": {
+   "/config/caddy/w.crt": "*.localhost"
+  },
+  "message": "covers the add-on's own domain caddy-mtls-smoke.localhost (as *.localhost)"
+ },
+ "livecert": {
+  "expect": "ok",
+  "files": [
+   "sites.caddy"
+  ],
+  "upstream": "127.0.0.1:8124",
+  "header_auth": true,
+  "certs": {
+   "/config/caddy/o.crt": "other.caddy-mtls-smoke.localhost"
+  }
+ },
+ "keytype": {
+  "expect": 3,
+  "files": [
+   "global.caddy"
+  ],
+  "upstream": "127.0.0.1:8123",
+  "header_auth": true,
+  "message": "(key_type): the certificate and TLS settings of the add-on's own domain cannot be changed by a snippet"
+ },
+ "defsni": {
+  "expect": 3,
+  "files": [
+   "global.caddy"
+  ],
+  "upstream": "127.0.0.1:8123",
+  "header_auth": true,
+  "message": "cannot be changed by a snippet"
+ },
+ "wild": {
+  "expect": 2,
+  "files": [
+   "sites.caddy"
+  ],
+  "upstream": "127.0.0.1:8123",
+  "header_auth": true,
+  "message": "a wildcard site that includes the add-on's name is not supported"
+ },
+ "logok": {
+  "expect": "ok",
+  "files": [
+   "global.caddy"
+  ],
+  "upstream": "127.0.0.1:8123",
+  "header_auth": true
  }
 }
