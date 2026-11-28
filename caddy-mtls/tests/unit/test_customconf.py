@@ -585,6 +585,26 @@ class IntegrityTest(unittest.TestCase):
         self.assertEqual(len(self.mutated("ok", loading("automate", ["printer.example.com"]), read_file)), 4)
         self.assert_rule(3, "ok", loading("automate", ["*.localhost"]))
 
+    def test_rule_3_reads_regular_files_only(self) -> None:
+        """B2-2: the check's own reader never blocks on a named pipe and
+        reads regular files only."""
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        fifo = tmp / "f.crt"
+        os.mkfifo(fifo)
+        for path in (fifo, tmp):
+            with self.subTest(path=path.name):
+                with self.assertRaises(customconf.NotRegularFile):
+                    customconf._read_bytes(str(path))
+        regular = tmp / "r.crt"
+        regular.write_bytes(b"pem")
+        self.assertEqual(customconf._read_bytes(str(regular)), b"pem")
+        with self.assertRaises(customconf.Violation) as ctx:
+            self.mutated("ok", lambda c: c["apps"].setdefault("tls", {}).update(certificates={"load_files": [
+                {"certificate": str(fifo), "key": str(tmp / "f.key")}]}))
+        self.assertEqual(ctx.exception.message,
+                         f"the certificate file {fifo}, which a site of yours loads, is not a regular file")
+
     def test_rule_1_groups_are_compared_up_to_renaming(self) -> None:
         def rename(c, old, new):
             text = json.dumps(c).replace(f'"{old}"', f'"{new}"')

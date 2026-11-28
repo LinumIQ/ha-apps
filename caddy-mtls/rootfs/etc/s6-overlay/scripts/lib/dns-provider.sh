@@ -105,6 +105,23 @@ caddy_cmd() {
     )
 }
 
+# caddy_cmd_limited <seconds> <caddy arguments...>: caddy_cmd under a time
+# limit (the image's busybox timeout: SIGTERM at the limit, SIGKILL 5 s
+# later, so that no process is left behind).
+caddy_cmd_limited() {
+    local seconds="$1"
+    shift
+    (
+        caddy_env_only
+        exec timeout -k 5 "${seconds}" /usr/bin/caddy "$@"
+    )
+}
+
+# limit_expired <exit status>: busybox timeout's status for an expired
+# limit - 143 (the command ended by its SIGTERM; GNU's 124 does not apply
+# here) or 137 (by the SIGKILL that follows).
+limit_expired() { [[ "$1" == 143 || "$1" == 137 ]]; }
+
 ###############################################################################
 # Copy stdin to stdout with every DNS credential replaced by <redacted>: the
 # raw option value (argument), and the exported variables.

@@ -698,9 +698,22 @@ _TLS_HINT = ("the certificate and TLS settings of the add-on's own domain cannot
              "options such as key_type, ocsp_stapling, cert_issuer, acme_ca or default_sni change them)")
 
 
+class NotRegularFile(OSError):
+    """A certificate path that is not a regular file (never read)."""
+
+
 def _read_bytes(path: str) -> bytes:
-    with open(path, "rb") as fh:
-        return fh.read(1024 * 1024)
+    """At most 1 MiB of a regular file - opened without blocking (a named
+    pipe would wait for a writer) and checked with fstat, as collect does;
+    anything else raises NotRegularFile."""
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise NotRegularFile(f"{path} is not a regular file")
+        with os.fdopen(os.dup(fd), "rb") as fh:
+            return fh.read(1024 * 1024)
+    finally:
+        os.close(fd)
 
 
 def cert_names(pem: bytes) -> list[str]:
@@ -751,6 +764,9 @@ def _check_certificates(adapted: dict[str, Any], reference: dict[str, Any], doma
                     what = f"the certificate file {entry.get('certificate')}"
                     try:
                         pem = read_file(str(entry.get("certificate")))
+                    except NotRegularFile:
+                        raise Violation(3, f"{what}, which a site of yours loads, is not a regular file", file) \
+                            from None
                     except OSError as err:
                         raise Violation(3, f"{what}, which a site of yours loads, cannot be read "
                                            f"({err.strerror or type(err).__name__})", file) from None

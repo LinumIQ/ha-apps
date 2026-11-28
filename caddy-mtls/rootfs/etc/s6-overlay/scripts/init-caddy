@@ -906,8 +906,13 @@ CADDYFILE
 # it considers malformed in its error message) and - as a second line: the
 # configuration never contains it - of the header key. Every caddy call here
 # runs in Caddy's own environment (caddy_cmd, lib/dns-provider.sh).
+# caddy_validate <file> limit: the same under CUSTOM_CHECK_SECONDS (the
+# custom files' check only; its exit status then says whether the limit
+# expired: limit_expired).
 caddy_validate() {
-    caddy_cmd validate --config "$1" --adapter caddyfile 2>&1 \
+    local run=(caddy_cmd)
+    [[ "${2:-}" == limit ]] && run=(caddy_cmd_limited "${CUSTOM_CHECK_SECONDS}")
+    "${run[@]}" validate --config "$1" --adapter caddyfile 2>&1 \
         | dns_provider_redact "${DNS_API_TOKEN}" \
         | "${PANEL_PYTHON}" "${HEADERAUTH_PY}" scrub --key-file "${HEADER_KEY_FILE}"
 }
@@ -925,26 +930,45 @@ custom_reject() {
 # own rendering without them (customconf.py check), which must validate as
 # well: it stays as ${CADDYFILE_OWN} while they are in use (the fallback of
 # a run-time reload). Any of it failing drops all of them: render again
-# without, validate as always.
+# without, validate as always. Caddy reads the files a snippet refers to:
+# a named pipe or a network folder that does not answer would block for
+# ever, so the steps that read them (validate with the snippets, both
+# adapts, the check) run under a time limit, and an expired one rejects
+# the files too (B2-2).
+readonly CUSTOM_CHECK_SECONDS=60
+readonly CUSTOM_TIMEOUT_MESSAGE="Caddy did not finish checking the configuration with your custom files within ${CUSTOM_CHECK_SECONDS} seconds. A file a snippet refers to probably cannot be read to its end (a named pipe, or a network folder that does not answer)."
 if (( ${#CUSTOM_FILES[@]} > 0 )); then
     render_caddyfile "${CADDYFILE}" yes
     bashio::log.info "Validating generated Caddyfile with the custom snippets (${CUSTOM_FILES[*]/#/caddy/})..."
     VALIDATE_OUT="$(mktemp)"
     VALIDATE_RC=0
-    caddy_validate "${CADDYFILE}" >"${VALIDATE_OUT}" || VALIDATE_RC=$?
+    caddy_validate "${CADDYFILE}" limit >"${VALIDATE_OUT}" || VALIDATE_RC=$?
     sed "s#${CUSTOM_DIR}/#caddy/#g" "${VALIDATE_OUT}"
-    if (( VALIDATE_RC != 0 )); then
+    if limit_expired "${VALIDATE_RC}"; then
+        custom_reject --message "${CUSTOM_TIMEOUT_MESSAGE}" >/dev/null
+    elif (( VALIDATE_RC != 0 )); then
         custom_reject --validate-output "${VALIDATE_OUT}" >/dev/null
     else
         render_caddyfile "${CADDYFILE_OWN}" no
         ADAPTED="${RUNTIME_DIR}/custom-adapted.json"
         REFERENCE="${RUNTIME_DIR}/custom-reference.json"
-        if caddy_cmd adapt --config "${CADDYFILE}" --adapter caddyfile >"${ADAPTED}" 2>/dev/null \
-            && caddy_cmd adapt --config "${CADDYFILE_OWN}" --adapter caddyfile >"${REFERENCE}" 2>/dev/null; then
+        ADAPT_RC=0
+        caddy_cmd_limited "${CUSTOM_CHECK_SECONDS}" adapt --config "${CADDYFILE}" --adapter caddyfile \
+            >"${ADAPTED}" 2>/dev/null || ADAPT_RC=$?
+        (( ADAPT_RC != 0 )) || caddy_cmd_limited "${CUSTOM_CHECK_SECONDS}" adapt --config "${CADDYFILE_OWN}" \
+            --adapter caddyfile >"${REFERENCE}" 2>/dev/null || ADAPT_RC=$?
+        if limit_expired "${ADAPT_RC}"; then
+            custom_reject --message "${CUSTOM_TIMEOUT_MESSAGE}" >/dev/null
+        elif (( ADAPT_RC == 0 )); then
             CHECK_JSON=""
-            if ! CHECK_JSON="$("${PANEL_PYTHON}" "${CUSTOMCONF_PY}" check --adapted "${ADAPTED}" --reference "${REFERENCE}" \
-                    --domain "${DOMAIN}" --upstream "${UPSTREAM_HOST}:${UPSTREAM_PORT}" --header-auth "${HEADER_AUTH}" \
-                    --state "${CUSTOM_STATE}")"; then
+            CHECK_RC=0
+            CHECK_JSON="$(timeout -k 5 "${CUSTOM_CHECK_SECONDS}" "${PANEL_PYTHON}" "${CUSTOMCONF_PY}" check \
+                --adapted "${ADAPTED}" --reference "${REFERENCE}" \
+                --domain "${DOMAIN}" --upstream "${UPSTREAM_HOST}:${UPSTREAM_PORT}" --header-auth "${HEADER_AUTH}" \
+                --state "${CUSTOM_STATE}")" || CHECK_RC=$?
+            if limit_expired "${CHECK_RC}"; then
+                custom_reject --message "${CUSTOM_TIMEOUT_MESSAGE}" >/dev/null
+            elif (( CHECK_RC != 0 )); then
                 custom_reject --message "The add-on's integrity check refused them: $(jq -r '.message // "unknown"' <<<"${CHECK_JSON}" 2>/dev/null)" \
                     --file "$(jq -r '.file // ""' <<<"${CHECK_JSON}" 2>/dev/null)" >/dev/null
             else

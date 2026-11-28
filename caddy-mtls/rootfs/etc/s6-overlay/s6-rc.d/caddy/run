@@ -42,19 +42,36 @@ readonly CADDYFILE="/etc/caddy/Caddyfile"
 # the add-on) - instead of stopping the add-on. Only while the snippets are
 # in use (the fallback file exists), and not at the add-on's start:
 # init-caddy has just validated the Caddyfile (its marker is consumed here).
+# The validation runs under the time limit of the start's check (a file a
+# snippet refers to may block); an expired limit is a failed validation.
+# If the drop could not replace the Caddyfile (the fallback file is still
+# there), Caddy starts with the fallback file itself; the next reload by the
+# panel fails on the Caddyfile, falls back and tries the switch again.
 readonly CADDYFILE_OWN="/etc/caddy/Caddyfile.own"
 readonly CADDYFILE_CHECKED="/run/caddy-mtls/caddyfile-validated"
+RUN_CONFIG="${CADDYFILE}"
 if ! rm "${CADDYFILE_CHECKED}" 2>/dev/null && [[ -f "${CADDYFILE_OWN}" ]]; then
     VALIDATE_OUT="$(mktemp)"
     VALIDATE_RC=0
-    caddy_cmd validate --config "${CADDYFILE}" --adapter caddyfile >"${VALIDATE_OUT}.raw" 2>&1 || VALIDATE_RC=$?
+    caddy_cmd_limited 60 validate --config "${CADDYFILE}" --adapter caddyfile >"${VALIDATE_OUT}.raw" 2>&1 \
+        || VALIDATE_RC=$?
+    if limit_expired "${VALIDATE_RC}"; then
+        printf 'Error: Caddy did not finish checking the configuration within 60 seconds - a file a snippet refers to probably cannot be read to its end\n' \
+            >>"${VALIDATE_OUT}.raw"
+    fi
     dns_provider_redact <"${VALIDATE_OUT}.raw" >"${VALIDATE_OUT}" || true
     rm -f "${VALIDATE_OUT}.raw"
     if (( VALIDATE_RC != 0 )); then
         if caddy_cmd validate --config "${CADDYFILE_OWN}" --adapter caddyfile >/dev/null 2>&1; then
-            { /usr/lib/cert-mgr/.venv/bin/python3 /usr/lib/cert-mgr/customconf.py drop --when restart \
-                --output "${VALIDATE_OUT}" 2>&1 || true; } \
-                | while IFS= read -r line; do bashio::log.warning "${line}"; done
+            DROP_RC=0
+            /usr/lib/cert-mgr/.venv/bin/python3 /usr/lib/cert-mgr/customconf.py drop --when restart \
+                --output "${VALIDATE_OUT}" >"${VALIDATE_OUT}.drop" 2>&1 || DROP_RC=$?
+            while IFS= read -r line; do bashio::log.warning "${line}"; done <"${VALIDATE_OUT}.drop"
+            rm -f "${VALIDATE_OUT}.drop"
+            if (( DROP_RC != 0 )) && [[ -f "${CADDYFILE_OWN}" ]]; then
+                bashio::log.warning "The Caddyfile could not be replaced; Caddy starts with the add-on's own configuration (${CADDYFILE_OWN})."
+                RUN_CONFIG="${CADDYFILE_OWN}"
+            fi
         else
             bashio::log.error "Caddy cannot load the Caddyfile, nor the add-on's own configuration without the custom snippets."
         fi
@@ -67,4 +84,4 @@ bashio::log.info "Starting Caddy server..."
 # could read its environment through {$VAR} or {env.*} placeholders. (bash's
 # exec exports SHLVL again; env drops it.)
 caddy_env_only
-exec env -u SHLVL /usr/bin/caddy run --config "${CADDYFILE}" --adapter caddyfile
+exec env -u SHLVL /usr/bin/caddy run --config "${RUN_CONFIG}" --adapter caddyfile
