@@ -325,6 +325,84 @@ class ReloadTest(unittest.TestCase):
         ok, message = caddyctl.reload(caddyfile=self.caddyfile, run=self.run_custom_fails(), regenerate=self.regenerate)
         self.assertEqual((ok, message, self.calls), (True, "reloaded", ["regenerate", "Caddyfile"]))
 
+    # --- B2-1: fall back only when Caddy judged the configuration -------------
+
+    NOT_REACHED = ('{"level":"info","ts":1795829509.09,"msg":"using config from file","file":"/etc/caddy/Caddyfile"}\n'
+                   '{"level":"error","ts":1795829509.10,"msg":"sending configuration to instance: performing request: '
+                   'Post \\"http://127.0.0.1:2019/load\\": dial tcp 127.0.0.1:2019: connect: connection refused"}\n')
+
+    def run_first_fails(self, failure):
+        """The first reload fails as ``failure`` says (an exception to raise
+        or a CLI output with exit status 1); any further call works."""
+        def run(args, **kwargs):
+            config = Path(args[args.index("--config") + 1])
+            self.calls.append(config.name)
+            if config == self.caddyfile and "import" in config.read_text():
+                if isinstance(failure, BaseException):
+                    raise failure
+                return subprocess.CompletedProcess(args, 1, "", failure)
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return run
+
+    def assert_nothing_dropped(self, failure) -> None:
+        self.custom_files_in_use()
+        result = caddyctl.reload_detailed(caddyfile=self.caddyfile, run=self.run_first_fails(failure),
+                                          regenerate=self.regenerate)
+        self.assertFalse(result.ok)
+        self.assertFalse(result.reloaded)
+        self.assertEqual(result.dropped, "")
+        self.assertEqual(self.calls, ["regenerate", "Caddyfile"])  # no second call
+        self.assertTrue(self.fallback.exists())
+        self.assertTrue((self.tmp / "custom" / "sites.caddy").exists())
+        self.assertEqual(caddyctl.customconf.read_state()["state"], "loaded")
+
+    def test_a_timeout_drops_nothing(self) -> None:
+        """B2-1: the reviewer's stalled Caddy (SIGSTOP): the CLI did not
+        finish - reported as before, the snippets stay."""
+        self.assert_nothing_dropped(subprocess.TimeoutExpired(["caddy", "reload"], 60))
+
+    def test_a_cli_that_cannot_start_drops_nothing(self) -> None:
+        self.assert_nothing_dropped(FileNotFoundError(2, "No such file or directory"))
+
+    def test_an_unreachable_admin_endpoint_drops_nothing(self) -> None:
+        self.assert_nothing_dropped(self.NOT_REACHED)
+        self.assertFalse(caddyctl.caddy_judged(self.NOT_REACHED))
+        self.assertFalse(caddyctl.caddy_judged(
+            "Error: sending configuration to instance: performing request: Post \"http://127.0.0.1:2019/load\": EOF"))
+
+    def test_refusals_and_unknown_failures_fall_back(self) -> None:
+        """An adapter error, Caddy's answer HTTP 400 and an output this code
+        does not know: the configuration was the problem (or may be) - fall
+        back, a revocation matters more than a snippet."""
+        for output in ('{"level":"error","ts":1.5,"msg":"adapting config using caddyfile: File to import not found: '
+                       '/etc/caddy/custom/sites.caddy, at /etc/caddy/Caddyfile:90"}\n',
+                       "Error: sending configuration to instance: caddy responded with error: HTTP 400: "
+                       '{"error":"loading config: loading new config: x"}\n',
+                       "something nobody has seen before\n"):
+            with self.subTest(output=output[:40]):
+                self.assertTrue(caddyctl.caddy_judged(output))
+                shutil.rmtree(self.tmp / "custom", ignore_errors=True)
+                self.calls.clear()
+                self.custom_files_in_use()
+                with self.assertLogs("caddyctl", level="WARNING"):
+                    result = caddyctl.reload_detailed(caddyfile=self.caddyfile, run=self.run_first_fails(output),
+                                                      regenerate=self.regenerate)
+                self.assertTrue(result.ok)
+                self.assertTrue(result.dropped)
+                self.assertEqual(self.calls, ["regenerate", "Caddyfile", "Caddyfile.own"])
+
+    def test_the_banner_shows_only_the_cause(self) -> None:
+        """B2-6: the panel's banner after "list not written and reload
+        failed" names Caddy's cause, not its raw log lines (the log keeps
+        them: message)."""
+        result = caddyctl.ReloadResult(False, "cannot write x: read-only", self.NOT_REACHED)
+        self.assertIn('"level":"info"', result.message)
+        self.assertEqual(result.banner,
+                         "the list of active client certificates could not be written (cannot write x: read-only), "
+                         "and Caddy could not be reloaded: sending configuration to instance: performing request: "
+                         'Post "http://127.0.0.1:2019/load": dial tcp 127.0.0.1:2019: connect: connection refused')
+        self.assertEqual(caddyctl.ReloadResult(True).banner, "reloaded")
+
     def test_both_failing_drops_nothing(self) -> None:
         self.custom_files_in_use()
         with self.assertLogs("caddyctl", level="ERROR") as logs:

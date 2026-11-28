@@ -256,7 +256,8 @@ def caddy_env(environ: Mapping[str, str] | None = None, options_file: Path | Non
 # file, CA files of a transport, ...) are read by Caddy at every reload, and
 # can break after the start. So while custom files are in use, init-caddy
 # keeps the add-on's own rendering (customconf.FALLBACK_FILE): a reload that
-# fails is retried with it, and if that works the custom files are dropped
+# Caddy refuses (caddy_judged - not one that timed out or never reached
+# Caddy) is retried with it, and if that works the custom files are dropped
 # for the rest of the run (customconf.drop) - the change being applied (a
 # revocation) takes effect. All of it under one lock (customconf.reload_lock)
 # shared by the panel and the monitor. A change that makes a reload read
@@ -297,6 +298,39 @@ class ReloadResult:
                     "list can be written (at the latest after a restart of the add-on)")
         return f"{what}, and Caddy could not be reloaded: {self.caddy_error}"
 
+    @property
+    def banner(self) -> str:
+        """``message`` for the panel's banner: Caddy's output reduced to its
+        cause (customconf.caddy_message); the log keeps the full output."""
+        if self.caddy_error and not self.ok:
+            return self.message.replace(self.caddy_error, customconf.caddy_message(self.caddy_error))
+        return self.message
+
+
+#: What the Caddy CLI prints when it could not talk to the admin endpoint at
+#: all (see caddy_judged).
+_NOT_REACHED = "sending configuration to instance: performing request:"
+
+
+def caddy_judged(output: str) -> bool:
+    """Did ``caddy reload`` run to its end and get a verdict on the
+    configuration (so that retrying with the add-on's own one can help)?
+    False only for the one sign that the running Caddy was never reached:
+    Caddy 2.11.9's cmd/commandfuncs.go (cmdReload) wraps the error of
+    AdminAPIRequest as "sending configuration to instance: %v", and
+    cmd/main.go (AdminAPIRequest) wraps a failed HTTP request as
+    "performing request: %v" - e.g. (the binary's real output, as an error
+    log line) ``sending configuration to instance: performing request: Post
+    "http://127.0.0.1:2019/load": dial tcp 127.0.0.1:2019: connect:
+    connection refused`` (also reset, EOF). Caddy's answer to a refused
+    configuration is "sending configuration to instance: caddy responded
+    with error: HTTP 400: ...", the adapter's own errors ("adapting config
+    using caddyfile: ...") come before any request. Everything else - an
+    output this code does not know included - counts as judged: a
+    revocation matters more than a snippet. (A CLI that did not finish or
+    could not be started is decided by the caller.)"""
+    return _NOT_REACHED not in output
+
 
 def reload_detailed(*, caddy_bin: str | None = None, caddyfile: Path | None = None, admin: str | None = None,
                     timeout: float = 60, run: Runner | None = None,
@@ -306,12 +340,14 @@ def reload_detailed(*, caddy_bin: str | None = None, caddyfile: Path | None = No
     reload --force`` (Caddy skips an unchanged config otherwise: a client
     change touches only the active folder and the list) - also when the list
     could not be written: the reload must not depend on it (revocation), and
-    the previous list can only refuse too much. If the reload fails and the
-    fallback file exists (custom files in use), reload with it; when that
-    works, the custom files are dropped for this run (customconf.drop) and
-    the reload counts as done. Every caddy call gets ``env`` (default
-    caddy_env()). A list failure, a drop and a failed fallback are logged
-    here."""
+    the previous list can only refuse too much. If Caddy refused the
+    configuration (caddy_judged: the CLI ran to its end and reached Caddy)
+    and the fallback file exists (custom files in use), reload with it; when
+    that works, the custom files are dropped for this run (customconf.drop)
+    and the reload counts as done. A CLI that timed out, could not be
+    started or did not reach the admin endpoint is reported as a failure,
+    nothing dropped. Every caddy call gets ``env`` (default caddy_env()). A
+    list failure, a drop and a failed fallback are logged here."""
     caddy_bin = CADDY_BIN if caddy_bin is None else caddy_bin
     caddyfile = CADDYFILE if caddyfile is None else caddyfile
     admin = CADDY_ADMIN if admin is None else admin
@@ -320,7 +356,8 @@ def reload_detailed(*, caddy_bin: str | None = None, caddyfile: Path | None = No
     fallback = customconf.FALLBACK_FILE if fallback is None else fallback
     env = caddy_env() if env is None else env
 
-    def caddy_reload(config: Path) -> tuple[bool, str]:
+    def caddy_reload(config: Path) -> tuple[bool, str, bool]:
+        """(reloaded, Caddy's output when not, whether Caddy judged it)."""
         try:
             proc = run(
                 [caddy_bin, "reload", "--force", "--config", str(config),
@@ -328,10 +365,12 @@ def reload_detailed(*, caddy_bin: str | None = None, caddyfile: Path | None = No
                 capture_output=True, text=True, check=False, timeout=timeout, env=dict(env),
             )
         except (OSError, subprocess.SubprocessError) as err:
-            return False, headerauth.scrub(str(err))
+            # Did not finish (TimeoutExpired) or could not be started.
+            return False, headerauth.scrub(str(err)), False
         if proc.returncode != 0:
-            return False, headerauth.scrub(proc.stderr or proc.stdout or "caddy reload failed")
-        return True, ""
+            output = headerauth.scrub(proc.stderr or proc.stdout or "caddy reload failed")
+            return False, output, caddy_judged(output)
+        return True, "", True
 
     with customconf.reload_lock(lock):
         if not caddyfile.exists():
@@ -341,11 +380,11 @@ def reload_detailed(*, caddy_bin: str | None = None, caddyfile: Path | None = No
             regenerate()
         except FingerprintError as err:
             list_error = str(err)
-        reloaded, caddy_error = caddy_reload(caddyfile)
+        reloaded, caddy_error, judged = caddy_reload(caddyfile)
         dropped = ""
-        if not reloaded and fallback.exists():
+        if not reloaded and judged and fallback.exists():
             cause = customconf.caddy_message(caddy_error)
-            fallback_ok, fallback_error = caddy_reload(fallback)
+            fallback_ok, fallback_error, _ = caddy_reload(fallback)
             if fallback_ok:
                 dropped = customconf.drop(cause, when="reload", caddyfile=caddyfile, fallback=fallback)
                 reloaded, caddy_error = True, ""

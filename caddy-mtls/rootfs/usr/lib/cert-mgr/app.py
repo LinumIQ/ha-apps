@@ -530,7 +530,7 @@ async def add_client(request: Request, name: str = Form(...)):
     if not result.ok:
         LOG.error("caddy reload after add_client failed: %s", result.message)
         raise FlashError(
-            f"Client '{name}' was created, but {_reload_problem(result.message)}"
+            f"Client '{name}' was created, but {_reload_problem(result.banner)}"
         )
     return _applied(request, f"Client '{name}' created.", result)
 
@@ -567,7 +567,7 @@ async def revoke_client(request: Request, name: str, reason: str = Form("unspeci
     if not result.ok:
         LOG.error("caddy reload after revoke_client failed: %s", result.message)
         raise FlashError(
-            f"Client '{name}' was revoked, but {_reload_problem(result.message)}"
+            f"Client '{name}' was revoked, but {_reload_problem(result.banner)}"
         )
     return _applied(request, f"Client '{name}' revoked.", result)
 
@@ -616,7 +616,7 @@ async def regenerate_client(request: Request, name: str):
     if not result.ok:
         LOG.error("caddy reload after regenerate_client failed: %s", result.message)
         raise FlashError(
-            f"Client '{name}' was regenerated, but {_reload_problem(result.message)}"
+            f"Client '{name}' was regenerated, but {_reload_problem(result.banner)}"
         )
     return _applied(request, f"Client '{name}' regenerated.", result)
 
@@ -747,7 +747,7 @@ async def regenerate_ca(request: Request, confirm: str = Form(...)):
     if not result.ok:
         LOG.error("caddy reload after regenerate_ca failed: %s", result.message)
         raise FlashError(
-            f"CA was regenerated, but {_reload_problem(result.message)}"
+            f"CA was regenerated, but {_reload_problem(result.banner)}"
         )
     return _applied(request, "CA regenerated.", result)
 
