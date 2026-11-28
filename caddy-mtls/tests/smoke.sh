@@ -69,6 +69,18 @@
 #              redacted), a domain with a port, an upstream without a port,
 #              forwarded_headers never without mTLS (Home Assistant and
 #              another upstream).
+#   auth       header authentication (2.3.0): the gate in every mode, the
+#              header removed before the upstream, websockets, revocation,
+#              secrecy of the key (logs, files, processes, panel).
+#   custom     Caddyfile snippets (2.3.0): harmless files of all four kinds
+#              take effect at their places; broken, ignored and rejected
+#              files (break-outs, other listeners, certificates over the
+#              domain, TLS settings, wildcard sites) leave the add-on's own
+#              configuration; lan.caddy while the port is off; one
+#              environment for start and reload ({$VAR}); a referenced file
+#              that breaks after the start: a revocation still applies (the
+#              reload falls back and drops the snippets; also when s6 starts
+#              Caddy again), a restart loads them again.
 #
 # No external network traffic: every container runs with --network none and
 # ACME_CA_URL points at a closed local port (http://127.0.0.1:9/directory);
@@ -325,6 +337,7 @@ HEADERS_STRIP='[.. | objects | select(.handler? == "reverse_proxy") | .headers.r
     and (has("set") | not))'
 command -v jq >/dev/null || { printf 'jq is required\n' >&2; exit 2; }
 command -v tar >/dev/null || { printf 'tar is required\n' >&2; exit 2; }
+command -v openssl >/dev/null || { printf 'openssl is required\n' >&2; exit 2; }
 
 P12_PASS_FILE="$(secret_file p12-pass "${P12_PASSWORD}")"
 
@@ -1570,6 +1583,14 @@ fi
 caddy_env_has() {
     cexec sh -c 'pid="$(pidof caddy)" && tr "\0" "\n" < "/proc/${pid}/environ" | grep -Fx -- "$0=$1" >/dev/null' "$1" "$2"
 }
+# caddy_env_only_allowed: the running Caddy's environment holds only the
+# names of CADDY_ENV_NAMES (lib/dns-provider.sh, 2.3.0).
+caddy_env_only_allowed() {
+    local names
+    names="$(cexec sh -c 'pid="$(pidof caddy)" && tr "\0" "\n" < "/proc/${pid}/environ" | cut -d= -f1')" || return 1
+    [[ -n "${names}" ]] && ! grep -vxE 'PATH|HOME|TZ|XDG_CONFIG_HOME|XDG_DATA_HOME|DNS_API_TOKEN|DNS_AWS_ACCESS_KEY_ID|DNS_AWS_SECRET_ACCESS_KEY' \
+        <<<"${names}" >/dev/null
+}
 dns_case() { # dns_case <provider> <token> <env-var=value...>
     local provider="$1" token="$2" kv secret_file_path
     shift 2
@@ -1610,6 +1631,7 @@ dns_case() { # dns_case <provider> <token> <env-var=value...>
     for kv in "$@"; do
         check "dns-${provider}: Caddy's environment has ${kv%%=*}" caddy_env_has "${kv%%=*}" "${kv#*=}"
     done
+    check "dns-${provider}: Caddy's environment holds nothing else (PATH, HOME, TZ, XDG_*, DNS_*)" caddy_env_only_allowed
     check "dns-${provider}: token not in the log" logs_lack_secret "${secret_file_path}"
     check "dns-${provider}: upstream_port unset, no Supervisor API -> homeassistant:8123" \
         eval 'logs_contain "Upstream:    homeassistant:8123 (Core'"'"'s port unknown" &&
@@ -2152,6 +2174,39 @@ EOF
         double-close)
             printf '}\n}\nevil.caddy-mtls-smoke.localhost {\n\trespond "EVIL"\n}\n%s:8444 {\nroute {\n' "${DOMAIN}" >"${dir}/site.caddy" ;;
         mtls-off) printf 'other.caddy-mtls-smoke.localhost {\n\timport mtls\n\trespond "other site" 200\n}\n' >"${dir}/sites.caddy" ;;
+        # B-1: other listeners (the reviewer's c43, c42, c14).
+        port-admin) printf 'http://other.caddy-mtls-smoke.localhost:2019 {\n\trespond "x"\n}\n' >"${dir}/sites.caddy" ;;
+        port-panel) printf 'http://other.caddy-mtls-smoke.localhost:8099 {\n\trespond "x"\n}\n' >"${dir}/sites.caddy" ;;
+        bind) printf 'other.caddy-mtls-smoke.localhost {\n\tbind 127.0.0.1\n\trespond "other site"\n}\n' >"${dir}/sites.caddy" ;;
+        # B-4: a certificate that covers the domain (c07); B-2: one that does
+        # not, read again at every reload (c37).
+        wildcert)
+            gen_cert "${dir}" w '*.localhost'
+            printf 'other.caddy-mtls-smoke.localhost {\n\ttls /config/caddy/w.crt /config/caddy/w.key\n\trespond "other"\n}\n' >"${dir}/sites.caddy"
+            ;;
+        livecert)
+            gen_cert "${dir}" o other.caddy-mtls-smoke.localhost
+            printf 'other.caddy-mtls-smoke.localhost {\n\ttls /config/caddy/o.crt /config/caddy/o.key\n\trespond "other" 200\n}\n' >"${dir}/sites.caddy"
+            ;;
+        # B-6: refused with the real cause; a log that includes the access logs.
+        keytype) printf '%s\n' 'key_type rsa2048' >"${dir}/global.caddy" ;;
+        defsni) printf '%s\n' 'default_sni other.caddy-mtls-smoke.localhost' >"${dir}/global.caddy" ;;
+        wild) printf '*.localhost {\n\trespond "wild"\n}\n' >"${dir}/sites.caddy" ;;
+        logok)
+            printf '%s\n' 'log mine {' '	output stdout' '	format filter {' '		wrap json' '		request>headers delete' '	}' \
+                '	include http.log.access' '}' >"${dir}/global.caddy"
+            ;;
+        # B-5: lan.caddy while the local-network port is off.
+        lanoff)
+            printf '%s\n' 'respond /custom/hello "hello" 200' >"${dir}/site.caddy"
+            printf '%s\n' 'this is { broken' >"${dir}/lan.caddy"
+            ;;
+        # B-8: the environment a snippet's {$VAR} sees.
+        env)
+            # shellcheck disable=SC2016 # Caddyfile placeholders
+            printf '%s\n' 'header X-Env "[{$CADDY_ADMIN}]"' 'header X-Token "[{$SUPERVISOR_TOKEN}]"' 'header X-Tz "[{$TZ}]"' \
+                >"${dir}/site.caddy"
+            ;;
         ignored)
             printf '%s\n' 'respond /x "x" 200' >"${dir}/elsewhere.txt"
             ln -s elsewhere.txt "${dir}/site.caddy"
@@ -2161,7 +2216,20 @@ EOF
             ;;
     esac
 }
+# gen_cert <dir> <name> <DNS name>: a throwaway self-signed certificate and
+# key (<name>.crt, <name>.key) for a snippet's site.
+gen_cert() {
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj "/CN=$2 smoke (fake)" \
+        -addext "subjectAltName=DNS:$3" -keyout "$1/$2.key" -out "$1/$2.crt" >/dev/null 2>&1
+}
 custom_state() { cexec jq -r "$1" /run/caddy-mtls/custom.json 2>/dev/null; }
+# other_site [curl args]: "<body> <code>" of https://other.caddy-mtls-smoke.localhost/ (" 000": handshake failed).
+other_site() {
+    cexec curl -sk --max-time 10 -o - -w ' %{http_code}' --resolve "other.caddy-mtls-smoke.localhost:443:127.0.0.1" \
+        "$@" https://other.caddy-mtls-smoke.localhost/ 2>/dev/null || true
+}
+# flash_ok <text>: the panel's redirect after a change that worked.
+flash_ok() { printf '303 http://127.0.0.1:8099%s/?ok=%s' "${INGRESS_PREFIX}" "$1"; }
 # creq <path> [curl args]: "<code>" on the public site (443).
 creq() { areq "$@"; }
 # custom_boot <case> <mtls> [fwd]: boot with the case's files (key mode).
@@ -2183,11 +2251,12 @@ save_fixture() { # save_fixture <case> <mode>
     "${DOCKER}" cp "${CTR}:/run/caddy-mtls/custom-adapted.json" "${SMOKE_FIXTURES_DIR}/$1.json" 2>/dev/null || true
     "${DOCKER}" cp "${CTR}:/run/caddy-mtls/custom-reference.json" "${SMOKE_FIXTURES_DIR}/$1.reference.json" 2>/dev/null || true
 }
-# reject_case <case> <mtls> <expected text in the state's error> [<bypass path>]:
+# reject_case <case> <mtls> <expected text in the state's error> [<bypass path> [<more checks>]]:
 # the files are rejected, the add-on runs, and in the key mode a request
-# without certificate and key gets 403 - on the bypass path too.
+# without certificate and key gets 403 - on the bypass path too; <more
+# checks>: a function with further checks before the stop.
 reject_case() {
-    local c="$1" expect="$3" path="${4:-/custom-check}"
+    local c="$1" expect="$3" path="${4:-/custom-check}" more="${5:-}"
     log "custom-${c}: booting"
     before=${FAIL_COUNT}
     SEED_NETWORK='{"80/tcp":8080,"443/tcp":8443,"4443/tcp":9443}'
@@ -2204,6 +2273,8 @@ reject_case() {
         check "custom-${c}: without certificate and key -> 403 on ${path} and /" eval '
             wait_for 30 eval "test \"\$(creq \"${path}\")\" == 403" && test "$(creq /)" == 403'
         check "custom-${c}: the log has the warning block" logs_contain "Your custom Caddyfile snippets are NOT in use"
+        check "custom-${c}: no fallback file kept (/etc/caddy/Caddyfile.own)" file_absent /etc/caddy/Caddyfile.own
+        [[ -z "${more}" ]] || "${more}" "${c}"
         check "custom-${c}: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
     else
         fail "custom-${c}: add-on booted (the start is not refused)"
@@ -2232,6 +2303,9 @@ if wait_for "${BOOT_TIMEOUT}" booted; then
         cexec cmp -s /config/caddy/sites.caddy /etc/caddy/custom/sites.caddy'
     check "custom-ok: README.txt written in /config/caddy" eval '
         cexec grep -F "applied when the add-on STARTS" /config/caddy/README.txt >/dev/null'
+    check "custom-ok: the add-on's own rendering kept as /etc/caddy/Caddyfile.own (no custom import, as the Caddyfile's mode)" eval '
+        file_exists /etc/caddy/Caddyfile.own && ! cexec grep -F /etc/caddy/custom/ /etc/caddy/Caddyfile.own >/dev/null &&
+        test "$(cexec stat -c %a /etc/caddy/Caddyfile.own)" == "$(cexec stat -c %a /etc/caddy/Caddyfile)"'
     check "custom-ok: the log lists each file and says changes need a restart" eval '
         logs_contain "Custom:      in use (checked by Caddy and by the add-on'"'"'s integrity check), from app_configs/local_caddy_mtls/caddy/ (addon_configs/local_caddy_mtls/caddy/ in apps that still use the old name):" &&
         logs_contain "caddy/site.caddy (" && logs_contain "caddy/sites.caddy (" &&
@@ -2342,7 +2416,9 @@ show_log_on_failure "${before}"
 # --- ignored entries: a symlink, an oversized file, a FIFO, a blank file ----
 log "custom-ignored: booting (symlink, 300 KB file, FIFO, blank file)"
 before=${FAIL_COUNT}
+SEED_NETWORK='{"80/tcp":8080,"443/tcp":8443,"4443/tcp":9443}'
 custom_boot ignored true
+SEED_NETWORK='{"80/tcp":8080,"443/tcp":8443}'
 if wait_for "${BOOT_TIMEOUT}" booted; then
     pass "custom-ignored: add-on booted (a FIFO does not block the start)"
     check "custom-ignored: each ignored with a log line, nothing in use" eval '
@@ -2391,6 +2467,226 @@ for c in admin-off admin-other storage; do
     fi
     show_log_on_failure "${before}"
 done
+
+# --- B-1: a site on another listener (admin 2019, panel 8099, bind) ----------
+# revoke_applies <case>: the admin endpoint answers the panel's reloads, so a
+# revocation through the panel ends alice's access (c43: the reload went to
+# the user's site, reported success and was not applied).
+revoke_applies() {
+    check "custom-$1: alice admitted before the revocation (502: no upstream here)" test "$(creq /x "${CERT_ALICE[@]}")" == 502
+    check "custom-$1: revoke alice through the panel -> applied: refused in the handshake" eval '
+        test "$(panel_post /api/clients/alice/revoke reason=superseded)" == "$(flash_ok Client+%27alice%27+revoked.)" &&
+        test "$(creq /x "${CERT_ALICE[@]}")" == 000'
+    check "custom-$1: the admin endpoint is Caddy's own on 127.0.0.1:2019 (its config, not a site's answer)" \
+        adapted '.admin.listen == "127.0.0.1:2019"'
+}
+reject_case port-admin true "listens on :2019" /custom-check revoke_applies
+panel_answers() {
+    check "custom-$1: the web interface answers on 8099 (dashboard, not a site's empty 200)" eval '
+        [[ "$(dashboard /)" == *"id=\"custom-config\""*"data-state=\"rejected\""* ]]'
+}
+reject_case port-panel true "listens on :8099" /custom-check panel_answers
+bind_off() {
+    check "custom-$1: the domain on 127.0.0.1:443 is the add-on's site (403 without certificate and key)" \
+        test "$(creq /x)" == 403
+}
+reject_case bind true "without bind" /custom-check bind_off
+
+# --- B-4 / B-6: refused, with the real cause in the message ------------------
+reject_case wildcert true "covers the add-on's own domain caddy-mtls-smoke.localhost (as *.localhost)"
+reject_case keytype true "cannot be changed by a snippet"
+reject_case defsni true "cannot be changed by a snippet"
+reject_case wild true "a wildcard site that includes the add-on's name is not supported"
+
+# --- B-6: a log that includes the access logs (with the header filter) ------
+log "custom-logok: booting (global.caddy: log mine { include http.log.access; request>headers delete }, access_log on)"
+before=${FAIL_COUNT}
+OPT_ACCESS_LOG=true
+custom_boot logok true
+OPT_ACCESS_LOG=false
+if wait_for "${BOOT_TIMEOUT}" booted; then
+    pass "custom-logok: add-on booted"
+    auth_headers
+    save_fixture logok key
+    check "custom-logok: loaded (the default log's added exclude is accepted)" test "$(custom_state .state)" == loaded
+    # The added log's lines (JSON) for the test request.
+    logok_lines() { "${DOCKER}" logs "${CTR}" 2>&1 | grep -F '{"level"' | grep -F /logok-check; }
+    logok_seen() { logok_lines | grep -F '"request":{' >/dev/null; }
+    check "custom-logok: the added log gets the access entries (JSON)" eval '
+        test "$(creq /logok-check -H @/tmp/h-ok)" == 502 && wait_for 10 logok_seen'
+    check "custom-logok: ... without request headers; the key in no log line" eval '
+        ! logok_lines | grep -iF -e "\"headers\"" -e "x-custom-psk" >/dev/null && logs_lack_secret "${AUTH_PATTERNS}"'
+    check "custom-logok: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
+else
+    fail "custom-logok: add-on booted"
+fi
+show_log_on_failure "${before}"
+
+# --- B-5: lan.caddy while the local-network port is off ----------------------
+log "custom-lanoff: booting (site.caddy fine, lan.caddy broken, local-network port off)"
+before=${FAIL_COUNT}
+custom_boot lanoff true
+if wait_for "${BOOT_TIMEOUT}" booted; then
+    pass "custom-lanoff: add-on booted"
+    auth_headers
+    check "custom-lanoff: loaded with site.caddy only; lan.caddy ignored (port off), not validated" eval '
+        test "$(custom_state .state)" == loaded && test "$(custom_state "[.files[].name] | join(\",\")")" == site.caddy &&
+        test "$(custom_state ".ignored[] | select(.name == \"lan.caddy\") | .reason")" == "the local-network port is off" &&
+        logs_contain "Custom Caddyfile snippets: caddy/lan.caddy is ignored: the local-network port is off." &&
+        ! cexec test -e /etc/caddy/custom/lan.caddy'
+    check "custom-lanoff: the card names lan.caddy as ignored, site.caddy in use" eval '
+        html="$(dashboard /)" && [[ "${html}" == *"id=\"custom-config\""*"data-state=\"loaded\""* &&
+        "${html}" == *"the local-network port is off"* ]]'
+    check "custom-lanoff: site.caddy took effect" test "$(abody /custom/hello -H @/tmp/h-ok)" == hello
+    check "custom-lanoff: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
+else
+    fail "custom-lanoff: add-on booted"
+fi
+show_log_on_failure "${before}"
+
+# --- B-8: one environment for start and reload --------------------------------
+log "custom-env: booting (site.caddy shows {\$CADDY_ADMIN}, {\$SUPERVISOR_TOKEN}, {\$TZ}; a token in the container env)"
+before=${FAIL_COUNT}
+custom_boot env true fwd
+if wait_for "${BOOT_TIMEOUT}" booted; then
+    pass "custom-env: add-on booted"
+    auth_headers
+    env_headers() { abody /env -H @/tmp/h-ok -o /dev/null -D - | tr -d '\r' | grep -iE '^x-(env|token|tz):' | tr '[:upper:]' '[:lower:]' | sort | tr '\n' ' '; }
+    check "custom-env: after the start: x-env [] x-token [] x-tz [europe/vienna]" \
+        test "$(env_headers)" == "x-env: [] x-token: [] x-tz: [europe/vienna] "
+    check "custom-env: a panel reload (add carol) works" \
+        test "$(panel_post /api/clients name=carol)" == "$(flash_ok Client+%27carol%27+created.)"
+    check "custom-env: after the panel reload: the same (no CADDY_ADMIN, no Supervisor token)" \
+        test "$(env_headers)" == "x-env: [] x-token: [] x-tz: [europe/vienna] "
+    check "custom-env: the token is in no running configuration" eval '
+        ! cexec sh -c "curl -fsS --max-time 5 http://127.0.0.1:2019/config/" | grep -F "${SMOKE_SUPERVISOR_TOKEN}" >/dev/null'
+    check "custom-env: Caddy's environment holds only PATH, HOME, TZ, XDG_* and DNS_* names" caddy_env_only_allowed
+    check "custom-env: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
+else
+    fail "custom-env: add-on booted"
+fi
+show_log_on_failure "${before}"
+
+# --- B-2: a file a snippet refers to breaks after the start (c37) -------------
+# livecert_case key|default: sites.caddy loads o.crt/o.key; o.key is removed;
+# revoking alice through the panel still ends her access (the reload falls
+# back to the add-on's own configuration and drops the snippets).
+livecert_case() {
+    local m="$1" c="custom-livecert-$1"
+    log "${c}: booting (sites.caddy loads /config/caddy/o.crt and o.key; ${m} mode)"
+    before=${FAIL_COUNT}
+    CUSTOM_CASE=livecert
+    BOOT_CONFIG_HOOK=custom_files
+    [[ "${m}" == key ]] && OPT_HEADER_KEY_FILE="${AUTH_KEY_RAW}"
+    boot_fwd "${c}" "$(options "${DOMAIN}" true none "" homeassistant 8124)" trust
+    OPT_HEADER_KEY_FILE=""
+    BOOT_CONFIG_HOOK=""
+    if ! wait_for "${BOOT_TIMEOUT}" booted; then
+        fail "${c}: add-on booted"
+        show_log_on_failure "${before}"
+        return 0
+    fi
+    pass "${c}: add-on booted"
+    [[ "${m}" == key ]] && auth_headers
+    check "${c}: loaded; the add-on's own rendering kept as /etc/caddy/Caddyfile.own (no custom import); alice 200; the site served" eval '
+        test "$(custom_state .state)" == loaded && file_exists /etc/caddy/Caddyfile.own &&
+        ! cexec grep -F /etc/caddy/custom/ /etc/caddy/Caddyfile.own >/dev/null &&
+        cexec grep -F /etc/caddy/custom/sites.caddy /etc/caddy/Caddyfile >/dev/null &&
+        test "$(creq /x "${CERT_ALICE[@]}")" == 200 && [[ "$(other_site)" == "other 200" ]]'
+    cexec rm /config/caddy/o.key
+    local lines_before
+    # shellcheck disable=SC2034 # used in an eval'd check
+    lines_before="$(log_line_count)"
+    check "${c}: o.key removed; revoke alice through the panel -> done, and the flash says the snippets were dropped" eval '
+        r="$(panel_post /api/clients/alice/revoke reason=superseded)" &&
+        [[ "${r}" == "303 http://127.0.0.1:8099${INGRESS_PREFIX}/?error=Caddy+could+not+reload+with+your+custom+files+while+applying+a+change+%28"*"+To+apply+the+change+the+add-on+dropped+them"*"&ok=Client+%27alice%27+revoked." ]]'
+    check "${c}: alice refused in the handshake at once" test "$(creq /x "${CERT_ALICE[@]}")" == 000
+    check "${c}: state rejected, dropped at run time, Caddy's cause named (o.key)" eval '
+        test "$(custom_state .state)" == rejected && test "$(custom_state .dropped)" == reload &&
+        [[ "$(custom_state .dropped_at)" =~ ^[0-9.]+$ ]] && [[ "$(custom_state .error)" == "Caddy could not reload with your custom files while applying a change ("*"o.key"*"). To apply the change the add-on dropped them; they are read again at the next start." ]]'
+    check "${c}: the Caddyfile is the add-on's own now; no fallback file, no copies" eval '
+        ! cexec grep -F /etc/caddy/custom/ /etc/caddy/Caddyfile >/dev/null && file_absent /etc/caddy/Caddyfile.own &&
+        test -z "$(cexec sh -c "ls -A /etc/caddy/custom 2>/dev/null")"'
+    check "${c}: the snippet's site is gone" eval '[[ "$(other_site)" != "other 200" ]]'
+    check "${c}: the card is red and says why" eval '
+        html="$(dashboard /)" && [[ "${html}" == *"id=\"custom-config\""*"data-state=\"rejected\""* &&
+        "${html}" == *"Caddy could not reload with your custom files while applying a change"* ]]'
+    check "${c}: the log says why (one WARNING line of cert-mgr)" eval '
+        new_logs_contain "${lines_before}" "Caddy could not reload with your custom files while applying a change" &&
+        test "$("${DOCKER}" logs "${CTR}" 2>&1 | grep -c "Caddy could not reload with your custom files")" == 1'
+    check "${c}: the notification is raised (the state changed after the start)" wait_for 30 supervisor_got \
+        "(.path | endswith(\"/create\")) and .body.notification_id == \"caddy_mtls_custom_config\" and (.body.message | contains(\"while applying a change\"))"
+    check "${c}: the next reload works without a fallback: revoke bob -> plain ok, bob refused" eval '
+        test "$(panel_post /api/clients/bob/revoke reason=superseded)" == "$(flash_ok Client+%27bob%27+revoked.)" &&
+        test "$(creq /x "${CERT_BOB[@]}")" == 000 &&
+        test "$("${DOCKER}" logs "${CTR}" 2>&1 | grep -c "Caddy could not reload with your custom files")" == 1'
+    if [[ "${m}" == key ]]; then
+        check "${c}: the gate still holds: no key 403, the key 200" eval '
+            test "$(creq /x)" == 403 && test "$(creq /x -H @/tmp/h-ok)" == 200'
+    else
+        check "${c}: the gate still holds: no certificate -> refused in the handshake" test "$(creq /x)" == 000
+    fi
+    check "${c}: no Traceback" logs_lack "Traceback"
+    check "${c}: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
+    show_log_on_failure "${before}"
+    [[ "${m}" == key ]] || return 0
+    # A restart with the files in place (o.key restored): the snippets are
+    # read again and loaded.
+    "${DOCKER}" cp "${CTR}:/data" - >"${WORK}/data-livecert.tar"
+    log "${c}-restart: new container with the previous /data, o.key back"
+    before=${FAIL_COUNT}
+    CUSTOM_CASE=livecert
+    BOOT_CONFIG_HOOK=custom_files
+    OPT_HEADER_KEY_FILE="${AUTH_KEY_RAW}"
+    boot "${c}-restart" "$(options "${DOMAIN}" true none "")" "${WORK}/data-livecert.tar"
+    OPT_HEADER_KEY_FILE=""
+    BOOT_CONFIG_HOOK=""
+    if wait_for "${BOOT_TIMEOUT}" booted; then
+        pass "${c}-restart: add-on booted"
+        check "${c}-restart: the snippets are loaded again; the site served; alice and bob stay refused" eval '
+            test "$(custom_state .state)" == loaded && test "$(custom_state ".dropped // \"\"")" == "" &&
+            file_exists /etc/caddy/Caddyfile.own && [[ "$(other_site)" == "other 200" ]] &&
+            test "$(creq /x "${CERT_ALICE[@]}")" == 000 && test "$(creq /x "${CERT_BOB[@]}")" == 000'
+        check "${c}-restart: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
+    else
+        fail "${c}-restart: add-on booted"
+    fi
+    show_log_on_failure "${before}"
+}
+livecert_case default
+livecert_case key
+
+# --- B-2: Caddy started again by s6 (it exited with 0) after o.key broke -----
+log "custom-livecert-caddyrun: booting (sites.caddy loads o.crt and o.key)"
+before=${FAIL_COUNT}
+custom_boot livecert true
+if wait_for "${BOOT_TIMEOUT}" booted; then
+    pass "custom-livecert-caddyrun: add-on booted"
+    save_fixture livecert key
+    check "custom-livecert-caddyrun: loaded, the start skipped the caddy service's own check (marker consumed)" eval '
+        test "$(custom_state .state)" == loaded && file_absent /run/caddy-mtls/caddyfile-validated'
+    cexec rm /config/caddy/o.key
+    caddy_pid="$(cexec pidof caddy 2>/dev/null || true)"
+    caddy_back() {
+        local pid
+        pid="$(cexec pidof caddy 2>/dev/null)" && [[ -n "${pid}" && "${pid}" != "${caddy_pid}" ]] && admin_up
+    }
+    check "custom-livecert-caddyrun: SIGTERM to Caddy alone -> s6 starts it again with the add-on's own configuration" eval '
+        [[ -n "${caddy_pid}" ]] && cexec kill -TERM "${caddy_pid}" && wait_for 30 caddy_back && running'
+    check "custom-livecert-caddyrun: state rejected (dropped when Caddy was started again), no fallback file, no copies" eval '
+        test "$(custom_state .state)" == rejected && test "$(custom_state .dropped)" == restart &&
+        [[ "$(custom_state .error)" == "Caddy could not load the configuration with your custom files when it was started again ("*"o.key"* ]] &&
+        file_absent /etc/caddy/Caddyfile.own && ! cexec grep -F /etc/caddy/custom/ /etc/caddy/Caddyfile >/dev/null'
+    check "custom-livecert-caddyrun: the log says so" logs_contain "Caddy could not load the configuration with your custom files when it was started again"
+    check "custom-livecert-caddyrun: the add-on works (alice 502: no upstream here; no certificate or key: 403); a reload works" eval '
+        test "$(creq /x "${CERT_ALICE[@]}")" == 502 && test "$(creq /x)" == 403 &&
+        test "$(panel_post /api/clients/bob/revoke reason=superseded)" == "$(flash_ok Client+%27bob%27+revoked.)" &&
+        test "$(creq /x "${CERT_BOB[@]}")" == 000'
+    check "custom-livecert-caddyrun: clean docker stop (< 10 s, exit 0, no s6 warnings)" stop_cleanly
+else
+    fail "custom-livecert-caddyrun: add-on booted"
+fi
+show_log_on_failure "${before}"
 fi
 
 printf '\n%d passed, %d failed\n' "${PASS_COUNT}" "${FAIL_COUNT}"
