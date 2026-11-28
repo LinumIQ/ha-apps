@@ -2791,7 +2791,7 @@ fifo_checks() {
 }
 BOOT_TIMEOUT_SAVED="${BOOT_TIMEOUT}"
 BOOT_TIMEOUT=$(( BOOT_TIMEOUT + 75 ))
-reject_case fifocert true "Caddy did not finish checking the configuration with your custom files within 60 seconds. A file a snippet refers to probably cannot be read to its end (a named pipe, or a network folder that does not answer)." /custom-check fifo_checks
+reject_case fifocert true "Caddy did not finish checking the configuration with your custom files within 60 seconds. A file a snippet refers to probably cannot be read to its end (for example a named pipe)." /custom-check fifo_checks
 BOOT_TIMEOUT="${BOOT_TIMEOUT_SAVED}"
 fi
 

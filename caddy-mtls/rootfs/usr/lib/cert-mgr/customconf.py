@@ -111,14 +111,19 @@ file_server a "root" - without one it serves that directory.
 The files are applied when the add-on STARTS (from copies): restart it after
 a change. Files they refer to (a "tls" certificate and key, a CA file, ...)
 are read by Caddy at every reload, so a change of such a file takes effect at
-the next reload. If Caddy rejects one of them, or it changes the add-on's own
-sites, NONE of them is used and the add-on runs with its own configuration
-only - also when the check does not finish within 60 seconds (a file a
-snippet refers to that cannot be read to its end). If Caddy refuses them at
-a reload while the add-on applies a change (e.g. a revoked client), the
-add-on drops them until the next start, so that the change takes effect.
-The add-on's web interface (card "Custom Caddy configuration") and its log
-show the result and Caddy's message.
+the next reload; refer to regular files only. If such a file cannot be read
+to its end at run time (for example a named pipe), Caddy's reload does not
+finish: the web interface reports that reloading Caddy failed, and the
+change takes effect after a restart of the add-on.
+
+If Caddy rejects one of them, or it changes the add-on's own sites, NONE of
+them is used and the add-on runs with its own configuration only - also
+when the check does not finish within 60 seconds (a file a snippet refers
+to that cannot be read to its end). If Caddy refuses them at a reload while
+the add-on applies a change (e.g. a revoked client), the add-on drops them
+until the next start, so that the change takes effect. The add-on's web
+interface (card "Custom Caddy configuration") and its log show the result
+and Caddy's message.
 
 Documentation: {DOCS_URL}
 

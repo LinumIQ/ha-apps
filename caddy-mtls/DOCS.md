@@ -558,7 +558,11 @@ restart the add-on; until then the four files are not read again, also not
 when the add-on reloads Caddy for a revoked client. Files they **refer to**
 (a site's `tls` certificate and key, a `trust_pool` file, CA files of a
 `transport`, ...) are a different matter: Caddy reads those at every reload,
-so a change of such a file takes effect at the next reload. If Caddy refuses
+so a change of such a file takes effect at the next reload. Refer to regular
+files only. If such a file cannot be read to its end at run time (for
+example a named pipe), Caddy's reload does not finish: the panel reports
+that reloading Caddy failed, and the change takes effect after a restart of
+the add-on (whose check then refuses the snippets). If Caddy refuses
 the configuration with the snippets while the add-on applies a change - say
 the key file of a `tls` line was removed - the add-on drops the
 snippets and reloads with its own configuration, so that the change (for
@@ -584,8 +588,8 @@ of the four files is used: the add-on starts with its own configuration, the
 log shows a warning block with the reason, the card **Custom Caddy
 configuration** turns red and a Home Assistant notification appears. A check
 that does not finish within 60 seconds - Caddy waits for a file a snippet
-refers to, such as a named pipe or a file on a network folder that does not
-answer - counts as a rejection.
+refers to that cannot be read to its end, for example a named pipe - counts
+as a rejection.
 **Do not rely on a snippet for a restriction without checking the card after
 the restart.**
 
